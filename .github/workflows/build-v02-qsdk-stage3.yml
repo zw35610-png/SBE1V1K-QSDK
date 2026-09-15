@@ -99,20 +99,20 @@ jobs:
             "$GITHUB_WORKSPACE/openwrt/build_dir" \
             -type d \
             -path '*/linux-*/linux-6.18*' \
-            | head -1)
+            -print -quit)
 
           TOOLCHAIN_DIR=$(find \
             "$GITHUB_WORKSPACE/openwrt/staging_dir" \
             -maxdepth 1 \
             -type d \
             -name 'toolchain-aarch64*' \
-            | head -1)
+            -print -quit)
 
           GCC=$(find \
             "$TOOLCHAIN_DIR/bin" \
             -type f \
             -name 'aarch64-openwrt-linux-musl-gcc' \
-            | head -1)
+            -print -quit)
 
           CROSS_PREFIX="${GCC%gcc}"
 
@@ -125,8 +125,14 @@ jobs:
             "$GCC" --version | head -1
           } | tee results/environment.txt
 
+          test -n "$KERNEL_DIR"
           test -d "$KERNEL_DIR"
+          test -n "$TOOLCHAIN_DIR"
+          test -d "$TOOLCHAIN_DIR"
+          test -n "$GCC"
           test -x "$GCC"
+
+          echo "Build environment located successfully."
 
       - name: Fully prepare Linux kernel
         shell: bash
