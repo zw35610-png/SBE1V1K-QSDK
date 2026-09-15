@@ -1,0 +1,56 @@
+name: Build SBE1V1K Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show runner information
+        run: |
+          echo "=== CPU ==="
+          nproc
+          echo "=== Memory ==="
+          free -h
+          echo "=== Disk ==="
+          df -h
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install OpenWrt build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib gettext git libncurses-dev \
+            libssl-dev python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget
+
+      - name: Clone OpenWrt 24.10
+        run: |
+          git clone --depth=1 \
+            --branch openwrt-24.10 \
+            https://github.com/openwrt/openwrt.git
+
+      - name: Check OpenWrt source
+        run: |
+          cd openwrt
+          git log -1 --oneline
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "OpenWrt source preparation successful"
+
+      - name: Test completed
+        run: |
+          echo "SBE1V1K-QSDK GitHub Actions environment is ready."
