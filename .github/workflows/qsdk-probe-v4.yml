@@ -1,0 +1,98 @@
+name: SBE1V1K QSDK Probe V4
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git grep
+          mkdir -p results
+
+      - name: Clone QSDK14 R9 NSS clients feed
+        shell: bash
+        run: |
+          set -e
+
+          git clone \
+            https://git.codelinaro.org/clo/qsdk/oss/system/feeds/nss-clients.git \
+            nss-clients
+
+          cd nss-clients
+
+          git checkout NHSS.QSDK.14.0.r9-00034-O
+
+          echo "===== CURRENT REVISION =====" \
+            > ../results/SUMMARY.txt
+
+          git log -1 --oneline \
+            >> ../results/SUMMARY.txt
+
+          echo "" >> ../results/SUMMARY.txt
+          echo "===== DIRECTORY TREE =====" \
+            >> ../results/SUMMARY.txt
+
+          find . -maxdepth 2 -type f -name Makefile \
+            | sort \
+            >> ../results/SUMMARY.txt
+
+          echo "" >> ../results/SUMMARY.txt
+          echo "===== SOURCE DEFINITIONS =====" \
+            >> ../results/SUMMARY.txt
+
+          grep -RniE \
+            'PKG_SOURCE_URL|PKG_SOURCE_VERSION|PKG_VERSION|PKG_SOURCE_PROTO' \
+            . \
+            --include=Makefile \
+            >> ../results/SUMMARY.txt || true
+
+          echo "" >> ../results/SUMMARY.txt
+          echo "===== TARGET HASHES =====" \
+            >> ../results/SUMMARY.txt
+
+          grep -RniE \
+            '22555a9|07fbf1b|b959456|e978478|87bb9b3|717b740' \
+            . \
+            >> ../results/SUMMARY.txt || true
+
+          echo "" >> ../results/SUMMARY.txt
+          echo "===== TARGET PACKAGES =====" \
+            >> ../results/SUMMARY.txt
+
+          find . -type f \
+            \( -name Makefile -o -name '*.mk' \) \
+            -print0 | \
+            xargs -0 grep -niE \
+            'qca-nss-netfn|qca-nss-ae-clients|qca-nss-ecm|qca-nss-dp' \
+            >> ../results/SUMMARY.txt || true
+
+          cat ../results/SUMMARY.txt
+
+      - name: Copy target Makefiles
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p results/makefiles
+
+          find nss-clients -type f -name Makefile | while read f
+          do
+            if grep -qiE \
+              'netfn|ae-clients|nss-ecm|nss-dp' "$f"
+            then
+              name=$(echo "$f" | tr '/' '_')
+              cp "$f" "results/makefiles/$name"
+            fi
+          done
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-QSDK-Probe-V4
+          path: results/
+          retention-days: 7
