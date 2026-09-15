@@ -1,0 +1,84 @@
+name: SBE1V1K QSDK Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl ca-certificates
+          git --version
+
+      - name: Probe Qualcomm repositories
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p qsdk-probe
+          cd qsdk-probe
+
+          probe_repo () {
+            NAME="$1"
+            URL="$2"
+
+            echo ""
+            echo "========================================"
+            echo "Repository: $NAME"
+            echo "URL: $URL"
+            echo "========================================"
+
+            git ls-remote --heads "$URL" > "${NAME}-heads.txt" 2>&1
+            HEAD_RC=$?
+
+            git ls-remote --tags "$URL" > "${NAME}-tags.txt" 2>&1
+            TAG_RC=$?
+
+            echo "heads exit code: $HEAD_RC"
+            echo "tags exit code:  $TAG_RC"
+
+            echo "--- HEADS ---"
+            head -100 "${NAME}-heads.txt"
+
+            echo "--- QSDK 14 TAGS ---"
+            grep -iE 'NHSS.QSDK.14|QSDK.14' \
+              "${NAME}-tags.txt" | tail -100 || true
+          }
+
+          probe_repo \
+            qca-nss-ppe \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe.git
+
+          probe_repo \
+            qca-ssdk \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-ssdk.git
+
+          probe_repo \
+            qca-nss-dp \
+            https://github.com/openwrt/qca-nss-dp.git
+
+          echo ""
+          echo "Probe completed."
+
+      - name: Upload probe results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-QSDK-Probe
+          path: qsdk-probe/
+          retention-days: 7
