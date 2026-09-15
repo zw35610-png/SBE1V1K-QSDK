@@ -1,0 +1,190 @@
+name: SBE1V1K V0.2 QSDK Stage1
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib gettext git libncurses-dev \
+            libssl-dev python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget curl jq
+
+      - name: Clone SBE1V1K baseline
+        run: |
+          git clone https://github.com/luckkyboy/SBE1V1K.git openwrt
+          cd openwrt
+          git checkout 02fb9517c9aefac9f3825a15ae46e7998bae7edd
+          git log -1 --oneline
+
+      - name: Prepare feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Prepare SBE1V1K config
+        run: |
+          cd openwrt
+          cp configs/sbe1v1k.config .config
+          make defconfig
+
+      - name: Fetch exact QSDK14 R9 PPE
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p qsdk-src
+
+          git clone \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe.git \
+            qsdk-src/qca-nss-ppe
+
+          cd qsdk-src/qca-nss-ppe
+
+          git checkout \
+            87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+
+          echo "===== PPE ====="
+          git log -1 --oneline
+
+          test "$(git rev-parse HEAD)" = \
+            "87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5"
+
+      - name: Fetch exact QSDK14 R9 SSDK
+        shell: bash
+        run: |
+          set -e
+
+          git clone \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-ssdk.git \
+            qsdk-src/qca-ssdk
+
+          cd qsdk-src/qca-ssdk
+
+          git checkout \
+            717b74016b0c131575bcd81b9e039d3f7974b02a
+
+          echo "===== SSDK ====="
+          git log -1 --oneline
+
+          test "$(git rev-parse HEAD)" = \
+            "717b74016b0c131575bcd81b9e039d3f7974b02a"
+
+      - name: Inspect QSDK source requirements
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p results
+
+          echo "===== BASELINE =====" \
+            > results/stage1-report.txt
+
+          cd openwrt
+
+          echo "OpenWrt:" \
+            >> ../results/stage1-report.txt
+          git log -1 --oneline \
+            >> ../results/stage1-report.txt
+
+          echo "" >> ../results/stage1-report.txt
+          echo "Kernel config:" \
+            >> ../results/stage1-report.txt
+
+          grep -E \
+            'CONFIG_TARGET_qualcommbe|CONFIG_LINUX_' \
+            .config \
+            >> ../results/stage1-report.txt || true
+
+          cd ..
+
+          echo "" >> results/stage1-report.txt
+          echo "===== PPE =====" \
+            >> results/stage1-report.txt
+
+          cd qsdk-src/qca-nss-ppe
+          git log -1 --oneline \
+            >> ../../results/stage1-report.txt
+
+          find . -maxdepth 2 \
+            -type f \
+            \( -name Makefile -o -name Kconfig \) \
+            >> ../../results/stage1-report.txt
+
+          cd ../..
+
+          echo "" >> results/stage1-report.txt
+          echo "===== SSDK =====" \
+            >> results/stage1-report.txt
+
+          cd qsdk-src/qca-ssdk
+          git log -1 --oneline \
+            >> ../../results/stage1-report.txt
+
+          find . -maxdepth 2 \
+            -type f \
+            \( -name Makefile -o -name Kconfig \) \
+            >> ../../results/stage1-report.txt
+
+          cd ../..
+
+          echo "" >> results/stage1-report.txt
+          echo "===== IPQ95xx references =====" \
+            >> results/stage1-report.txt
+
+          grep -RniE \
+            'IPQ95|IPQ9574|IPQ95XX|NSS_DP_IPQ95' \
+            qsdk-src/qca-nss-ppe \
+            qsdk-src/qca-ssdk \
+            --include='Makefile' \
+            --include='Kconfig' \
+            --include='*.mk' \
+            --include='*.h' \
+            | head -500 \
+            >> results/stage1-report.txt || true
+
+          cat results/stage1-report.txt
+
+      - name: Archive exact source metadata
+        shell: bash
+        run: |
+          mkdir -p results/source-info
+
+          git -C qsdk-src/qca-nss-ppe \
+            show -s --format=fuller HEAD \
+            > results/source-info/PPE.txt
+
+          git -C qsdk-src/qca-ssdk \
+            show -s --format=fuller HEAD \
+            > results/source-info/SSDK.txt
+
+          git -C openwrt \
+            show -s --format=fuller HEAD \
+            > results/source-info/SBE1V1K.txt
+
+      - name: Upload Stage1 report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-V0.2-QSDK-Stage1
+          path: results/
+          retention-days: 7
