@@ -1,0 +1,395 @@
+name: SBE1V1K QSDK Stage7C PPE Debug Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git findutils grep sed curl jq
+
+      - name: Prepare directories
+        run: |
+          mkdir -p results
+          mkdir -p qsdk-probe
+
+      - name: Clone exact QSDK14 R9 PPE
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          git clone \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe.git \
+            qsdk-probe/qca-nss-ppe \
+            2>&1 | tee results/ppe-clone.txt
+
+          RC=${PIPESTATUS[0]}
+          echo "$RC" > results/ppe-clone-exit.txt
+
+          if [ "$RC" -eq 0 ]; then
+            git -C qsdk-probe/qca-nss-ppe checkout \
+              87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5 \
+              2>&1 | tee results/ppe-checkout.txt
+
+            git -C qsdk-probe/qca-nss-ppe rev-parse HEAD \
+              > results/ppe-head.txt
+          fi
+
+          exit 0
+
+      - name: Search PPE for nss_debug dependency
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "===== NSS_DEBUG REFERENCES IN PPE ====="
+            echo ""
+
+            grep -RniE \
+              'nss_debug\.h|nss_debug|qca-nss-debug' \
+              qsdk-probe/qca-nss-ppe \
+              --exclude-dir=.git \
+              2>/dev/null \
+              | head -3000
+
+          } > results/ppe-nss-debug-references.txt
+
+          cat results/ppe-nss-debug-references.txt
+
+          exit 0
+
+      - name: Inspect PPE Makefiles and Kbuild
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "===== PPE BUILD FILES ====="
+            echo ""
+
+            find qsdk-probe/qca-nss-ppe \
+              -type f \
+              \( \
+                -name 'Makefile' \
+                -o -name 'Kbuild' \
+                -o -name '*.mk' \
+              \) \
+              -print \
+              | sort
+
+          } > results/ppe-build-files.txt
+
+          {
+            echo "===== PPE BUILD DEFINITIONS ====="
+            echo ""
+
+            grep -RniE \
+              'nss_debug|EXTRA_CFLAGS|ccflags|KCFLAGS|INCLUDE|NSS_PPE|QCA_NSS' \
+              qsdk-probe/qca-nss-ppe \
+              --include='Makefile' \
+              --include='Kbuild' \
+              --include='*.mk' \
+              2>/dev/null \
+              | head -5000
+
+          } > results/ppe-build-definitions.txt
+
+          cat results/ppe-build-definitions.txt
+
+          exit 0
+
+      - name: List PPE header dependencies
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "===== PPE INCLUDE STATEMENTS ====="
+            echo ""
+
+            grep -RhoE \
+              '#[[:space:]]*include[[:space:]]*[<"][^>"]+[>"]' \
+              qsdk-probe/qca-nss-ppe \
+              --include='*.c' \
+              --include='*.h' \
+              2>/dev/null \
+              | sort -u
+
+          } > results/ppe-all-includes.txt
+
+          {
+            echo "===== NSS RELATED INCLUDE STATEMENTS ====="
+            echo ""
+
+            grep -Ei \
+              'nss|ppe|fal|ssdk|netfn' \
+              results/ppe-all-includes.txt \
+              | sort -u
+
+          } > results/ppe-nss-includes.txt
+
+          cat results/ppe-nss-includes.txt
+
+          exit 0
+
+      - name: Clone official QSDK nss-host feed
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          git clone \
+            https://git.codelinaro.org/clo/qsdk/oss/system/feeds/nss-host.git \
+            qsdk-probe/nss-host \
+            2>&1 | tee results/nss-host-clone.txt
+
+          RC=${PIPESTATUS[0]}
+          echo "$RC" > results/nss-host-clone-exit.txt
+
+          exit 0
+
+      - name: Search all nss-host history for qca-nss-debug
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "===== CURRENT TREE SEARCH ====="
+            echo ""
+
+            grep -RniE \
+              'qca-nss-debug|nss_debug\.h|nss-debug' \
+              qsdk-probe/nss-host \
+              --exclude-dir=.git \
+              2>/dev/null \
+              | head -3000
+
+          } > results/nss-host-current-debug.txt
+
+          {
+            echo "===== GIT HISTORY SEARCH ====="
+            echo ""
+
+            git -C qsdk-probe/nss-host log \
+              --all \
+              --oneline \
+              --decorate \
+              --grep='nss.debug' \
+              -i \
+              2>/dev/null \
+              | head -2000
+
+          } > results/nss-host-debug-history.txt
+
+          exit 0
+
+      - name: Search git objects for debug package names
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "===== ALL REMOTE BRANCHES ====="
+            git -C qsdk-probe/nss-host branch -a
+            echo ""
+
+            echo "===== ALL TAGS CONTAINING QSDK14 ====="
+            git -C qsdk-probe/nss-host tag -l \
+              | grep -Ei '14\.0|r9|NHSS' \
+              | sort -V
+            echo ""
+
+            echo "===== FILE NAMES ACROSS CURRENT TREE ====="
+            find qsdk-probe/nss-host \
+              -type f \
+              \( \
+                -iname '*nss*debug*' \
+                -o -iname '*debug*nss*' \
+              \) \
+              -print \
+              2>/dev/null
+
+          } > results/nss-host-repository-info.txt
+
+          exit 0
+
+      - name: Search CodeLinaro feed package metadata
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "===== PACKAGE SOURCE METADATA ====="
+            echo ""
+
+            grep -RniE \
+              'PKG_NAME.*debug|PKG_SOURCE.*debug|PKG_BUILD_DIR.*debug|qca-nss-debug|nss_debug' \
+              qsdk-probe/nss-host \
+              --exclude-dir=.git \
+              2>/dev/null \
+              | head -5000
+
+          } > results/debug-package-metadata.txt
+
+          exit 0
+
+      - name: Inspect PPE git history around exact commit
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "===== PPE EXACT COMMIT ====="
+            git -C qsdk-probe/qca-nss-ppe \
+              show \
+              --stat \
+              --oneline \
+              --decorate \
+              87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5 \
+              2>/dev/null
+
+            echo ""
+            echo "===== PPE RECENT HISTORY ====="
+
+            git -C qsdk-probe/qca-nss-ppe \
+              log \
+              -30 \
+              --oneline \
+              --decorate \
+              2>/dev/null
+
+            echo ""
+            echo "===== PPE DEBUG RELATED HISTORY ====="
+
+            git -C qsdk-probe/qca-nss-ppe \
+              log \
+              --all \
+              --oneline \
+              --grep='debug' \
+              -i \
+              2>/dev/null \
+              | head -1000
+
+          } > results/ppe-history.txt
+
+          exit 0
+
+      - name: Find nss_debug include context
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "===== NSS_DEBUG INCLUDE CONTEXT ====="
+            echo ""
+
+            grep -RniB10 -A20 \
+              'nss_debug\.h' \
+              qsdk-probe/qca-nss-ppe \
+              --exclude-dir=.git \
+              2>/dev/null \
+              | head -3000
+
+          } > results/nss-debug-context.txt
+
+          cat results/nss-debug-context.txt
+
+          exit 0
+
+      - name: Search for debug macros used by PPE
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "===== POSSIBLE NSS DEBUG SYMBOLS ====="
+            echo ""
+
+            grep -RhoE \
+              '\b(nss|NSS)_[A-Za-z0-9_]*(warn|info|trace|assert|debug|error)[A-Za-z0-9_]*\b' \
+              qsdk-probe/qca-nss-ppe \
+              --include='*.c' \
+              --include='*.h' \
+              2>/dev/null \
+              | sort -u
+
+          } > results/ppe-debug-symbols.txt
+
+          cat results/ppe-debug-symbols.txt
+
+          exit 0
+
+      - name: Produce Stage7C summary
+        shell: bash
+        run: |
+          {
+            echo "===== STAGE7C SUMMARY ====="
+            echo ""
+
+            PPE_HEAD=$(cat results/ppe-head.txt 2>/dev/null || true)
+
+            echo "PPE commit:"
+            echo "$PPE_HEAD"
+            echo ""
+
+            if grep -Rqi \
+              'nss_debug\.h' \
+              qsdk-probe/qca-nss-ppe \
+              --exclude-dir=.git \
+              2>/dev/null
+            then
+              echo "PPE requires nss_debug.h: YES"
+            else
+              echo "PPE requires nss_debug.h: NO"
+            fi
+
+            echo ""
+
+            DEBUG_FILE=$(find \
+              qsdk-probe/qca-nss-ppe \
+              qsdk-probe/nss-host \
+              -type f \
+              -name 'nss_debug.h' \
+              -print -quit \
+              2>/dev/null)
+
+            if [ -n "$DEBUG_FILE" ]; then
+              echo "nss_debug.h found locally: YES"
+              echo "Path: $DEBUG_FILE"
+            else
+              echo "nss_debug.h found locally: NO"
+            fi
+
+            echo ""
+
+            if grep -Rqi \
+              'qca-nss-debug' \
+              qsdk-probe/nss-host \
+              --exclude-dir=.git \
+              2>/dev/null
+            then
+              echo "qca-nss-debug package reference: FOUND"
+            else
+              echo "qca-nss-debug package reference: NOT FOUND"
+            fi
+
+          } | tee results/stage7c-summary.txt
+
+      - name: Upload Stage7C diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-V0.2-QSDK-Stage7C-Probe
+          path: results/
+          retention-days: 7
