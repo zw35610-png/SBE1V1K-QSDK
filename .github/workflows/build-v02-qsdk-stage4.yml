@@ -1,0 +1,278 @@
+name: SBE1V1K V0.2 QSDK Stage4
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib gettext git libncurses-dev \
+            libssl-dev python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget curl jq bc
+
+      - name: Clone SBE1V1K baseline
+        run: |
+          git clone https://github.com/luckkyboy/SBE1V1K.git openwrt
+          cd openwrt
+          git checkout 02fb9517c9aefac9f3825a15ae46e7998bae7edd
+
+          cp configs/sbe1v1k.config .config
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+
+      - name: Download sources
+        run: |
+          cd openwrt
+          make download -j$(nproc)
+
+      - name: Build OpenWrt tools and toolchain
+        shell: bash
+        run: |
+          set -o pipefail
+          cd openwrt
+
+          make tools/install -j$(nproc) \
+            2>&1 | tee ../tools.log
+
+          make toolchain/install -j$(nproc) \
+            2>&1 | tee ../toolchain.log
+
+          make target/linux/prepare -j$(nproc) \
+            2>&1 | tee ../target-linux-prepare.log
+
+      - name: Fetch exact QSDK14 R9 PPE and SSDK
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p qsdk-src
+
+          git clone \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe.git \
+            qsdk-src/qca-nss-ppe
+
+          git -C qsdk-src/qca-nss-ppe checkout \
+            87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+
+          git clone \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-ssdk.git \
+            qsdk-src/qca-ssdk
+
+          git -C qsdk-src/qca-ssdk checkout \
+            717b74016b0c131575bcd81b9e039d3f7974b02a
+
+      - name: Locate build environment
+        shell: bash
+        run: |
+          set -e
+          mkdir -p results
+
+          KERNEL_DIR=$(find \
+            "$GITHUB_WORKSPACE/openwrt/build_dir" \
+            -type d \
+            -path '*/linux-*/linux-6.18*' \
+            -print -quit)
+
+          TOOLCHAIN_DIR=$(find \
+            "$GITHUB_WORKSPACE/openwrt/staging_dir" \
+            -maxdepth 1 \
+            -type d \
+            -name 'toolchain-aarch64*' \
+            -print -quit)
+
+          GCC=$(find \
+            "$TOOLCHAIN_DIR/bin" \
+            -type f \
+            -name 'aarch64-openwrt-linux-musl-gcc' \
+            -print -quit)
+
+          CROSS_PREFIX="${GCC%gcc}"
+
+          {
+            echo "KERNEL_DIR=$KERNEL_DIR"
+            echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR"
+            echo "GCC=$GCC"
+            echo "CROSS_COMPILE=$CROSS_PREFIX"
+          } | tee results/environment.txt
+
+          test -d "$KERNEL_DIR"
+          test -x "$GCC"
+
+      - name: Fully prepare Linux kernel
+        shell: bash
+        run: |
+          set -e
+
+          KERNEL_DIR=$(grep '^KERNEL_DIR=' \
+            results/environment.txt | cut -d= -f2-)
+
+          CROSS_PREFIX=$(grep '^CROSS_COMPILE=' \
+            results/environment.txt | cut -d= -f2-)
+
+          make -C "$KERNEL_DIR" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_PREFIX" \
+            olddefconfig
+
+          make -C "$KERNEL_DIR" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_PREFIX" \
+            prepare
+
+          make -C "$KERNEL_DIR" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_PREFIX" \
+            modules_prepare
+
+          {
+            test -f "$KERNEL_DIR/include/generated/autoconf.h" \
+              && echo "autoconf.h: OK"
+
+            test -f "$KERNEL_DIR/include/config/auto.conf" \
+              && echo "auto.conf: OK"
+
+            test -f "$KERNEL_DIR/include/generated/utsrelease.h" \
+              && echo "utsrelease.h: OK"
+          } | tee results/kernel-check.txt
+
+      - name: Verify SSDK headers
+        shell: bash
+        run: |
+          set -e
+
+          SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+
+          {
+            echo "===== REQUIRED HEADER ====="
+            find "$SSDK" -name 'fal_rss_hash.h' -print
+
+            echo ""
+            echo "===== SSDK INCLUDE TREE ====="
+            find "$SSDK/include" \
+              -maxdepth 2 \
+              -type d \
+              | sort
+
+          } | tee results/ssdk-header-check.txt
+
+          test -f "$SSDK/include/fal/fal_rss_hash.h"
+
+      - name: Compile QSDK14 R9 PPE with SSDK headers
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          KERNEL_DIR=$(grep '^KERNEL_DIR=' \
+            results/environment.txt | cut -d= -f2-)
+
+          CROSS_PREFIX=$(grep '^CROSS_COMPILE=' \
+            results/environment.txt | cut -d= -f2-)
+
+          PPE_DIR="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe/drv/ppe_drv"
+          SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+
+          QSDK_HEADERS="\
+          -I$SSDK/include \
+          -I$SSDK/include/common \
+          -I$SSDK/include/fal \
+          -I$SSDK/include/hsl \
+          -I$SSDK/include/init \
+          -I$SSDK/src \
+          -I$SSDK/src/fal \
+          -I$SSDK/src/hsl"
+
+          echo "===== HEADER FLAGS =====" \
+            | tee results/header-flags.txt
+
+          echo "$QSDK_HEADERS" \
+            | tee -a results/header-flags.txt
+
+          make \
+            -C "$KERNEL_DIR" \
+            M="$PPE_DIR" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_PREFIX" \
+            SoC=ipq95xx \
+            CONFIG_NET_DSA=y \
+            KCFLAGS="$QSDK_HEADERS" \
+            modules \
+            V=1 \
+            2>&1 | tee results/ppe-compile.log
+
+          RC=${PIPESTATUS[0]}
+
+          echo "$RC" \
+            | tee results/ppe-exit-code.txt
+
+          exit 0
+
+      - name: Verify header injection
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "===== GCC COMMANDS CONTAINING QCA-SSDK ====="
+
+            grep -F 'qca-ssdk' \
+              results/ppe-compile.log \
+              | head -50 || true
+
+          } > results/header-injection.txt
+
+          cat results/header-injection.txt
+
+      - name: Analyze PPE result
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "===== PPE ERRORS ====="
+
+            grep -iE \
+              'error:|fatal error:|implicit declaration|undefined|No such file|No rule to make target' \
+              results/ppe-compile.log \
+              | head -1000 || true
+
+          } > results/ppe-errors.txt
+
+          {
+            echo "===== GENERATED FILES ====="
+
+            find qsdk-src/qca-nss-ppe \
+              -type f \
+              \( -name '*.o' \
+              -o -name '*.ko' \
+              -o -name '*.mod' \) \
+              | sort || true
+
+          } > results/ppe-generated.txt
+
+          cat results/ppe-errors.txt
+
+      - name: Upload Stage4 diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-V0.2-QSDK-Stage4
+          path: results/
+          retention-days: 7
