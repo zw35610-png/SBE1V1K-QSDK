@@ -1,0 +1,772 @@
+name: SBE1V1K V0.2 QSDK Stage10 PPE Flow Compat
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib gettext git libncurses-dev \
+            libssl-dev python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget curl jq bc
+
+      - name: Clone SBE1V1K baseline
+        run: |
+          git clone \
+            https://github.com/luckkyboy/SBE1V1K.git \
+            openwrt
+
+          cd openwrt
+
+          git checkout \
+            02fb9517c9aefac9f3825a15ae46e7998bae7edd
+
+          cp configs/sbe1v1k.config .config
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+
+      - name: Cache OpenWrt downloads
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: sbe1v1k-stage10-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}
+          restore-keys: |
+            sbe1v1k-stage10-${{ runner.os }}-
+            sbe1v1k-stage9-${{ runner.os }}-
+            sbe1v1k-openwrt-dl-${{ runner.os }}-
+
+      - name: Download sources
+        run: |
+          cd openwrt
+          make download -j$(nproc)
+
+      - name: Build OpenWrt kernel
+        shell: bash
+        run: |
+          set -o pipefail
+          cd openwrt
+
+          make tools/install -j$(nproc) \
+            2>&1 | tee ../tools.log
+
+          make toolchain/install -j$(nproc) \
+            2>&1 | tee ../toolchain.log
+
+          make target/linux/compile -j$(nproc) \
+            2>&1 | tee ../kernel-compile.log
+
+      - name: Fetch exact QSDK sources
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p qsdk-src results
+
+          git clone \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe.git \
+            qsdk-src/qca-nss-ppe
+
+          git -C qsdk-src/qca-nss-ppe checkout \
+            87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+
+          git clone \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-ssdk.git \
+            qsdk-src/qca-ssdk
+
+          git -C qsdk-src/qca-ssdk checkout \
+            717b74016b0c131575bcd81b9e039d3f7974b02a
+
+          {
+            echo "PPE=$(git -C qsdk-src/qca-nss-ppe rev-parse HEAD)"
+            echo "SSDK=$(git -C qsdk-src/qca-ssdk rev-parse HEAD)"
+          } | tee results/qsdk-commits.txt
+
+      - name: Locate kernel and toolchain
+        shell: bash
+        run: |
+          set -e
+
+          KERNEL_DIR=$(find \
+            "$GITHUB_WORKSPACE/openwrt/build_dir" \
+            -type d \
+            -path '*/linux-*/linux-6.18*' \
+            -print -quit)
+
+          TOOLCHAIN_DIR=$(find \
+            "$GITHUB_WORKSPACE/openwrt/staging_dir" \
+            -maxdepth 1 \
+            -type d \
+            -name 'toolchain-aarch64*' \
+            -print -quit)
+
+          GCC=$(find \
+            "$TOOLCHAIN_DIR/bin" \
+            -type f \
+            -name 'aarch64-openwrt-linux-musl-gcc' \
+            -print -quit)
+
+          CROSS_PREFIX="${GCC%gcc}"
+
+          {
+            echo "KERNEL_DIR=$KERNEL_DIR"
+            echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR"
+            echo "GCC=$GCC"
+            echo "CROSS_COMPILE=$CROSS_PREFIX"
+          } | tee results/environment.txt
+
+          test -d "$KERNEL_DIR"
+          test -x "$GCC"
+
+      - name: Verify kernel Module.symvers
+        shell: bash
+        run: |
+          set +e
+
+          KERNEL_DIR=$(grep '^KERNEL_DIR=' \
+            results/environment.txt | cut -d= -f2-)
+
+          {
+            echo "===== KERNEL BUILD CHECK ====="
+            echo "Kernel: $KERNEL_DIR"
+            echo ""
+
+            if [ -s "$KERNEL_DIR/Module.symvers" ]; then
+              echo "Module.symvers: PRESENT"
+              echo -n "Lines: "
+              wc -l < "$KERNEL_DIR/Module.symvers"
+              echo -n "Size: "
+              stat -c '%s bytes' "$KERNEL_DIR/Module.symvers"
+            else
+              echo "Module.symvers: MISSING OR EMPTY"
+            fi
+          } | tee results/kernel-symvers-check.txt
+
+      - name: Generate QSDK include flags
+        shell: bash
+        run: |
+          set -e
+
+          SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+          PPE="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe"
+
+          test -f "$SSDK/include/fal/fal_rss_hash.h"
+          test -f "$SSDK/include/sal/os/aos_mem.h"
+          test -f "$PPE/nss_debug/exports/nss_debug.h"
+
+          find "$SSDK" \
+            -type f \
+            -name '*.h' \
+            -printf '%h\n' \
+            | sort -u \
+            > results/ssdk-header-dirs.txt
+
+          : > results/qsdk-header-flags.txt
+
+          printf -- '-I%s ' "$SSDK/include" \
+            >> results/qsdk-header-flags.txt
+
+          while IFS= read -r DIR
+          do
+            printf -- '-I%s ' "$DIR" \
+              >> results/qsdk-header-flags.txt
+          done < results/ssdk-header-dirs.txt
+
+          printf -- '-I%s ' \
+            "$PPE/nss_debug/exports" \
+            >> results/qsdk-header-flags.txt
+
+          printf -- '%s ' \
+            '-Wno-error=ignored-qualifiers' \
+            '-Wno-error=missing-prototypes' \
+            '-Wno-error=shift-count-overflow' \
+            >> results/qsdk-header-flags.txt
+
+          cat results/qsdk-header-flags.txt
+
+      - name: Save original PPE context
+        shell: bash
+        run: |
+          PPE="qsdk-src/qca-nss-ppe/drv/ppe_drv"
+
+          {
+            echo "===== PPE_DRV.C LINES 1-90 ====="
+            nl -ba "$PPE/ppe_drv.c" | sed -n '1,90p'
+
+            echo ""
+            echo "===== PLATFORM DRIVER AREA ====="
+            nl -ba "$PPE/ppe_drv.c" | sed -n '2820,2920p'
+
+            echo ""
+            echo "===== DSA AREA ====="
+            nl -ba "$PPE/ppe_drv.c" | sed -n '3810,3900p'
+
+            echo ""
+            echo "===== SYSCTL AREA ====="
+            nl -ba "$PPE/ppe_drv.c" | sed -n '4380,4620p'
+
+          } > results/ppe-original-context.txt
+
+      - name: Apply Linux 6.18 DSA compatibility
+        shell: bash
+        run: |
+          set -e
+
+          PPE="qsdk-src/qca-nss-ppe/drv/ppe_drv"
+
+          COUNT_BEFORE=$(grep -R \
+            'dsa_slave_dev_check' \
+            "$PPE" \
+            --include='*.c' \
+            --include='*.h' \
+            | wc -l || true)
+
+          find "$PPE" \
+            -type f \
+            \( -name '*.c' -o -name '*.h' \) \
+            -print0 \
+            | xargs -0 sed -i \
+              's/dsa_slave_dev_check/dsa_user_dev_check/g'
+
+          COUNT_AFTER=$(grep -R \
+            'dsa_slave_dev_check' \
+            "$PPE" \
+            --include='*.c' \
+            --include='*.h' \
+            | wc -l || true)
+
+          {
+            echo "DSA replacements before: $COUNT_BEFORE"
+            echo "Old API remaining: $COUNT_AFTER"
+            echo ""
+
+            grep -Rni \
+              'dsa_user_dev_check' \
+              "$PPE" \
+              --include='*.c' \
+              --include='*.h' || true
+
+          } | tee results/dsa-compat.txt
+
+      - name: Apply Linux 6.18 platform remove compatibility
+        shell: bash
+        run: |
+          set -e
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("qsdk-src/qca-nss-ppe/drv/ppe_drv/ppe_drv.c")
+          s = p.read_text()
+
+          m = re.search(
+              r'\.remove\s*=\s*([A-Za-z_][A-Za-z0-9_]*)',
+              s
+          )
+
+          if not m:
+              print("No .remove callback found")
+              raise SystemExit(0)
+
+          fn = m.group(1)
+          print("remove callback:", fn)
+
+          pattern = re.compile(
+              r'(static\s+)int(\s+' +
+              re.escape(fn) +
+              r'\s*\(\s*struct\s+platform_device\s*\*\s*'
+              r'[A-Za-z_][A-Za-z0-9_]*\s*\))'
+          )
+
+          s2, n = pattern.subn(
+              r'\1void\2',
+              s,
+              count=1
+          )
+
+          if n:
+              start = s2.find("static void " + fn)
+              brace = s2.find("{", start)
+
+              if start >= 0 and brace >= 0:
+                  depth = 0
+                  end = None
+
+                  for i in range(brace, len(s2)):
+                      if s2[i] == "{":
+                          depth += 1
+                      elif s2[i] == "}":
+                          depth -= 1
+
+                          if depth == 0:
+                              end = i + 1
+                              break
+
+                  if end:
+                      body = s2[start:end]
+                      body = re.sub(
+                          r'\breturn\s+0\s*;',
+                          'return;',
+                          body
+                      )
+                      s2 = s2[:start] + body + s2[end:]
+
+          p.write_text(s2)
+
+          print("definition replacements:", n)
+          PY
+
+          {
+            echo "===== REMOVE CALLBACK AFTER PATCH ====="
+
+            grep -nE \
+              '\.remove|static void .*remove|static int .*remove' \
+              qsdk-src/qca-nss-ppe/drv/ppe_drv/ppe_drv.c \
+              | head -100 || true
+
+          } | tee results/platform-remove-compat.txt
+
+      - name: Apply Linux 6.18 sysctl const compatibility
+        shell: bash
+        run: |
+          set -e
+
+          PPE="qsdk-src/qca-nss-ppe/drv/ppe_drv"
+
+          find "$PPE" \
+            -type f \
+            \( -name '*.c' -o -name '*.h' \) \
+            -print0 \
+            | xargs -0 sed -Ei \
+              's/\bstruct ctl_table \*([A-Za-z_][A-Za-z0-9_]*)/const struct ctl_table *\1/g'
+
+          {
+            echo "===== CTL_TABLE REFERENCES AFTER PATCH ====="
+
+            grep -Rni \
+              'ctl_table' \
+              "$PPE" \
+              --include='*.c' \
+              --include='*.h' \
+              | head -1000 || true
+
+          } > results/sysctl-compat.txt
+
+      - name: Apply PPE Flow Linux 6.18 compatibility
+        shell: bash
+        run: |
+          set -e
+
+          FILE="qsdk-src/qca-nss-ppe/drv/ppe_drv/ppe_drv_flow.c"
+
+          cp "$FILE" results/ppe_drv_flow.original.c
+
+          {
+            echo "===== ORIGINAL MAP-T AREA ====="
+            nl -ba "$FILE" | sed -n '3300,3350p'
+
+            echo ""
+            echo "===== VMALLOC AREA ====="
+            nl -ba "$FILE" | sed -n '3670,3780p'
+
+          } > results/ppe-flow-original-context.txt
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path(
+              "qsdk-src/qca-nss-ppe/drv/ppe_drv/ppe_drv_flow.c"
+          )
+
+          s = p.read_text()
+
+          #
+          # Linux 6.18: vzalloc/vfree declarations.
+          #
+          if "#include <linux/vmalloc.h>" not in s:
+              includes = list(
+                  re.finditer(
+                      r'^#include\s+[<"].*[>"]\s*$',
+                      s,
+                      re.M
+                  )
+              )
+
+              if not includes:
+                  raise RuntimeError(
+                      "Could not locate include block"
+                  )
+
+              pos = includes[-1].end()
+
+              s = (
+                  s[:pos]
+                  + "\n#include <linux/vmalloc.h>"
+                  + s[pos:]
+              )
+
+          #
+          # QSDK14 has Qualcomm-specific net_device extension:
+          #
+          #   priv_flags_ext & IFF_EXT_MAPT
+          #
+          # Upstream Linux 6.18 does not expose this field.
+          #
+          # Stage10 compile-depth probe only:
+          # temporarily report MAP-T flag as false.
+          #
+          helper = r'''
+          /*
+           * QSDK14 / Linux 6.18 compatibility probe.
+           *
+           * Qualcomm QSDK net_device contains priv_flags_ext and
+           * IFF_EXT_MAPT. Upstream Linux does not.
+           *
+           * Stage10 temporarily disables this MAP-T device flag
+           * check so that PPE compilation can continue.
+           *
+           * This is NOT the final runtime MAP-T implementation.
+           */
+          static inline bool
+          ppe_drv_flow_dev_is_mapt(struct net_device *dev)
+          {
+              (void)dev;
+              return false;
+          }
+          '''
+
+          marker = "ppe_drv_flow_dev_is_mapt"
+
+          if marker not in s:
+              includes = list(
+                  re.finditer(
+                      r'^#include\s+[<"].*[>"]\s*$',
+                      s,
+                      re.M
+                  )
+              )
+
+              pos = includes[-1].end()
+
+              s = (
+                  s[:pos]
+                  + "\n\n"
+                  + helper
+                  + "\n"
+                  + s[pos:]
+              )
+
+          s, n1 = re.subn(
+              r'\(\s*dev_eg->priv_flags_ext\s*&\s*'
+              r'IFF_EXT_MAPT\s*\)',
+              r'ppe_drv_flow_dev_is_mapt(dev_eg)',
+              s
+          )
+
+          s, n2 = re.subn(
+              r'\(\s*dev_in->priv_flags_ext\s*&\s*'
+              r'IFF_EXT_MAPT\s*\)',
+              r'ppe_drv_flow_dev_is_mapt(dev_in)',
+              s
+          )
+
+          p.write_text(s)
+
+          print(
+              "dev_eg MAP-T replacements:",
+              n1
+          )
+
+          print(
+              "dev_in MAP-T replacements:",
+              n2
+          )
+
+          if n1 == 0 or n2 == 0:
+              raise RuntimeError(
+                  "Expected MAP-T expressions "
+                  "were not both replaced"
+              )
+          PY
+
+          {
+            echo "===== AFTER STAGE10 FLOW PATCH ====="
+            echo ""
+
+            grep -nE \
+              'vmalloc.h|ppe_drv_flow_dev_is_mapt|priv_flags_ext|IFF_EXT_MAPT|vzalloc|vfree' \
+              "$FILE" || true
+
+            echo ""
+            echo "===== MAP-T AREA AFTER PATCH ====="
+
+            nl -ba "$FILE" | sed -n '3300,3370p'
+
+          } | tee results/ppe-flow-compat.txt
+
+      - name: Save Linux 6.18 compatibility patch
+        shell: bash
+        run: |
+          git -C qsdk-src/qca-nss-ppe diff \
+            > results/linux-6.18-stage10-compat.patch || true
+
+          echo "===== STAGE10 PATCH ====="
+          cat results/linux-6.18-stage10-compat.patch
+
+      - name: Compile QCA NSS Debug
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          KERNEL_DIR=$(grep '^KERNEL_DIR=' \
+            results/environment.txt | cut -d= -f2-)
+
+          CROSS_PREFIX=$(grep '^CROSS_COMPILE=' \
+            results/environment.txt | cut -d= -f2-)
+
+          DEBUG_DIR="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe/nss_debug"
+
+          FLAGS=$(cat results/qsdk-header-flags.txt)
+
+          make \
+            -C "$KERNEL_DIR" \
+            M="$DEBUG_DIR" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_PREFIX" \
+            KCFLAGS="$FLAGS" \
+            modules \
+            V=1 \
+            2>&1 | tee results/nss-debug-compile.log
+
+          RC=${PIPESTATUS[0]}
+
+          echo "$RC" \
+            > results/nss-debug-exit-code.txt
+
+          exit 0
+
+      - name: Compile PPE
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          KERNEL_DIR=$(grep '^KERNEL_DIR=' \
+            results/environment.txt | cut -d= -f2-)
+
+          CROSS_PREFIX=$(grep '^CROSS_COMPILE=' \
+            results/environment.txt | cut -d= -f2-)
+
+          PPE_DIR="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe/drv/ppe_drv"
+
+          FLAGS=$(cat results/qsdk-header-flags.txt)
+
+          make \
+            -C "$KERNEL_DIR" \
+            M="$PPE_DIR" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_PREFIX" \
+            SoC=ipq95xx \
+            CONFIG_NET_DSA=y \
+            KCFLAGS="$FLAGS" \
+            modules \
+            V=1 \
+            2>&1 | tee results/ppe-compile.log
+
+          RC=${PIPESTATUS[0]}
+
+          echo "$RC" \
+            > results/ppe-exit-code.txt
+
+          exit 0
+
+      - name: Analyze Stage10 compilation
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "===== NSS DEBUG ERRORS ====="
+
+            grep -iE \
+              'error:|fatal error:|undefined!|MODPOST|No such file' \
+              results/nss-debug-compile.log \
+              | head -2000 || true
+
+          } > results/nss-debug-errors.txt
+
+          {
+            echo "===== PPE ERRORS ====="
+
+            grep -iE \
+              'error:|fatal error:|implicit declaration|undefined!|has no member|incompatible pointer|conflicting types|too few arguments|too many arguments|unknown type|undeclared|MODPOST|No such file' \
+              results/ppe-compile.log \
+              | head -5000 || true
+
+          } > results/ppe-errors.txt
+
+          {
+            echo "===== PPE COMPILE DEPTH ====="
+
+            grep -E \
+              'CC \[M\]|LD \[M\]|MODPOST|\.ko' \
+              results/ppe-compile.log \
+              | head -5000 || true
+
+          } > results/ppe-compile-depth.txt
+
+          {
+            echo "===== MISSING HEADERS ====="
+
+            grep -hE \
+              'fatal error: .*: No such file or directory' \
+              results/nss-debug-compile.log \
+              results/ppe-compile.log \
+              2>/dev/null \
+              | sed -E \
+                's/.*fatal error: ([^:]+): No such file or directory.*/\1/' \
+              | sort -u || true
+
+          } > results/missing-headers.txt
+
+          {
+            echo "===== LINUX API ERRORS ====="
+
+            grep -hiE \
+              'implicit declaration|has no member named|too few arguments|too many arguments|incompatible pointer|conflicting types|undeclared|unknown type name' \
+              results/ppe-compile.log \
+              2>/dev/null \
+              | head -5000 || true
+
+          } > results/linux-api-errors.txt
+
+          {
+            echo "===== SHIFT WARNINGS ====="
+
+            grep -n -B8 -A12 \
+              'shift-count-overflow' \
+              results/ppe-compile.log \
+              | head -3000 || true
+
+          } > results/shift-overflow-analysis.txt
+
+          cat results/ppe-errors.txt
+
+      - name: Collect Stage10 products
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p results/modules
+
+          find qsdk-src/qca-nss-ppe \
+            -type f \
+            \( \
+              -name '*.ko' \
+              -o -name '*.o' \
+              -o -name 'Module.symvers' \
+            \) \
+            -exec cp --parents -v {} results/modules/ \; \
+            2>/dev/null || true
+
+          find results/modules \
+            -type f \
+            > results/module-products.txt || true
+
+      - name: Stage10 summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "===== STAGE10 SUMMARY ====="
+            echo ""
+
+            echo -n "NSS Debug exit: "
+            cat results/nss-debug-exit-code.txt \
+              2>/dev/null || echo UNKNOWN
+
+            echo -n "PPE exit: "
+            cat results/ppe-exit-code.txt \
+              2>/dev/null || echo UNKNOWN
+
+            echo ""
+
+            KERNEL_DIR=$(grep '^KERNEL_DIR=' \
+              results/environment.txt \
+              | cut -d= -f2-)
+
+            if [ -s "$KERNEL_DIR/Module.symvers" ]; then
+              echo "Kernel Module.symvers: OK"
+            else
+              echo "Kernel Module.symvers: MISSING"
+            fi
+
+            if find qsdk-src/qca-nss-ppe/nss_debug \
+              -name '*.ko' \
+              -print -quit \
+              | grep -q .
+            then
+              echo "qca-nss-debug.ko: GENERATED"
+            else
+              echo "qca-nss-debug.ko: NOT GENERATED"
+            fi
+
+            if find qsdk-src/qca-nss-ppe/drv/ppe_drv \
+              -name '*.ko' \
+              -print -quit \
+              | grep -q .
+            then
+              echo "qca-nss-ppe.ko: GENERATED"
+            else
+              echo "qca-nss-ppe.ko: NOT GENERATED"
+            fi
+
+            echo ""
+            echo -n "PPE object count: "
+
+            find qsdk-src/qca-nss-ppe/drv/ppe_drv \
+              -name '*.o' \
+              | wc -l
+
+            echo ""
+            echo "Remaining missing headers:"
+
+            cat results/missing-headers.txt \
+              2>/dev/null || true
+
+            echo ""
+            echo "===== FIRST PPE ERRORS ====="
+
+            head -100 \
+              results/ppe-errors.txt \
+              2>/dev/null || true
+
+          } | tee results/stage10-summary.txt
+
+      - name: Upload Stage10
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-V0.2-QSDK-Stage10
+          path: results/
+          retention-days: 7
