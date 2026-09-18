@@ -1,0 +1,1399 @@
+# Compile probe only; no image creation, deployment or flashing.
+name: SBE1V1K V0.2 QSDK Stage16 bridge FDB compatibility and SSDK build
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Initialize diagnostics
+      shell: bash
+      run: |
+        mkdir -p results
+    - name: Free disk
+      run: |
+        sudo rm -rf /usr/local/lib/android || true
+        sudo rm -rf /usr/share/dotnet || true
+        sudo rm -rf /opt/ghc || true
+        sudo apt-get clean
+        df -h
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential clang flex bison g++ gawk \
+          gcc-multilib gettext git libncurses-dev \
+          libssl-dev python3-setuptools rsync swig \
+          unzip zlib1g-dev file wget curl jq bc kmod
+    - name: Clone SBE1V1K baseline
+      run: |
+        git clone \
+          https://github.com/luckkyboy/SBE1V1K.git \
+          openwrt
+        
+        cd openwrt
+        
+        git checkout \
+          02fb9517c9aefac9f3825a15ae46e7998bae7edd
+        
+        cp configs/sbe1v1k.config .config
+        
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        make defconfig
+    - name: Cache OpenWrt downloads
+      uses: actions/cache@v4
+      with:
+        path: openwrt/dl
+        key: sbe1v1k-stage16-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}
+        restore-keys: |
+          sbe1v1k-stage15-${{ runner.os }}-
+          sbe1v1k-stage14-${{ runner.os }}-
+          sbe1v1k-stage13-${{ runner.os }}-
+          sbe1v1k-stage12-${{ runner.os }}-
+          sbe1v1k-stage11-${{ runner.os }}-
+          sbe1v1k-stage10-${{ runner.os }}-
+          sbe1v1k-stage9-${{ runner.os }}-
+          sbe1v1k-openwrt-dl-${{ runner.os }}-
+    - name: Fetch exact QSDK sources
+      shell: bash
+      run: |
+        set -e
+        
+        mkdir -p qsdk-src results
+        
+        git clone \
+          https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe.git \
+          qsdk-src/qca-nss-ppe
+        
+        git -C qsdk-src/qca-nss-ppe checkout \
+          87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+        
+        git clone \
+          https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-ssdk.git \
+          qsdk-src/qca-ssdk
+        
+        git -C qsdk-src/qca-ssdk checkout \
+          717b74016b0c131575bcd81b9e039d3f7974b02a
+        
+        {
+          echo "PPE=$(git -C qsdk-src/qca-nss-ppe rev-parse HEAD)"
+          echo "SSDK=$(git -C qsdk-src/qca-ssdk rev-parse HEAD)"
+        } | tee results/qsdk-commits.txt
+        
+        test "$(git -C qsdk-src/qca-nss-ppe rev-parse HEAD)" = 87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+        test "$(git -C qsdk-src/qca-ssdk rev-parse HEAD)" = 717b74016b0c131575bcd81b9e039d3f7974b02a
+        git clone https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-nss-phy.git qsdk-src/qca-nss-phy
+        git -C qsdk-src/qca-nss-phy checkout --detach 16eec6ac35820cb67af59223e8b4c2dba7179655
+        test "$(git -C qsdk-src/qca-nss-phy rev-parse HEAD)" = 16eec6ac35820cb67af59223e8b4c2dba7179655
+        echo "PHY=$(git -C qsdk-src/qca-nss-phy rev-parse HEAD)" >> results/qsdk-commits.txt
+        git -C qsdk-src/qca-nss-phy log -1 --format=fuller > results/phy-source-commit.txt
+        git -C qsdk-src/qca-nss-phy ls-tree -r --name-only HEAD > results/phy-source-tree.txt
+    - name: Inspect pinned SSDK source and package build evidence
+      run: |
+        set -euo pipefail
+        SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+        mkdir -p results/ssdk-source-context
+        git -C "$SSDK" ls-tree -r --name-only HEAD > results/ssdk-source-tree.txt
+        git -C "$SSDK" log -1 --format=fuller > results/ssdk-source-commit.txt
+        find "$SSDK" -path "$SSDK/.git" -prune -o -type f \( -iname '*makefile*' -o -name '*.mk' -o -name '*build*.sh' -o -name 'make.sh' -o -name 'Kbuild' \) -print | sort > results/ssdk-build-entry-inventory.txt
+        cp -a "$SSDK/mk" results/ssdk-source-context/
+        cat > results/ssdk-source-context/QSDK-package-Makefile <<'QSDK_PACKAGE'
+        
+        include $(TOPDIR)/rules.mk
+        include $(INCLUDE_DIR)/kernel.mk
+        
+        PKG_NAME:=qca-ssdk
+        PKG_SOURCE_PROTO:=git
+        PKG_BRANCH:=master
+        PKG_RELEASE:=1
+        
+        ifeq ($(CONFIG_TARGET_ipq),y)
+        	subtarget:=$(SUBTARGET)
+        else
+        	subtarget:=$(CONFIG_TARGET_BOARD)
+        endif
+        
+        ifneq (, $(findstring _64, $(subtarget)))
+        	hal_arch:=$(subst _64,,$(subtarget))
+        else ifneq (, $(findstring _32, $(subtarget)))
+        	hal_arch:=$(subst _32,,$(subtarget))
+        else
+        	hal_arch:=$(subtarget)
+        endif
+        
+        include $(INCLUDE_DIR)/local-development.mk
+        ifeq ($(DUMP)$(PKG_VERSION),)
+        	PKG_VERSION:=$(shell git ls-remote $(PKG_SOURCE_URL) $(PKG_BRANCH) | cut -b -7)
+        endif
+        
+        LOCAL_VARIANT=$(patsubst qca-ssdk-%,%,$(patsubst qca-ssdk-%,%,$(BUILD_VARIANT)))
+        include $(INCLUDE_DIR)/package.mk
+        
+        define KernelPackage/qca-ssdk/default-nohnat
+          SECTION:=kernel
+          CATEGORY:=Kernel modules
+          SUBMENU:=Network Devices
+          TITLE:=Kernel driver for QCA SSDK
+          FILES:=$(PKG_BUILD_DIR)/build/bin/qca-ssdk.ko
+          AUTOLOAD:=$(call AutoLoad,30,qca-ssdk)
+          PROVIDES:=qca-ssdk
+        endef
+        
+        define KernelPackage/qca-ssdk-nohnat
+        $(call KernelPackage/qca-ssdk/default-nohnat)
+          DEPENDS:=@!(TARGET_ipq_ipq40xx||TARGET_ipq40xx)||TARGET_ar71xx \
+        	+kmod-qca-nss-phy
+          VARIANT:=nohnat
+        
+          ifneq (, $(findstring $(hal_arch), "ipq50xx"))
+            ifeq (, $(CONFIG_LOWMEM_FLASH))
+              ifneq ($(LINUX_VERSION),$(filter 5.4%,$(LINUX_VERSION)))
+              DEPENDS+=kmod-ipt-filter +kmod-ppp
+              QCASSDK_CONFIG_OPTS+= HNAT_FEATURE=enable
+              endif
+            endif
+          endif
+        endef
+        
+        define KernelPackage/qca-ssdk-nohnat/Description
+        This package contains a qca-ssdk driver for QCA chipset
+        endef
+        
+        define KernelPackage/qca-ssdk-hnat
+        $(call KernelPackage/qca-ssdk/default-nohnat)
+          DEPENDS:=@TARGET_ipq_ipq40xx||TARGET_ipq40xx||TARGET_ar71xx||TARGET_ipq806x +kmod-ipt-extra \
+        	  +kmod-ipt-filter +(TARGET_ipq806x||TARGET_ipq):kmod-qca-rfs +kmod-ppp
+          TITLE+= (hnat)
+          VARIANT:=hnat
+        endef
+        
+        define KernelPackage/qca-ssdk-hnat/Description
+        This package contains a qca-ssdk-hnat driver for QCA chipset
+        endef
+        
+        GCC_VERSION=$(shell echo "$(CONFIG_GCC_VERSION)" | sed 's/[^0-9.]*\([0-9.]*\).*/\1/')
+        ifeq ($(GCC_VERSION), 4.8)
+        	GCC_VERSION=4.8.3
+        endif
+        
+        ifdef CONFIG_TOOLCHAIN_BIN_PATH
+        	TOOLCHAIN_BIN_PATH=$(CONFIG_TOOLCHAIN_BIN_PATH)
+        else
+        	TOOLCHAIN_BIN_PATH=$(TOOLCHAIN_DIR)/bin
+        endif
+        
+        ifdef CONFIG_TARGET_NAME
+        	QCASSDK_CONFIG_OPTS+= \
+        			      TARGET_NAME=$(CONFIG_TARGET_NAME)
+        else ifneq ($(CONFIG_ARCH),)
+        	QCASSDK_CONFIG_OPTS+= \
+        			      TARGET_NAME=$(subst ",,$(CONFIG_ARCH))-openwrt-linux$(if $(CONFIG_TARGET_SUFFIX),-$(subst ",,$(CONFIG_TARGET_SUFFIX)))
+        endif
+        
+        QCASSDK_CONFIG_OPTS+= TOOL_PATH=$(TOOLCHAIN_BIN_PATH) \
+                        SYS_PATH=$(LINUX_DIR) \
+                        TOOLPREFIX=$(TARGET_CROSS) \
+                        KVER=$(LINUX_VERSION) \
+                        ARCH=$(LINUX_KARCH) \
+        		TARGET_SUFFIX=$(CONFIG_TARGET_SUFFIX) \
+        		GCC_VERSION=$(GCC_VERSION) \
+        		SoC=$(hal_arch) \
+        		CFLAGS=-I$(STAGING_DIR)/usr/include
+        
+        ifeq ($(LOCAL_VARIANT),hnat)
+            QCASSDK_CONFIG_OPTS+= HNAT_FEATURE=enable
+            ifeq ($(CONFIG_TARGET_ar71xx),)
+            	QCASSDK_CONFIG_OPTS+= RFS_FEATURE=enable
+            endif
+        endif
+        
+        ifneq (, $(findstring $(hal_arch), "ipq95xx"))
+        	QCASSDK_CONFIG_OPTS+= CHIP_TYPE=APPE
+        else ifneq (, $(findstring $(hal_arch), "ipq807x"))
+        	QCASSDK_CONFIG_OPTS+= CHIP_TYPE=HPPE
+        else ifneq (, $(findstring $(hal_arch), "ipq60xx"))
+        	QCASSDK_CONFIG_OPTS+= CHIP_TYPE=CPPE
+        else ifneq (, $(findstring $(hal_arch), "ipq50xx"))
+        	QCASSDK_CONFIG_OPTS+= CHIP_TYPE=MP
+        else ifneq (, $(findstring $(hal_arch), "ipq53xx"))
+        	QCASSDK_CONFIG_OPTS+= CHIP_TYPE=MPPE
+        else ifneq (, $(findstring $(hal_arch), "ipq54xx"))
+        	QCASSDK_CONFIG_OPTS+= CHIP_TYPE=MRPPE
+        endif
+        
+        ifneq (, $(findstring $(CONFIG_KERNEL_IPQ_MEM_PROFILE), 256)$(CONFIG_LOWMEM_FLASH))
+        	QCASSDK_CONFIG_OPTS+= MINI_SSDK=enable
+        	ifeq ($(CONFIG_LOWMEM_FLASH),y)
+        		QCASSDK_CONFIG_OPTS+= LOWMEM_FLASH=enable
+        	endif
+        endif
+        
+        define Build/InstallDev
+        	$(INSTALL_DIR) $(1)/usr/include/qca-ssdk
+        	$(INSTALL_DIR) $(1)/usr/include/qca-ssdk/api
+        	$(INSTALL_DIR) $(1)/usr/include/qca-ssdk/ref
+        	$(INSTALL_DIR) $(1)/usr/include/qca-ssdk/fal
+        	$(INSTALL_DIR) $(1)/usr/include/qca-ssdk/sal
+        	$(INSTALL_DIR) $(1)/usr/include/qca-ssdk/init
+        	$(CP) -rf $(PKG_BUILD_DIR)/include/api/sw_ioctl.h $(1)/usr/include/qca-ssdk/api
+        	if [ -f $(PKG_BUILD_DIR)/include/ref/ref_vsi.h ]; then \
+        	$(CP) -rf $(PKG_BUILD_DIR)/include/ref/ref_vsi.h $(1)/usr/include/qca-ssdk/ref/; \
+        	fi
+        	if [ -f $(PKG_BUILD_DIR)/include/ref/ref_fdb.h ]; then \
+        	$(CP) -rf $(PKG_BUILD_DIR)/include/ref/ref_fdb.h $(1)/usr/include/qca-ssdk/ref/; \
+        	fi
+        	if [ -f $(PKG_BUILD_DIR)/include/ref/ref_port_ctrl.h ]; then \
+        	$(CP) -rf $(PKG_BUILD_DIR)/include/ref/ref_port_ctrl.h $(1)/usr/include/qca-ssdk/ref/; \
+        	fi
+        	$(CP) -rf $(PKG_BUILD_DIR)/include/init $(1)/usr/include/qca-ssdk
+        	$(CP) -rf $(PKG_BUILD_DIR)/include/fal $(1)/usr/include/qca-ssdk
+        	$(CP) -rf $(PKG_BUILD_DIR)/include/common/*.h $(1)/usr/include/qca-ssdk
+        	$(CP) -rf $(PKG_BUILD_DIR)/include/sal/os/linux/*.h $(1)/usr/include/qca-ssdk
+        	$(CP) -rf $(PKG_BUILD_DIR)/include/sal/os/*.h $(1)/usr/include/qca-ssdk
+        
+        endef
+        
+        LNX_CONFIG_OPTS :=
+        
+        ifneq (, $(findstring $(hal_arch), "ipq807x" "ipq60xx" "ipq95xx" "ipq53xx"))
+        LNX_CONFIG_OPTS += LNX_MAKEOPTS='$(KERNEL_MAKEOPTS)' MODULE_TYPE=KSLIB modules
+        else ifeq ($(LINUX_VERSION), $(filter 6.1%, $(LINUX_VERSION)))
+        LNX_CONFIG_OPTS += LNX_MAKEOPTS='$(KERNEL_MAKEOPTS)' MODULE_TYPE=KSLIB modules
+        else ifeq ($(LINUX_VERSION), $(filter 6.6%, $(LINUX_VERSION)))
+        LNX_CONFIG_OPTS += LNX_MAKEOPTS='$(KERNEL_MAKEOPTS)' MODULE_TYPE=KSLIB modules
+        endif
+        
+        define Build/Compile
+        	$(MAKE) -C $(PKG_BUILD_DIR)/mk $(strip $(QCASSDK_CONFIG_OPTS)) $(LNX_CONFIG_OPTS)
+        endef
+        
+        define KernelPackage/qca-ssdk-nohnat/install
+        	$(INSTALL_DIR) $(1)/etc/init.d
+        	$(INSTALL_BIN) ./files/qca-ssdk $(1)/etc/init.d/qca-ssdk
+        endef
+        
+        define KernelPackage/qca-ssdk-hnat/install
+        	$(INSTALL_DIR) $(1)/etc/init.d
+        	$(INSTALL_BIN) ./files/qca-ssdk $(1)/etc/init.d/qca-ssdk
+        endef
+        
+        $(eval $(call KernelPackage,qca-ssdk-nohnat))
+        $(eval $(call KernelPackage,qca-ssdk-hnat))
+        QSDK_PACKAGE
+        cat > results/ssdk-build-provenance.txt <<'PROVENANCE'
+        Source: https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-ssdk.git
+        Source commit: 717b74016b0c131575bcd81b9e039d3f7974b02a
+        Package: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/ssdk.git
+        Package reference commit: c7ebac1882395c7ee35453cde6775c7026b813b8
+        Package reference branch: win.nss.1.1 (fixed snapshot, not claimed as a release manifest pairing)
+        Package Build/Compile: make -C $(PKG_BUILD_DIR)/mk
+        ipq95xx -> CHIP_TYPE=APPE; MODULE_TYPE=KSLIB; LNX_MAKEOPTS; modules
+        mk/Makefile -> kernel M=$(MK_PATH); copies mk/Module.symvers to root and ko to build/bin.
+        Stage16 retains Stage13/14 MINI_SSDK=disable PTP_FEATURE=disable SWCONFIG_FEATURE=disable.
+        No OS_VER override or kernel version spoofing; effective values are captured.
+        mk/build.sh is a developer matrix runner referring to absent make.sh, not the package entry.
+        PROVENANCE
+        python3 <<'PY'
+        from pathlib import Path
+        import hashlib
+        expected = {'mk/build.sh': '1307f7f33feeae5f1f7c30b2159026757b6983fb3a5fbdefca688732015a7de9', 'mk/cflags.mk': '905e4f5ae54f52e2e48720511e83d788ac25d623657f019e54bd72b4e6bded2a', 'mk/chip.mk': '04a92d2fa375c0aa65b9ca935fc00b74fcebaf6011f25513d93c400cdc086e3c', 'mk/feature.mk': '6295cf05c4311950bd2e9cc3e00f89171c6eb09be99384e4f944d792d32b50a7', 'mk/make.sh': '7fb02f94256ad2f8fd1a2e7794ec17893bc7db17f577cf62e5da2a53b68db808', 'mk/Makefile': 'adf8f279aba5635deba314138874eb5b33211c2c84f782f216bd05b923be4f1f', 'mk/obj.mk': 'c222542a7702df0fb719f25097e7a3a69aeccdb11d0c006517a4a42829fdb66b'}
+        base = Path('qsdk-src/qca-ssdk')
+        lines = []
+        for name, digest in expected.items():
+            actual = hashlib.sha256((base / name).read_bytes()).hexdigest()
+            lines.append(f'{actual}  {name}')
+            assert actual == digest, f'Unexpected SSDK build input: {name}'
+        Path('results/ssdk-build-input-sha256.txt').write_text('\n'.join(lines) + '\n')
+        PY
+    - name: Export pinned PHY headers and verify include parent
+      run: |
+        set -euo pipefail
+        python3 <<'PY'
+        from pathlib import Path
+        import hashlib, json, re, shutil
+        root = Path.cwd()
+        phy = root / 'qsdk-src/qca-nss-phy'
+        ssdk = root / 'qsdk-src/qca-ssdk'
+        parent = root / 'qsdk-include'
+        dest = parent / 'qca-nss-phy'
+        dest.mkdir(parents=True, exist_ok=True)
+        out = root / 'results'
+        # Qualcomm nss-host c887f125 Build/InstallDev exports nss_ext/*h here.
+        # Also export the three linux_std headers directly referenced by SSDK 717b740.
+        headers = sorted((phy / 'nss_ext').glob('*.h')) + [
+            phy / 'linux_std/qcom_phy_lib.h',
+            phy / 'linux_std/clock/qca8k_clk.h',
+            phy / 'linux_std/mdio_ahb/mdio-ahb.h',
+        ]
+        assert headers and len({p.name for p in headers}) == len(headers)
+        manifest = []
+        for p in headers:
+            assert p.is_file(), p
+            shutil.copy2(p, dest / p.name)
+            digest = hashlib.sha256(p.read_bytes()).hexdigest()
+            assert hashlib.sha256((dest / p.name).read_bytes()).hexdigest() == digest
+            manifest.append(f'{digest}  {p.relative_to(phy).as_posix()} -> qca-nss-phy/{p.name}')
+        references = set()
+        for base in (ssdk, root / 'qsdk-src/qca-nss-ppe'):
+            for p in base.rglob('*'):
+                if p.suffix in ('.c', '.h'):
+                    references.update(re.findall(r'#\s*include\s*[<"](qca-nss-phy/[^">]+)[">]', p.read_text(errors='replace')))
+        assert 'qca-nss-phy/nss_phy_ptp.h' in references
+        missing = sorted(name for name in references if not (parent / name).is_file())
+        (out / 'phy-header-manifest.txt').write_text('\n'.join(manifest) + '\n')
+        (out / 'phy-header-references.txt').write_text('\n'.join(sorted(references)) + '\n')
+        status = {'source_commit': '16eec6ac35820cb67af59223e8b4c2dba7179655',
+                  'include_parent': str(parent), 'exported_header_count': len(headers),
+                  'missing_headers': missing, 'verified': not missing}
+        (out / 'phy-header-status.json').write_text(json.dumps(status, indent=2) + '\n')
+        shutil.copytree(dest, out / 'phy-exported-headers/qca-nss-phy', dirs_exist_ok=True)
+        assert not missing, f'Missing real PHY headers: {missing}'
+        print(json.dumps(status, indent=2))
+        PY
+    - name: Download sources
+      run: |
+        cd openwrt
+        make download -j$(nproc)
+    - name: Build OpenWrt kernel
+      shell: bash
+      run: |
+        set -o pipefail
+        cd openwrt
+        
+        make tools/install -j$(nproc) \
+          2>&1 | tee ../tools.log
+        
+        make toolchain/install -j$(nproc) \
+          2>&1 | tee ../toolchain.log
+        
+        make target/linux/compile -j$(nproc) \
+          2>&1 | tee ../kernel-compile.log
+    - name: Locate kernel and toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        mapfile -t kernels < <(find "$GITHUB_WORKSPACE/openwrt/build_dir" -type d -path '*/linux-qualcommbe_ipq95xx/linux-6.18.39')
+        test "${#kernels[@]}" = 1
+        KERNEL_DIR="${kernels[0]}"
+        mapfile -t compilers < <(find -L "$GITHUB_WORKSPACE/openwrt/staging_dir" -path '*/toolchain-aarch64*/bin/aarch64-openwrt-linux-musl-gcc' -type f)
+        test "${#compilers[@]}" = 1
+        GCC="${compilers[0]}"
+        TOOLCHAIN_DIR="$(dirname "$(dirname "$GCC")")"
+        CROSS_COMPILE="${GCC%gcc}"
+        test -x "$GCC"
+        grep -q 'CONFIG_TARGET_qualcommbe_ipq95xx=y' openwrt/.config
+        grep -q 'CONFIG_ARM64=y' "$KERNEL_DIR/.config"
+        grep -q 'CONFIG_MODULES=y' "$KERNEL_DIR/.config"
+        grep -Eq '"6\.18\.39(["-])' "$KERNEL_DIR/include/generated/utsrelease.h"
+        {
+          echo "KERNEL_DIR=$KERNEL_DIR"
+          echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR"
+          echo "GCC=$GCC"
+          echo "CROSS_COMPILE=$CROSS_COMPILE"
+        } | tee results/environment.txt
+        "$GCC" --version > results/compiler-version.txt
+        cat "$KERNEL_DIR/include/generated/utsrelease.h" > results/kernel-version.txt
+        git -C openwrt rev-parse HEAD > results/openwrt-commit.txt
+    - name: Verify kernel Module.symvers
+      shell: bash
+      run: |
+        set +e
+        
+        KERNEL_DIR=$(grep '^KERNEL_DIR=' \
+          results/environment.txt | cut -d= -f2-)
+        
+        {
+          echo "===== KERNEL BUILD CHECK ====="
+          echo "Kernel: $KERNEL_DIR"
+          echo ""
+        
+          if [ -s "$KERNEL_DIR/Module.symvers" ]; then
+            echo "Module.symvers: PRESENT"
+            echo -n "Lines: "
+            wc -l < "$KERNEL_DIR/Module.symvers"
+            echo -n "Size: "
+            stat -c '%s bytes' "$KERNEL_DIR/Module.symvers"
+          else
+            echo "Module.symvers: MISSING OR EMPTY"
+          fi
+        } | tee results/kernel-symvers-check.txt
+        
+        test -s "$KERNEL_DIR/Module.symvers"
+    - name: Generate QSDK include flags
+      shell: bash
+      run: |
+        set -e
+        
+        SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+        PPE="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe"
+        
+        test -f "$SSDK/include/fal/fal_rss_hash.h"
+        test -f "$SSDK/include/sal/os/aos_mem.h"
+        test -f "$PPE/nss_debug/exports/nss_debug.h"
+        
+        find "$SSDK" \
+          -type f \
+          -name '*.h' \
+          -printf '%h\n' \
+          | sort -u \
+          > results/ssdk-header-dirs.txt
+        
+        : > results/qsdk-header-flags.txt
+        printf -- '-I%s ' "$GITHUB_WORKSPACE/qsdk-include" >> results/qsdk-header-flags.txt
+        
+        printf -- '-I%s ' "$SSDK/include" \
+          >> results/qsdk-header-flags.txt
+        
+        while IFS= read -r DIR
+        do
+          printf -- '-I%s ' "$DIR" \
+            >> results/qsdk-header-flags.txt
+        done < results/ssdk-header-dirs.txt
+        
+        printf -- '-I%s ' \
+          "$PPE/nss_debug/exports" \
+          >> results/qsdk-header-flags.txt
+        
+        printf -- '%s ' \
+          '-Wno-error=ignored-qualifiers' \
+          '-Wno-error=missing-prototypes' \
+          '-Wno-error=shift-count-overflow' \
+          >> results/qsdk-header-flags.txt
+    - name: Apply exact successful Stage12 PPE patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat > results/linux-6.18-stage12-compat.patch <<'STAGE12_PATCH'
+        diff --git a/drv/ppe_drv/ppe_drv.c b/drv/ppe_drv/ppe_drv.c
+        index e113996e..b83ea536 100644
+        --- a/drv/ppe_drv/ppe_drv.c
+        +++ b/drv/ppe_drv/ppe_drv.c
+        @@ -313,7 +313,7 @@ void ppe_drv_vlan_flow_key_enable(void)
+          * ppe_drv_sixth_tuple_mode_handler()
+          *	change the sixth mode.
+          */
+        -static int ppe_drv_sixth_tuple_mode_handler(struct ctl_table *table, int write,
+        +static int ppe_drv_sixth_tuple_mode_handler(const struct ctl_table *table, int write,
+         		void __user *buffer, size_t *lenp, loff_t *ppos)
+         {
+         	int ret, cur_sixth_tuple_mode;
+        @@ -2576,7 +2576,7 @@ fail:
+          * ppe_drv_remove()
+          *	remove the ppe driver
+          */
+        -static int ppe_drv_remove(struct platform_device *pdev)
+        +static void ppe_drv_remove(struct platform_device *pdev)
+         {
+         	struct ppe_drv *p = platform_get_drvdata(pdev);
+         	int i = 0;
+        @@ -2770,7 +2770,7 @@ static int ppe_drv_remove(struct platform_device *pdev)
+         	ppe_drv_flow_dump_exit();
+         	ppe_drv_if_map_exit();
+         
+        -	return 0;
+        +	return;
+         }
+         
+         /*
+        @@ -2965,7 +2965,7 @@ static void ppe_drv_set_ppe_if_bm_to_port(void)
+          * ppe_drv_if_bm_to_offload_handler()
+          *	API to configure the interface bitmask where the offload is enabled
+          */
+        -static int ppe_drv_if_bm_to_offload_handler(struct ctl_table *table, int write,
+        +static int ppe_drv_if_bm_to_offload_handler(const struct ctl_table *table, int write,
+         		void __user *buffer, size_t *lenp, loff_t *ppos)
+         {
+         	int ret;
+        @@ -2999,7 +2999,7 @@ static int ppe_drv_if_bm_to_offload_handler(struct ctl_table *table, int write,
+          * ppe_drv_disable_port_mtu_check_handler()
+          * 	Set disable port mtu config
+          */
+        -static int ppe_drv_disable_port_mtu_check_handler(struct ctl_table *table,
+        +static int ppe_drv_disable_port_mtu_check_handler(const struct ctl_table *table,
+         						int write, void __user *buffer,
+         						size_t *lenp, loff_t *ppos)
+         {
+        @@ -3022,7 +3022,7 @@ static int ppe_drv_disable_port_mtu_check_handler(struct ctl_table *table,
+          * ppe_drv_l4_checksum_exception_enable()
+          *	API to enable/disable the exception for l4 checksum.
+          */
+        -int ppe_drv_l4_checksum_exception_enable(struct ctl_table *table, int write,
+        +int ppe_drv_l4_checksum_exception_enable(const struct ctl_table *table, int write,
+         		void __user *buffer, size_t *lenp, loff_t *ppos)
+         {
+         	int ret;
+        @@ -3059,7 +3059,7 @@ int ppe_drv_l4_checksum_exception_enable(struct ctl_table *table, int write,
+          * ppe_drv_mac_lrn_exception_en()
+          *	API to enable/disable the exception for MAC address learn exception.
+          */
+        -int ppe_drv_mac_lrn_exception_en(struct ctl_table *table, int write,
+        +int ppe_drv_mac_lrn_exception_en(const struct ctl_table *table, int write,
+         		void __user *buffer, size_t *lenp, loff_t *ppos)
+         {
+         	int ret;
+        @@ -3079,7 +3079,7 @@ int ppe_drv_mac_lrn_exception_en(struct ctl_table *table, int write,
+          * ppe_drv_loopback_port_feature_write_handler()
+          *	sysctl handler for loopback port write operation.
+          */
+        -static int ppe_drv_loopback_port_feature_write_handler(struct ctl_table *table, int write,
+        +static int ppe_drv_loopback_port_feature_write_handler(const struct ctl_table *table, int write,
+         		void __user *buffer, size_t *lenp, loff_t *ppos)
+         {
+         	struct ppe_drv *p = ppe_drv_gbl;
+        @@ -3134,7 +3134,7 @@ static int ppe_drv_loopback_port_feature_write_handler(struct ctl_table *table,
+          * ppe_drv_wlan_host_assist_qdisc_en_handler()
+          *	Handler for wlan_host_assist_qdisc_en sysctl
+          */
+        -static int ppe_drv_wlan_host_assist_qdisc_en_handler(struct ctl_table *table, int write,
+        +static int ppe_drv_wlan_host_assist_qdisc_en_handler(const struct ctl_table *table, int write,
+         		void __user *buffer, size_t *lenp, loff_t *ppos)
+         {
+         	int ret;
+        @@ -3183,7 +3183,7 @@ static int ppe_drv_wlan_host_assist_qdisc_en_handler(struct ctl_table *table, in
+          *		- Clears BIT(1) and BIT(2) to disable IPsec AH and ESP flow keys
+          *		- Writes the updated configuration back to hardware
+          */
+        -static int ppe_drv_ipsec_pass_through_en_handler(struct ctl_table *table, int write,
+        +static int ppe_drv_ipsec_pass_through_en_handler(const struct ctl_table *table, int write,
+         		void __user *buffer, size_t *lenp, loff_t *ppos)
+         {
+         	int ret;
+        @@ -3254,7 +3254,7 @@ static int ppe_drv_ipsec_pass_through_en_handler(struct ctl_table *table, int wr
+          * ppe_drv_eth2eth_offload_if_bitmap_handler()
+          * 	Set eth to eth offload with if bitmap config
+          */
+        -static int ppe_drv_eth2eth_offload_if_bitmap_handler(struct ctl_table *table,
+        +static int ppe_drv_eth2eth_offload_if_bitmap_handler(const struct ctl_table *table,
+         						int write, void __user *buffer,
+         						size_t *lenp, loff_t *ppos)
+         {
+        @@ -3277,7 +3277,7 @@ static int ppe_drv_eth2eth_offload_if_bitmap_handler(struct ctl_table *table,
+          * ppe_drv_static_dbg_level_handler()
+          *	Set static debug level for ppe-driver.
+          */
+        -static int ppe_drv_static_dbg_level_handler(struct ctl_table *table,
+        +static int ppe_drv_static_dbg_level_handler(const struct ctl_table *table,
+         					int write, void __user *buffer,
+         					size_t *lenp, loff_t *ppos)
+         {
+        @@ -3323,7 +3323,7 @@ static int ppe_drv_static_dbg_level_handler(struct ctl_table *table,
+          * ppe_drv_pkt_padding_handler
+          * 	sysctl to enable/disable stripping of packet padding
+          */
+        -static int ppe_drv_pkt_padding_handler(struct ctl_table *table,  int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+        +static int ppe_drv_pkt_padding_handler(const struct ctl_table *table,  int write, void __user *buffer, size_t *lenp, loff_t *ppos)
+         {
+         	fal_pktedit_padding_t padding = { 0 };
+         	char *start_ch_ptr = NULL;
+        @@ -3416,7 +3416,7 @@ static int ppe_drv_pkt_padding_handler(struct ctl_table *table,  int write, void
+          * ppe_drv_upstream_dev_handler()
+          *      Set upstream device.
+          */
+        -static int ppe_drv_upstream_dev_handler(struct ctl_table *table,
+        +static int ppe_drv_upstream_dev_handler(const struct ctl_table *table,
+         		int write, void __user *buffer,
+         		size_t *lenp, loff_t *ppos)
+         {
+        @@ -3707,7 +3707,7 @@ bool ppe_drv_l2vp_sc_rmv(uint32_t dest_port_id)
+          * ppe_drv_src2uni_handler()
+          *      Set Source Profile to UNI port mapping.
+          */
+        -static int ppe_drv_src2uni_handler(struct ctl_table *table,
+        +static int ppe_drv_src2uni_handler(const struct ctl_table *table,
+         		int write, void __user *buffer,
+         		size_t *lenp, loff_t *ppos)
+         {
+        @@ -3858,7 +3858,7 @@ static int ppe_drv_src2uni_handler(struct ctl_table *table,
+         						continue;
+         
+         					if (!((pp_local->type == PPE_DRV_PORT_PHYSICAL) ||
+        -					      ((pp_local->type == PPE_DRV_PORT_VIRTUAL) && dsa_slave_dev_check(pp_local->dev))))
+        +					      ((pp_local->type == PPE_DRV_PORT_VIRTUAL) && dsa_user_dev_check(pp_local->dev))))
+         						continue;
+         
+         					q_dst.src_profile = src_profile;
+        @@ -3931,7 +3931,7 @@ static int ppe_drv_src2uni_handler(struct ctl_table *table,
+         			continue;
+         
+         		if (!((pp_local->type == PPE_DRV_PORT_PHYSICAL) ||
+        -		      ((pp_local->type == PPE_DRV_PORT_VIRTUAL) && dsa_slave_dev_check(pp_local->dev))))
+        +		      ((pp_local->type == PPE_DRV_PORT_VIRTUAL) && dsa_user_dev_check(pp_local->dev))))
+         			continue;
+         
+         		q_dst.src_profile = src_profile;
+        @@ -4235,7 +4235,7 @@ static void ppe_drv_lpbk_iface_name_fmt(char *buf, size_t len,
+          * 	echo 'flush' : Remove all the entries from the map.
+          * 	echo 'flush <ingress_dev> <egress_dev>' : Removes one specific pair
+          */
+        -static int ppe_drv_lpbk_buffer_map_handler(struct ctl_table *table,
+        +static int ppe_drv_lpbk_buffer_map_handler(const struct ctl_table *table,
+         		int write, void __user *buffer,
+         		size_t *lenp, loff_t *ppos)
+         {
+        @@ -4409,7 +4409,7 @@ action:
+          * 	echo 1 > /proc/sys/ppe/ppe_drv/ddr_buffer_auto_en (enable)
+          * 	echo 0 > /proc/sys/ppe/ppe_drv/ddr_buffer_auto_en (disable)
+          */
+        -static int ppe_drv_ddr_buffer_auto_en_handler(struct ctl_table *table,
+        +static int ppe_drv_ddr_buffer_auto_en_handler(const struct ctl_table *table,
+         		int write, void __user *buffer,
+         		size_t *lenp, loff_t *ppos)
+         {
+        diff --git a/drv/ppe_drv/ppe_drv_flow.c b/drv/ppe_drv/ppe_drv_flow.c
+        index 5da9357b..63ea6983 100644
+        --- a/drv/ppe_drv/ppe_drv_flow.c
+        +++ b/drv/ppe_drv/ppe_drv_flow.c
+        @@ -13,6 +13,21 @@
+         #include "ppe_drv.h"
+         #include "tun/ppe_drv_tun.h"
+         
+        +#include <linux/vmalloc.h>
+        +
+        +
+        +/*
+        + * Temporary QSDK14 / Linux 6.18 MAP-T compatibility.
+        + * Compile-depth probe only.
+        + */
+        +static inline bool
+        +ppe_drv_flow_dev_is_mapt(struct net_device *dev)
+        +{
+        +    (void)dev;
+        +    return false;
+        +}
+        +
+        +
+         static struct ppe_drv_flow_table_info *flow_table_info;
+         
+         static bool ppe_drv_flow_v6_wifi_qos_get(struct ppe_drv_v6_conn_flow *pcf, uint8_t *wifi_qos, bool *wifi_qos_en);
+        @@ -3323,7 +3338,7 @@ struct ppe_drv_flow *ppe_drv_flow_v4_add(struct ppe_drv_v4_conn_flow *pcf, struc
+         		 */
+         		flow_cfg.fwd_type = FAL_FLOW_FORWARD;
+         		ppe_drv_trace("%p: flow_tbl[fwd_type]: L2-Multicast: %u", pcf, FAL_FLOW_FORWARD);
+        -	} else if ((match_src_ip != xlate_src_ip) || (dev_eg && (dev_eg->priv_flags_ext & IFF_EXT_MAPT))) {
+        +	} else if ((match_src_ip != xlate_src_ip) || (dev_eg && ppe_drv_flow_dev_is_mapt(dev_eg))) {
+         		/*
+         		 * Case SNAT
+         		 */
+        @@ -3331,7 +3346,7 @@ struct ppe_drv_flow *ppe_drv_flow_v4_add(struct ppe_drv_v4_conn_flow *pcf, struc
+         		flow_cfg.snat_nexthop = nh->index;
+         		flow_cfg.snat_srcport = ppe_drv_v4_conn_flow_xlate_src_ident_get(pcf);
+         		ppe_drv_trace("%p: flow_tbl[nat_type]: SNAT: %u snat_port: %u", pcf, FAL_FLOW_SNAT, flow_cfg.snat_srcport);
+        -	} else if ((match_dest_ip != xlate_dest_ip) || (dev_in && (dev_in->priv_flags_ext & IFF_EXT_MAPT))) {
+        +	} else if ((match_dest_ip != xlate_dest_ip) || (dev_in && ppe_drv_flow_dev_is_mapt(dev_in))) {
+         		/*
+         		 * Case DNAT
+         		 */
+        diff --git a/drv/ppe_drv/ppe_drv_nexthop.c b/drv/ppe_drv/ppe_drv_nexthop.c
+        index b112d2aa..25dc5a5d 100644
+        --- a/drv/ppe_drv/ppe_drv_nexthop.c
+        +++ b/drv/ppe_drv/ppe_drv_nexthop.c
+        @@ -526,7 +526,7 @@ struct ppe_drv_nexthop *ppe_drv_nexthop_v6_get_and_ref(struct ppe_drv_v6_conn_fl
+         		is_vlan_as_vp = is_vlan_dev(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+         		is_vlan_as_veip = is_vlan_dev(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VEIP);
+         #if defined(NSS_VLAN_BASED_DSA_SUPPORT) || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)
+        -		is_dsa_dev = dsa_slave_dev_check(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+        +		is_dsa_dev = dsa_user_dev_check(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+         #endif
+         	}
+         
+        @@ -594,7 +594,7 @@ struct ppe_drv_nexthop *ppe_drv_nexthop_v6_get_and_ref(struct ppe_drv_v6_conn_fl
+         				 * a VLAN-based DSA interface, program the VLAN ID as C-VLAN so that
+         				 * S-VLAN remains available for DSA tagging.
+         				 */
+        -				if ((is_dsa_dev) && (dp) && (dp->cpu_dp->tag_ops->proto == DSA_TAG_PROTO_QCA_8021Q)) {
+        +				if ((is_dsa_dev) && (dp) && (dp->cpu_dp->tag_ops->proto == DSA_TAG_PROTO_8021Q)) {
+         					ppe_drv_trace("%p: DSA egress, programming bridge VLAN %u as CTAG",
+         							pcf, in_vlan);
+         					fal_nh.ctag_fmt = 1;
+        @@ -1022,7 +1022,7 @@ struct ppe_drv_nexthop *ppe_drv_nexthop_v4_get_and_ref(struct ppe_drv_v4_conn_fl
+         		is_vlan_as_vp = is_vlan_dev(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+         		is_vlan_as_veip = is_vlan_dev(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VEIP);
+         #if defined(NSS_VLAN_BASED_DSA_SUPPORT) || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)
+        -		is_dsa_dev = dsa_slave_dev_check(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+        +		is_dsa_dev = dsa_user_dev_check(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+         #endif
+         	}
+         
+        @@ -1091,7 +1091,7 @@ struct ppe_drv_nexthop *ppe_drv_nexthop_v4_get_and_ref(struct ppe_drv_v4_conn_fl
+         				 * a VLAN-based DSA interface, program the VLAN ID as C-VLAN so that
+         				 * S-VLAN remains available for DSA tagging.
+         				 */
+        -				if ((is_dsa_dev) && (dp) && (dp->cpu_dp->tag_ops->proto == DSA_TAG_PROTO_QCA_8021Q)) {
+        +				if ((is_dsa_dev) && (dp) && (dp->cpu_dp->tag_ops->proto == DSA_TAG_PROTO_8021Q)) {
+         					ppe_drv_trace("%p: DSA egress, programming bridge VLAN %u as CTAG",
+         							pcf, in_vlan);
+         					fal_nh.ctag_fmt = 1;
+        diff --git a/drv/ppe_drv/ppe_drv_port.c b/drv/ppe_drv/ppe_drv_port.c
+        index ba4b3e68..da5c3f71 100644
+        --- a/drv/ppe_drv/ppe_drv_port.c
+        +++ b/drv/ppe_drv/ppe_drv_port.c
+        @@ -1647,7 +1647,7 @@ bool ppe_drv_port_ucast_queue_set(struct ppe_drv_port *pp, int src_profile, uint
+         	}
+         
+         #if defined(NSS_VLAN_BASED_DSA_SUPPORT) || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)
+        -	if ((pp->type == PPE_DRV_PORT_VIRTUAL) && dsa_slave_dev_check(pp->dev)) {
+        +	if ((pp->type == PPE_DRV_PORT_VIRTUAL) && dsa_user_dev_check(pp->dev)) {
+         		profile = PPE_DRV_REDIR_PROFILE_ID;
+         	}
+         #endif
+        diff --git a/drv/ppe_drv/ppe_drv_v4.c b/drv/ppe_drv/ppe_drv_v4.c
+        index 9300c401..63ec2fca 100644
+        --- a/drv/ppe_drv/ppe_drv_v4.c
+        +++ b/drv/ppe_drv/ppe_drv_v4.c
+        @@ -2043,7 +2043,7 @@ bool ppe_drv_v4_if_walk(struct ppe_drv_v4_conn_flow *pcf, struct ppe_drv_top_if_
+         
+         	is_vlan_as_veip = is_vlan_dev(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VEIP);
+         #if defined(NSS_VLAN_BASED_DSA_SUPPORT) || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)
+        -	is_dsa_dev = dsa_slave_dev_check(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+        +	is_dsa_dev = dsa_user_dev_check(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+         #endif
+         
+         	if (vlan_cnt && !is_vlan_as_veip && !is_vlan_as_vp && !eg_vsi_if && !is_dsa_dev) {
+        diff --git a/drv/ppe_drv/ppe_drv_v6.c b/drv/ppe_drv/ppe_drv_v6.c
+        index 40150328..b8f1158d 100644
+        --- a/drv/ppe_drv/ppe_drv_v6.c
+        +++ b/drv/ppe_drv/ppe_drv_v6.c
+        @@ -2573,7 +2573,7 @@ bool ppe_drv_v6_if_walk(struct ppe_drv_v6_conn_flow *pcf, struct ppe_drv_top_if_
+         
+         	is_vlan_as_veip = is_vlan_dev(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VEIP);
+         #if defined(NSS_VLAN_BASED_DSA_SUPPORT) || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)
+        -	is_dsa_dev = dsa_slave_dev_check(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+        +	is_dsa_dev = dsa_user_dev_check(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VIRTUAL);
+         #endif
+         
+         	if (vlan_cnt && !is_vlan_as_veip && !is_vlan_as_vp && !eg_vsi_if && !is_dsa_dev) {
+        diff --git a/drv/ppe_drv/ppe_drv_vlan.c b/drv/ppe_drv/ppe_drv_vlan.c
+        index 036e678a..829cd03e 100644
+        --- a/drv/ppe_drv/ppe_drv_vlan.c
+        +++ b/drv/ppe_drv/ppe_drv_vlan.c
+        @@ -3,6 +3,7 @@
+          * SPDX-License-Identifier: ISC
+          */
+         
+        +#include <linux/vmalloc.h>
+         #include <linux/etherdevice.h>
+         #include <linux/if_vlan.h>
+         #ifdef NSS_VLAN_BASED_DSA_SUPPORT
+        @@ -295,23 +296,23 @@ ppe_drv_ret_t ppe_drv_vlan_as_vp_del_xlate_rules(struct ppe_drv_iface *iface, st
+         	/*
+         	 * Handling for DSA/VLAN on DSA interface
+         	 */
+        -	if (!base_dev && dsa_slave_dev_check(iface->dev)) {
+        +	if (!base_dev && dsa_user_dev_check(iface->dev)) {
+         		/*
+         		 * We reach here if it's not a VLAN dev, eg: lan1.
+         		 * base_dev is NULL at this point. Set base_dev as lan1's CPU port.
+         		 */
+         		dp = dsa_port_from_netdev(iface->dev);
+         		if (dp) {
+        -			base_dev = dsa_port_to_master(dp);
+        +			base_dev = dsa_port_to_conduit(dp);
+         		}
+        -	} else if (base_dev && dsa_slave_dev_check(base_dev)) {
+        +	} else if (base_dev && dsa_user_dev_check(base_dev)) {
+         		/*
+         		 * VLAN over DSA interface ? eg: lan1.10.
+         		 * base_dev would already been set to lan1. Set base_dev as lan1's CPU port.
+         		 */
+         		dp = dsa_port_from_netdev(base_dev);
+         		if (dp) {
+        -			base_dev = dsa_port_to_master(dp);
+        +			base_dev = dsa_port_to_conduit(dp);
+         		}
+         	}
+         #endif
+        @@ -421,23 +422,23 @@ ppe_drv_ret_t ppe_drv_vlan_as_vp_add_xlate_rules(struct ppe_drv_iface *iface, st
+         	/*
+         	 * Handling for DSA/VLAN on DSA interface
+         	 */
+        -	if (!base_dev && dsa_slave_dev_check(iface->dev)) {
+        +	if (!base_dev && dsa_user_dev_check(iface->dev)) {
+         		/*
+         		 * We reach here if it's not a VLAN dev, eg: lan1.
+         		 * base_dev is NULL at this point. Set base_dev as lan1's CPU port.
+         		 */
+         		dp = dsa_port_from_netdev(iface->dev);
+         		if (dp) {
+        -			base_dev = dsa_port_to_master(dp);
+        +			base_dev = dsa_port_to_conduit(dp);
+         		}
+        -	} else if (base_dev && dsa_slave_dev_check(base_dev)) {
+        +	} else if (base_dev && dsa_user_dev_check(base_dev)) {
+         		/*
+         		 * VLAN over DSA interface ? eg: lan1.10.
+         		 * base_dev would already been set to lan1. Set base_dev as lan1's CPU port.
+         		 */
+         		dp = dsa_port_from_netdev(base_dev);
+         		if (dp) {
+        -			base_dev = dsa_port_to_master(dp);
+        +			base_dev = dsa_port_to_conduit(dp);
+         		}
+         	}
+         #endif
+        STAGE12_PATCH
+        git -C qsdk-src/qca-nss-ppe apply --check "$GITHUB_WORKSPACE/results/linux-6.18-stage12-compat.patch"
+        git -C qsdk-src/qca-nss-ppe apply "$GITHUB_WORKSPACE/results/linux-6.18-stage12-compat.patch"
+        git -C qsdk-src/qca-nss-ppe diff > results/linux-6.18-stage13-ppe-compat.patch
+        sha256sum results/linux-6.18-stage12-compat.patch > results/ppe-patch-sha256.txt
+    - name: Repeat verified Stage12 DSA and vmalloc compile probe
+      shell: bash
+      run: |
+        set -euo pipefail
+        source results/environment.txt
+        export STAGING_DIR="$GITHUB_WORKSPACE/openwrt/staging_dir"
+        mkdir -p results/stage12-api-probe
+        cat > results/stage12-api-probe/stage12_api.c <<'PROBE_C'
+        #include <linux/module.h>
+        #include <linux/vmalloc.h>
+        #include <net/dsa.h>
+        static __used struct net_device *stage12_dsa(const struct dsa_port *dp)
+        {
+            return dsa_port_to_conduit(dp);
+        }
+        static __used void stage12_vmalloc(void)
+        {
+            void *p = vzalloc(64);
+            vfree(p);
+        }
+        MODULE_LICENSE("GPL");
+        PROBE_C
+        echo 'obj-m += stage12_api.o' > results/stage12-api-probe/Makefile
+        set +e
+        make -C "$KERNEL_DIR" M="$GITHUB_WORKSPACE/results/stage12-api-probe" \
+          ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" stage12_api.o V=1 \
+          2>&1 | tee results/stage12-api-probe.log
+        rc=${PIPESTATUS[0]}
+        echo "$rc" > results/stage12-api-probe-exit-code.txt
+        exit "$rc"
+    - name: Compile QCA NSS Debug
+      shell: bash
+      run: |
+        export STAGING_DIR="$GITHUB_WORKSPACE/openwrt/staging_dir"
+        set +e
+        set -o pipefail
+        
+        KERNEL_DIR=$(grep '^KERNEL_DIR=' \
+          results/environment.txt | cut -d= -f2-)
+        
+        CROSS_PREFIX=$(grep '^CROSS_COMPILE=' \
+          results/environment.txt | cut -d= -f2-)
+        
+        DEBUG_DIR="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe/nss_debug"
+        
+        FLAGS=$(cat results/qsdk-header-flags.txt)
+        
+        make \
+          -C "$KERNEL_DIR" \
+          M="$DEBUG_DIR" \
+          ARCH=arm64 \
+          CROSS_COMPILE="$CROSS_PREFIX" \
+          KCFLAGS="$FLAGS" \
+          modules \
+          V=1 \
+          2>&1 | tee results/nss-debug-compile.log
+        
+        RC=${PIPESTATUS[0]}
+        
+        echo "$RC" \
+          > results/nss-debug-exit-code.txt
+        
+        exit 0
+    - name: Audit Linux 6.18.39 bridge semantics and patch SSDK
+      shell: bash
+      run: |
+        set -euo pipefail
+        source results/environment.txt
+        export KERNEL_DIR
+        python3 <<'PY'
+        from pathlib import Path
+        import os, re, json, hashlib, shutil, difflib
+        out = Path('results/bridge-api')
+        out.mkdir(parents=True, exist_ok=True)
+        kernel = Path(os.environ['KERNEL_DIR'])
+        files = ['net/bridge/br_fdb.c', 'net/bridge/br_device.c',
+                 'net/bridge/br_private.h', 'net/core/rtnetlink.c',
+                 'include/linux/netdevice.h', 'include/linux/if_bridge.h']
+        (out/'review.txt').write_text("Stage16 reviewed source evidence\n\nLinux 6.18.39:\nhttps://github.com/gregkh/linux/blob/v6.18.39/net/bridge/br_fdb.c\nhttps://github.com/gregkh/linux/blob/v6.18.39/include/linux/netdevice.h\nhttps://github.com/gregkh/linux/blob/v6.18.39/net/core/rtnetlink.c\nhttps://github.com/gregkh/linux/blob/v6.18.39/net/bridge/br_device.c\n\nHistorical QSDK helper implementation (comparison evidence, NOT a release\nmanifest pairing for SSDK 717b740):\nhttps://github.com/Leo357449107/qsdk_cmiot-ax6/blob/d5887fa1ec8b8163c127d0ed619857da894486ee/qca/src/linux-4.4/net/bridge/br_fdb.c\nSource SHA256: 36a2d9915c74e33b0dc602c2e7874afb05f1cf4fe28687d587b1e471cdd1f0ad\n\nBoth VID-0 paths delete the supplied MAC only on the supplied bridge port,\nfirst in VID 0 then in each usable VLAN configured on that port. Other ports'\nentries are rejected by the FDB destination-port comparison. No blanket flush.\nNonzero VID validation differs across kernels and is deliberately NOT exposed\nby this two-argument compatibility helper; the pinned SSDK call uses zero.\n\nbr_fdb_delete is not exported. Use the bridge master's ndo_fdb_del callback,\npassing the original port (not the master) and all seven actual arguments.\nDo not call the physical port's ndo_fdb_del and do not use external_learn_del.\nThe bridge performs hash locking, switchdev notification and RTM_DELNEIGH.\nnotified is initialized and passed by address; no duplicate notification.\n\nDevice lifetime: existing dev_get_by_name/dev_put retained; RTNL protects\nmembership, master lifetime and VLAN traversal during callback invocation.\nUse rtnl_trylock to avoid blocking under unknown caller-held SSDK/RTNL locks.\nContention, atomic context or an RTNL-owning caller gets SW_BUSY and must retry\nfrom process context without RTNL. Never use rtnl_is_locked as ownership proof.\nENOENT means already absent; other failures are logged and returned to SSDK.\nThis is a compile probe, not runtime validation of ACL/FDB or DSA/MAP-T.\n")
+        (out/'legacy-QSDK-helper.txt').write_text('int br_fdb_delete_by_netdev(struct net_device *dev,\n\t\t\t    const unsigned char *addr, u16 vid)\n{\n\tint err;\n\tstruct net_bridge_vlan_group *vg;\n\tstruct net_bridge_vlan *v;\n\tstruct net_bridge_port *p = br_port_get_rcu(dev);\n\n\tif (!p) {\n\t\tpr_info("bridge: %s not a bridge port\\n",\n\t\t\tdev->name);\n\t\treturn -EINVAL;\n\t}\n\tvg = nbp_vlan_group(p);\n\n\tif (vid) {\n\t\tv = br_vlan_find(vg, vid);\n\t\tif (!v) {\n\t\t\tpr_info("bridge: with unconfigured vlan %d on %s\\n"\n\t\t\t\t, vid, dev->name);\n\t\t\treturn -EINVAL;\n\t\t}\n\n\t\treturn __br_fdb_delete(p, addr, vid);\n\t}\n\terr = __br_fdb_delete(p, addr, 0);\n\n\tif (!vg || !vg->num_vlans)\n\t\treturn err;\n\n\tlist_for_each_entry(v, &vg->vlan_list, vlist) {\n\t\tif (!br_vlan_should_use(v))\n\t\t\tcontinue;\n\t\terr &= __br_fdb_delete(p, addr, v->vid);\n\t}\n\treturn err;\n}\n')
+        texts = {}
+        for name in files:
+            p = kernel / name
+            dest = out / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dest)
+            texts[name] = p.read_text()
+        status = {'verified': False, 'kernel': str(kernel), 'checks': {},
+                  'sha256': {n: hashlib.sha256((kernel/n).read_bytes()).hexdigest() for n in files}}
+        def check(name, condition):
+            status['checks'][name] = bool(condition)
+            (out/'status.json').write_text(json.dumps(status, indent=2)+'\n')
+            if not condition:
+                raise SystemExit('Bridge API audit failed: ' + name)
+        def function(text, name):
+            m = re.search(r'^.*\b' + re.escape(name) + r'\([^;]*?\n\{', text, re.M)
+            if not m:
+                raise SystemExit('Missing function: ' + name)
+            start = text.index('{', m.start())
+            depth, end = 1, start+1
+            while depth:
+                depth += (text[end] == '{') - (text[end] == '}')
+                end += 1
+            return text[m.start():end]
+        def compact(s):
+            return re.sub(r'\s+', '', s)
+        expected = {'fdb_delete_by_addr_and_port': 'ffe4957b983af950eef7f88923d050951750f07269aac67a3c1484d2b7ce00cd', '__br_fdb_delete': '37993edc658da75c0dd8e2ee621a26df481a1822ac3e98b2ae08a61419328cfb', 'br_fdb_delete': '3f8f3a12adb098a6ddc91989b91464087d9291e98184ac1533e2394d08275891'}
+        for name, expected_hash in expected.items():
+            body = function(texts['net/bridge/br_fdb.c'], name)
+            (out/(name+'.txt')).write_text(body+'\n')
+            check(name + '_reviewed_6_18_39_body',
+                  hashlib.sha256(compact(body).encode()).hexdigest() == expected_hash)
+        netdev = compact(texts['include/linux/netdevice.h'])
+        check('seven_argument_ndo_fdb_del',
+              '(*ndo_fdb_del)(structndmsg*ndm,structnlattr*tb[],structnet_device*dev,constunsignedchar*addr,u16vid,bool*notified,structnetlink_ext_ack*extack);' in netdev)
+        check('bridge_ops_dispatch', '.ndo_fdb_del=br_fdb_delete,' in compact(texts['net/bridge/br_device.c']))
+        rtnl = compact(texts['net/core/rtnetlink.c'])
+        check('rtnetlink_uses_master_ops_with_original_port',
+              'structnet_device*br_dev=netdev_master_upper_dev_get(dev);' in rtnl and
+              'ops=br_dev->netdev_ops;' in rtnl and
+              'ops->ndo_fdb_del(ndm,tb,dev,addr,vid,&notified,extack)' in rtnl)
+        exported = {r.split()[1] for r in (kernel/'Module.symvers').read_text().splitlines() if len(r.split()) >= 4}
+        check('required_helpers_exported', {'rtnl_trylock', 'rtnl_unlock', 'netdev_master_upper_dev_get'} <= exported)
+        check('bridge_enabled', bool(re.search(r'^CONFIG_BRIDGE=[ym]$', (kernel/'.config').read_text(), re.M)))
+        check('legacy_helper_absent', 'br_fdb_delete_by_netdev' not in texts['include/linux/if_bridge.h'] and 'br_fdb_delete_by_netdev' not in exported)
+
+        ssdk = Path('qsdk-src/qca-ssdk')
+        p = ssdk/'src/ref/ref_acl.c'
+        before = p.read_text()
+        check('pinned_ref_acl_source', hashlib.sha256(before.encode()).hexdigest() == '9f2270d3d338e9e3e00228500266aba0fb2c15ba79f975998605445000757d23')
+        call = 'br_fdb_delete_by_netdev(eth_dev, entry->src_mac.uc, 0);'
+        check('single_expected_call', before.count(call) == 1)
+        header = ssdk/'src/ref/ssdk_stage16_bridge.h'
+        header.write_text(r"""/* SPDX-License-Identifier: GPL-2.0-only */
+        #ifndef SSDK_STAGE16_BRIDGE_H
+        #define SSDK_STAGE16_BRIDGE_H
+
+        #include <linux/errno.h>
+        #include <linux/if_bridge.h>
+        #include <linux/interrupt.h>
+        #include <linux/netdevice.h>
+        #include <linux/neighbour.h>
+        #include <linux/rtnetlink.h>
+
+        /*
+         * Replacement for the ref_acl.c br_fdb_delete_by_netdev(port, addr, 0)
+         * call ONLY. Linux 6.18.39 br_fdb_delete() keeps port ownership checks and
+         * deletes VID 0 plus the port's usable VLANs, like the QSDK VID-0 path.
+         * Use the bridge master's ops but pass the original PORT as the device.
+         * The bridge handles its hash lock, switchdev and RTM_DELNEIGH notification.
+         * Caller owns a dev reference. Never wait for RTNL under unknown SSDK locks:
+         * return -EAGAIN on contention (including a caller already holding RTNL).
+         * The API caller must retry SW_BUSY from process context without RTNL held.
+         */
+        static inline int ssdk_stage16_fdb_delete(struct net_device *port,
+        					const unsigned char *addr)
+        {
+        	struct net_device *bridge;
+        	struct ndmsg ndm = { .ndm_family = AF_BRIDGE,
+        			    .ndm_flags = NTF_MASTER };
+        	struct nlattr *tb[NDA_MAX + 1] = { NULL };
+        	bool notified = false;
+        	int err = -EINVAL;
+
+        	if (in_atomic() || in_interrupt() || irqs_disabled())
+        		return -EAGAIN;
+        	if (!rtnl_trylock())
+        		return -EAGAIN;
+
+        	if (!netif_is_bridge_port(port))
+        		goto out;
+        	bridge = netdev_master_upper_dev_get(port);
+        	if (!bridge || !netif_is_bridge_master(bridge))
+        		goto out;
+        	err = -EOPNOTSUPP;
+        	if (!bridge->netdev_ops || !bridge->netdev_ops->ndo_fdb_del)
+        		goto out;
+
+        	ndm.ndm_ifindex = port->ifindex;
+        	err = bridge->netdev_ops->ndo_fdb_del(&ndm, tb, port, addr, 0,
+        					    &notified, NULL);
+        out:
+        	rtnl_unlock();
+        	return err;
+        }
+        #endif
+        """)
+        replacement = 'int fdb_err;\n\n\t\t\tfdb_err = ssdk_stage16_fdb_delete(eth_dev, entry->src_mac.uc);\n\t\t\t/* A missing FDB entry already satisfies the deletion request. */\n\t\t\tif (fdb_err && fdb_err != -ENOENT) {\n\t\t\t\tSSDK_ERROR("bridge FDB delete failed on %s: %d\\n",\n\t\t\t\t\t\teth_dev->name, fdb_err);\n\t\t\t\trv = fdb_err == -EAGAIN ? SW_BUSY :\n\t\t\t\t\t(fdb_err == -EOPNOTSUPP ? SW_NOT_SUPPORTED : SW_FAIL);\n\t\t\t}'
+        after = before.replace('#include <linux/if_bridge.h>', '#include <linux/if_bridge.h>\n#include "ssdk_stage16_bridge.h"').replace(call, replacement)
+        p.write_text(after)
+        patch = ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+                      fromfile='a/src/ref/ref_acl.c', tofile='b/src/ref/ref_acl.c'))
+        patch += ''.join(difflib.unified_diff([], header.read_text().splitlines(True),
+                      fromfile='/dev/null', tofile='b/src/ref/ssdk_stage16_bridge.h'))
+        Path('results/ssdk-stage16-bridge.patch').write_text(patch)
+        shutil.copy2(p, out/'ref_acl.c')
+        shutil.copy2(header, out/header.name)
+        status['verified'] = True
+        status['scope'] = 'ref_acl VID-0 call only; original port + MAC, VID 0 and usable port VLANs'
+        status['locking'] = 'RTNL trylock; contention/atomic context => SW_BUSY, no silent skip'
+        (out/'status.json').write_text(json.dumps(status, indent=2)+'\n')
+        print(json.dumps(status, indent=2))
+        PY
+    - name: Compile and MODPOST exact Stage16 bridge helper
+      shell: bash
+      run: |
+        set -euo pipefail
+        source results/environment.txt
+        export STAGING_DIR="$GITHUB_WORKSPACE/openwrt/staging_dir"
+        export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+        PROBE="$GITHUB_WORKSPACE/results/stage16-bridge-probe"
+        mkdir -p "$PROBE"
+        cp qsdk-src/qca-ssdk/src/ref/ssdk_stage16_bridge.h "$PROBE/"
+        cat > "$PROBE/Makefile" <<'MK'
+        obj-m := stage16_bridge_probe.o
+        MK
+        cat > "$PROBE/stage16_bridge_probe.c" <<'C'
+        #include <linux/module.h>
+        #include "ssdk_stage16_bridge.h"
+        /* Compile and MODPOST only. This module is never loaded. */
+        int stage16_bridge_probe(struct net_device *port, const unsigned char *addr);
+        int stage16_bridge_probe(struct net_device *port, const unsigned char *addr)
+        {
+        	return ssdk_stage16_fdb_delete(port, addr);
+        }
+        EXPORT_SYMBOL_GPL(stage16_bridge_probe);
+        MODULE_LICENSE("GPL");
+        C
+        set +e
+        make -C "$KERNEL_DIR" M="$PROBE" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" \
+          KCFLAGS=-Werror modules V=1 2>&1 | tee results/stage16-bridge-probe.log
+        rc=${PIPESTATUS[0]}
+        echo "$rc" > results/stage16-bridge-probe-exit-code.txt
+        set -e
+        test "$rc" = 0
+        test -s "$PROBE/stage16_bridge_probe.ko"
+        "${CROSS_COMPILE}nm" -u "$PROBE/stage16_bridge_probe.ko" > results/stage16-bridge-probe-undefined.txt
+        modinfo "$PROBE/stage16_bridge_probe.ko" > results/stage16-bridge-probe-modinfo.txt
+    - name: Build exact SSDK through verified mk entry
+      shell: bash
+      run: |
+        set -euo pipefail
+        source results/environment.txt
+        export STAGING_DIR="$GITHUB_WORKSPACE/openwrt/staging_dir"
+        export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+        SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+        MK_PATH="$SSDK/mk"
+        test -f "$MK_PATH/Makefile"
+        test -s "$KERNEL_DIR/Module.symvers"
+        test "$(git -C "$SSDK" rev-parse HEAD)" = 717b74016b0c131575bcd81b9e039d3f7974b02a
+        git -C "$SSDK" status --short > results/ssdk-source-status.txt
+        
+        # Qualcomm feed c7ebac1 Build/Compile uses $(PKG_BUILD_DIR)/mk.
+        # Both paths are explicit: setting PRJ_PATH alone skips MK_PATH initialization.
+        # Keep the Stage13 full-size / no-swconfig / no-PTP compile-probe choices.
+        # Do not run mk/build.sh: it references an absent make.sh and a devtest tree.
+        vars=(
+          PRJ_PATH="$SSDK" MK_PATH="$MK_PATH" SYS_PATH="$KERNEL_DIR"
+          ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" TOOLPREFIX="$CROSS_COMPILE"
+          TOOL_PATH="$TOOLCHAIN_DIR/bin" KVER=6.18.39
+          TARGET_NAME=aarch64-openwrt-linux-musl TARGET_SUFFIX=musl
+          "GCC_VERSION=$($GCC -dumpfullversion)"
+          SoC=ipq95xx CHIP_TYPE=APPE MODULE_TYPE=KSLIB
+          MINI_SSDK=disable PTP_FEATURE=disable SWCONFIG_FEATURE=disable
+          "KCFLAGS=-I$GITHUB_WORKSPACE/qsdk-include"
+          SHELL=/bin/bash V=1
+          "LNX_MAKEOPTS=ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE V=1"
+        )
+        # Serial compilation makes the first compiler diagnostic unambiguous.
+        args=(-C "$MK_PATH" -j1 "${vars[@]}" modules)
+        printf '%q ' make "${args[@]}" > results/ssdk-build-command.txt
+        printf '\n' >> results/ssdk-build-command.txt
+        
+        cat > results/ssdk-inspect.mk <<'MK'
+        .PHONY: stage16_inspect
+        stage16_inspect:
+        	@$(foreach v,PRJ_PATH MK_PATH SYS_PATH ARCH CROSS_COMPILE SoC CHIP_TYPE SUPPORT_CHIP KVER OS_VER MODULE_TYPE MINI_SSDK FAL IN_ACL IN_IP IN_PPPOE IN_POLICER IN_QM IN_QOS IN_VSI IN_VPORT IN_TUNNEL IN_MAPT IN_COSMAP IN_SERVCODE SWCONFIG IN_PTP KCFLAGS MODULE_CFLAG MODULE_INC SSDK_OBJ,$(info $(v)=$($(v)))) true
+        MK
+        set +e
+        make -C "$MK_PATH" "${vars[@]}" -f "$MK_PATH/Makefile" \
+          -f "$GITHUB_WORKSPACE/results/ssdk-inspect.mk" stage16_inspect \
+          > results/ssdk-effective-config.txt 2>&1
+        inspect_rc=$?
+        echo "$inspect_rc" > results/ssdk-config-inspect-exit-code.txt
+        if [ "$inspect_rc" != 0 ]; then
+          cp results/ssdk-effective-config.txt results/ssdk-compile.log
+          echo "$inspect_rc" > results/ssdk-exit-code.txt
+          exit 0
+        fi
+        
+        make "${args[@]}" 2>&1 | tee results/ssdk-compile.log
+        rc=${PIPESTATUS[0]}
+        echo "$rc" > results/ssdk-exit-code.txt
+        find "$SSDK" -type f \( -name '*.ko' -o -name Module.symvers \) -print \
+          | sort > results/ssdk-generated.txt
+        # mk/Makefile copies these on success; check instead of fabricating a table.
+        if [ "$rc" = 0 ]; then
+          if [ -s "$MK_PATH/qca-ssdk.ko" ] && [ -s "$SSDK/build/bin/qca-ssdk.ko" ] &&
+             [ -s "$MK_PATH/Module.symvers" ] && [ -s "$SSDK/Module.symvers" ] &&
+             cmp -s "$MK_PATH/Module.symvers" "$SSDK/Module.symvers" &&
+             cmp -s "$MK_PATH/qca-ssdk.ko" "$SSDK/build/bin/qca-ssdk.ko"; then
+            echo VERIFIED > results/ssdk-products-check.txt
+            modinfo "$MK_PATH/qca-ssdk.ko" > results/ssdk-modinfo.txt 2>&1
+          else
+            echo 'SSDK returned zero but expected products are missing or inconsistent.' \
+              > results/ssdk-products-check.txt
+            echo 90 > results/ssdk-exit-code.txt
+          fi
+        fi
+        git -C "$SSDK" diff > results/ssdk-build-changes.patch
+        cp "$SSDK/src/ref/ssdk_stage16_bridge.h" results/ssdk-source-context/
+        exit 0
+    - name: Build PPE with SSDK and NSS Debug exports
+      shell: bash
+      run: |
+        set +e
+        set -uo pipefail
+        source results/environment.txt
+        export STAGING_DIR="$GITHUB_WORKSPACE/openwrt/staging_dir"
+        export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+        SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+        DEBUG_DIR="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe/nss_debug"
+        PPE_DIR="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe/drv/ppe_drv"
+        FLAGS=$(cat results/qsdk-header-flags.txt)
+        extras=()
+        : > results/kbuild-extra-symbols.txt
+        # Never import incomplete/stale SSDK exports after a failed build.
+        if [ "$(cat results/ssdk-exit-code.txt 2>/dev/null)" = 0 ] &&
+           [ -s "$SSDK/Module.symvers" ] &&
+           [ -n "$(find "$SSDK" -name 'qca-ssdk.ko' -type f -print -quit)" ]; then
+          extras+=("$SSDK/Module.symvers")
+        else
+          echo 'SSDK dependency unavailable; PPE build is diagnostic only.' > results/ppe-dependency-status.txt
+        fi
+        if [ "$(cat results/nss-debug-exit-code.txt 2>/dev/null)" = 0 ] &&
+           [ -s "$DEBUG_DIR/Module.symvers" ] && [ -s "$DEBUG_DIR/qca-nss-debug.ko" ]; then
+          extras+=("$DEBUG_DIR/Module.symvers")
+        fi
+        for f in "${extras[@]}"; do printf '%s\n' "$f" >> results/kbuild-extra-symbols.txt; done
+        args=(-C "$KERNEL_DIR" M="$PPE_DIR" ARCH=arm64
+          CROSS_COMPILE="$CROSS_COMPILE" SoC=ipq95xx CONFIG_NET_DSA=y
+          KCFLAGS="$FLAGS" "KBUILD_EXTRA_SYMBOLS=${extras[*]}" modules V=1)
+        printf '%q ' make "${args[@]}" > results/ppe-build-command.txt
+        printf '\n' >> results/ppe-build-command.txt
+        make "${args[@]}" 2>&1 | tee results/ppe-compile.log
+        rc=${PIPESTATUS[0]}
+        echo "$rc" > results/ppe-exit-code.txt
+        if [ "$rc" = 0 ]; then
+          if [ -s "$PPE_DIR/qca-nss-ppe.ko" ]; then
+            modinfo "$PPE_DIR/qca-nss-ppe.ko" > results/ppe-modinfo.txt 2>&1
+            echo VERIFIED > results/ppe-products-check.txt
+          else
+            echo 'PPE returned zero without qca-nss-ppe.ko' > results/ppe-products-check.txt
+            echo 91 > results/ppe-exit-code.txt
+          fi
+        fi
+        exit 0
+    - name: Collect all products and audit unresolved symbols
+      shell: bash
+      run: |
+        python3 <<'PY'
+        from pathlib import Path
+        import json
+        import os
+        import re
+        import shutil
+        import subprocess
+        
+        root = Path.cwd()
+        out = root / 'results'
+        out.mkdir(exist_ok=True)
+        env = {}
+        envfile = out / 'environment.txt'
+        if envfile.exists():
+            env = dict(line.split('=', 1) for line in envfile.read_text().splitlines() if '=' in line)
+        ssdk = root / 'qsdk-src/qca-ssdk'
+        ppe = root / 'qsdk-src/qca-nss-ppe/drv/ppe_drv'
+        debug = root / 'qsdk-src/qca-nss-ppe/nss_debug'
+        
+        def write(name, lines):
+            (out / name).write_text('\n'.join(lines) + ('\n' if lines else ''))
+        
+        def rc(name):
+            p = out / (name + '-exit-code.txt')
+            return p.read_text().strip() if p.exists() else 'NOT_RUN'
+        
+        def symbols(path):
+            if not path.is_file():
+                return set()
+            return {row.split()[1] for row in path.read_text().splitlines() if len(row.split()) >= 4}
+        
+        products = []
+        for base in (ssdk, root / 'qsdk-src/qca-nss-ppe'):
+            if not base.exists():
+                continue
+            for p in sorted(base.rglob('*')):
+                if p.is_file() and (p.suffix in ('.ko', '.o', '.mod') or p.name in ('Module.symvers', 'modules.order')):
+                    rel = p.relative_to(root)
+                    dest = out / 'modules' / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(p, dest)
+                    products.append(f'{rel.as_posix()}\t{p.stat().st_size}')
+        write('module-products.txt', products)
+        
+        ssdk_tables = []
+        for p in sorted(ssdk.rglob('Module.symvers')) if ssdk.exists() else []:
+            names = symbols(p)
+            ssdk_tables.append(f'{p.relative_to(root)}\tbytes={p.stat().st_size}\texports={len(names)}\tfal={sum(x.startswith("fal_") for x in names)}')
+        write('ssdk-symvers-inventory.txt', ssdk_tables)
+        exports = symbols(ssdk / 'Module.symvers')
+        fal_exports = sorted(x for x in exports if x.startswith('fal_'))
+        write('ssdk-fal-exports.txt', fal_exports)
+        write('ssdk-all-exports.txt', sorted(exports))
+        
+        for name in ('ssdk', 'nss-debug', 'ppe'):
+            log = out / (name + '-compile.log')
+            lines = log.read_text(errors='replace').splitlines() if log.exists() else []
+            write(name + '-errors.txt', [l for l in lines if re.search(r'error:|fatal error:|undefined!|implicit declaration|No rule to make target|No such file|has no member|incompatible pointer|conflicting types|too few arguments|too many arguments', l, re.I)])
+            if name == 'ppe':
+                write('ppe-modpost-unresolved.txt', [l for l in lines if 'undefined!' in l or 'suppressed' in l and 'unresolved' in l])
+                write('ppe-compile-depth.txt', [l for l in lines if re.search(r'CC \[M\]|LD \[M\]|MODPOST|\.ko', l)])
+        
+        # Runs inside the inherited all-products diagnostic Python block.
+        ssdk_log = out / 'ssdk-compile.log'
+        ssdk_lines = ssdk_log.read_text(errors='replace').splitlines() if ssdk_log.exists() else []
+        compiler_error = re.compile(r'\.(?:c|h):\d+(?::\d+)?:\s+(?:fatal\s+)?error:')
+        compiler_command = re.compile(r'aarch64[^\s]*-(?:gcc|cc)\b.*(?:\s-c\s).*\.c(?:\s|$)')
+        first_index = next((i for i, line in enumerate(ssdk_lines) if compiler_error.search(line)), None)
+        compile_commands = [line for line in ssdk_lines if compiler_command.search(line)]
+        write('ssdk-compiler-commands.txt', compile_commands)
+        write('ssdk-compile-depth.txt', [line for line in ssdk_lines if re.search(r'CC\s+\[M\]|LD\s+\[M\]|MODPOST|\.ko', line)])
+        if first_index is not None:
+            write('ssdk-first-compiler-error.txt', [f'log_line={first_index + 1}', ssdk_lines[first_index]])
+            write('ssdk-first-compiler-error-context.txt', ssdk_lines[max(0, first_index-20):first_index+41])
+            match = re.search(r'([^\s:]+\.(?:c|h)):(\d+)', ssdk_lines[first_index])
+            if match:
+                name, line_no = match.group(1), int(match.group(2))
+                for candidate in (Path(name), ssdk / 'mk' / name, ssdk / name):
+                    candidate = candidate.resolve()
+                    if candidate.is_file() and candidate.is_relative_to(ssdk.resolve()):
+                        source = candidate.read_text(errors='replace').splitlines()
+                        write('ssdk-first-error-source.txt', [str(candidate)] + [f'{i+1}: {source[i]}' for i in range(max(0,line_no-21), min(len(source),line_no+20))])
+                        break
+        else:
+            write('ssdk-first-compiler-error.txt', ['No source-positioned compiler error found; inspect ssdk-errors.txt and ssdk-compile.log.'])
+        objects = sorted(p.relative_to(ssdk).as_posix() for p in ssdk.rglob('*.o')) if ssdk.exists() else []
+        write('ssdk-object-inventory.txt', objects)
+        ssdk_started = bool(compile_commands or objects or first_index is not None)
+        write('ssdk-stage16-status.txt', [f'compiler_started={ssdk_started}', f'object_count={len(objects)}', f'first_compiler_error_line={first_index + 1 if first_index is not None else "NONE"}', f'make_exit={rc("ssdk")}'])
+        
+        # An exhaustive strong-undefined-symbol comparison independent of MODPOST's
+        # first-ten-errors display limit. This does not replace MODPOST's CRC,
+        # namespace and license validation.
+        kernel_table = Path(env['KERNEL_DIR']) / 'Module.symvers' if 'KERNEL_DIR' in env else None
+        available = symbols(kernel_table) if kernel_table else set()
+        extra_file = out / 'kbuild-extra-symbols.txt'
+        extra_paths = extra_file.read_text().splitlines() if extra_file.exists() else []
+        for path in extra_paths:
+            available.update(symbols(Path(path)))
+        nm_status = 'NOT_AVAILABLE'
+        needed, missing = set(), set()
+        obj = ppe / 'qca-nss-ppe.o'
+        if obj.is_file() and 'CROSS_COMPILE' in env:
+            try:
+                proc = subprocess.run([env['CROSS_COMPILE'] + 'nm', '-u', str(obj)], capture_output=True, text=True)
+                (out / 'ppe-nm-undefined.raw.txt').write_text(proc.stdout + proc.stderr)
+                nm_status = str(proc.returncode)
+                if proc.returncode == 0:
+                    needed = {parts[-1] for line in proc.stdout.splitlines() if len(parts := line.split()) >= 2 and parts[-2] == 'U'}
+                    missing = needed - available
+            except OSError as exc:
+                nm_status = str(exc)
+        write('ppe-required-symbols.txt', sorted(needed))
+        write('ppe-unresolved-all.txt', sorted(missing))
+        write('ppe-fal-resolution.tsv', ['symbol\tSSDK_exported\tavailable_to_MODPOST'] + [f'{s}\t{int(s in exports)}\t{int(s in available)}' for s in sorted(needed) if s.startswith('fal_')])
+        
+        for name in ('tools.log', 'toolchain.log', 'kernel-compile.log'):
+            if (root / name).is_file():
+                shutil.copy2(root / name, out / name)
+        if (root / 'openwrt/.config').is_file():
+            shutil.copy2(root / 'openwrt/.config', out / 'openwrt.config')
+        if kernel_table and kernel_table.is_file():
+            shutil.copy2(kernel_table, out / 'kernel-Module.symvers')
+            config = kernel_table.parent / '.config'
+            if config.is_file():
+                shutil.copy2(config, out / 'kernel.config')
+        
+        ssdk_modules = sorted(str(p.relative_to(root)) for p in ssdk.rglob('qca-ssdk.ko')) if ssdk.exists() else []
+        phy_status_file = out / 'phy-header-status.json'
+        phy_status = json.loads(phy_status_file.read_text()) if phy_status_file.exists() else {}
+        phy_flag_seen = any('-I' + str(root / 'qsdk-include') in line for line in compile_commands)
+        bridge_status_path = out / 'bridge-api/status.json'
+        bridge_status = json.loads(bridge_status_path.read_text()) if bridge_status_path.exists() else {}
+        stats = {
+            'stage': 16,
+            'bridge_api_verified': bridge_status.get('verified', False),
+            'bridge_probe_exit': rc('stage16-bridge-probe'),
+            'bridge_probe_ko': (out / 'stage16-bridge-probe/stage16_bridge_probe.ko').is_file(),
+            'phy_commit_required': '16eec6ac35820cb67af59223e8b4c2dba7179655',
+            'phy_header_status': phy_status,
+            'phy_include_in_ssdk_gcc': phy_flag_seen,
+            'purpose': 'Compile probe only; no flashing; inherited MAP-T/DSA compatibility is not runtime validation',
+            'ssdk_commit_required': '717b74016b0c131575bcd81b9e039d3f7974b02a',
+            'kernel_required': '6.18.39',
+            'target': 'IPQ9574/ipq95xx/APPE/arm64',
+            'ssdk_exit': rc('ssdk'), 'nss_debug_exit': rc('nss-debug'), 'ppe_exit': rc('ppe'),
+            'ssdk_modules': ssdk_modules,
+            'ssdk_compiler_started': ssdk_started,
+            'ssdk_object_count': len(objects),
+            'ssdk_source_object_count': sum(p.startswith('src/') and not p.endswith('.mod.o') for p in objects),
+            'ssdk_first_compiler_error': ssdk_lines[first_index] if first_index is not None else None,
+            'ssdk_symvers_bytes': (ssdk / 'Module.symvers').stat().st_size if (ssdk / 'Module.symvers').exists() else 0,
+            'ssdk_export_count': len(exports), 'ssdk_fal_export_count': len(fal_exports),
+            'nss_debug_ko': (debug / 'qca-nss-debug.ko').is_file(),
+            'ppe_ko': (ppe / 'qca-nss-ppe.ko').is_file(),
+            'ppe_linked_object': obj.is_file(),
+            'ppe_source_object_count': sum(1 for p in ppe.glob('*.o') if p.name != 'qca-nss-ppe.o' and not p.name.endswith('.mod.o')),
+            'ppe_all_object_count': len(list(ppe.glob('*.o'))),
+            'extra_symvers': extra_paths, 'symbol_audit_exit': nm_status,
+            'ppe_unresolved_count': len(missing) if nm_status == '0' else None,
+            'ppe_unresolved_fal_count': sum(s.startswith('fal_') for s in missing) if nm_status == '0' else None,
+        }
+        stats['success'] = bool(stats['bridge_api_verified'] and stats['bridge_probe_exit'] == '0' and stats['bridge_probe_ko'] and phy_status.get('verified') and phy_flag_seen and all(rc(n) == '0' for n in ('ssdk', 'nss-debug', 'ppe')) and ssdk_started and ssdk_modules and fal_exports and stats['ppe_ko'] and stats['nss_debug_ko'] and nm_status == '0' and not missing and str(ssdk / 'Module.symvers') in extra_paths)
+        (out / 'stage16-summary.json').write_text(json.dumps(stats, indent=2) + '\n')
+        summary = ['STAGE 16: ' + ('PASS' if stats['success'] else 'FAIL / INCOMPLETE')]
+        summary += [f'{k}: {v}' for k, v in stats.items()]
+        write('stage16-summary.txt', summary)
+        print('\n'.join(summary))
+        if os.environ.get('GITHUB_STEP_SUMMARY'):
+            with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+                f.write('```text\n' + '\n'.join(summary) + '\n```\n')
+        PY
+      if: always()
+    - name: Upload Stage16 diagnostics and modules
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: SBE1V1K-V0.2-QSDK-Stage16
+        path: results/
+        retention-days: 14
+        if-no-files-found: error
+    - name: Require real SSDK and PPE module success
+      shell: bash
+      run: |
+        python3 <<'PY'
+        import json
+        from pathlib import Path
+        p = Path('results/stage16-summary.json')
+        assert p.is_file(), 'Missing Stage16 diagnostics'
+        s = json.loads(p.read_text())
+        assert s['success'], 'Stage16 compile incomplete; download the uploaded diagnostics'
+        PY
+      if: always()
