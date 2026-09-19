@@ -1425,13 +1425,14 @@ jobs:
 
         anchor = "\tswitch (event) {\n"
         pos = t.index(anchor, t.index("static int ssdk_dev_event(")) + len(anchor)
-        netdev_change = """#if IS_ENABLED(CONFIG_NET_DSA)
-\t\tcase NETDEV_CHANGE:
-\t\t\tif (dsa_user_dev_check(dev))
-\t\t\t\treturn ssdk_dsa_event_link_change(dev, netif_carrier_ok(dev));
-\t\t\tbreak;
-#endif
-"""
+        netdev_change = (
+            "#if IS_ENABLED(CONFIG_NET_DSA)\\n"
+            "\\t\\tcase NETDEV_CHANGE:\\n"
+            "\\t\\t\\tif (dsa_user_dev_check(dev))\\n"
+            "\\t\\t\\t\\treturn ssdk_dsa_event_link_change(dev, netif_carrier_ok(dev));\\n"
+            "\\t\\t\\tbreak;\\n"
+            "#endif\\n"
+        )
         t = t[:pos] + netdev_change + t[pos:]
         p.write_text(t)
         PY
