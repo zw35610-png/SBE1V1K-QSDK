@@ -1,0 +1,1876 @@
+# Compile probe only; no firmware image creation, module loading or flashing.
+name: SBE1V1K V0.2 QSDK Stage28 preparation diagnostics and SSDK prototypes
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      id: checkout
+    - name: Initialize diagnostics
+      shell: bash
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/initialize"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        mkdir -p results
+        cat > results/step-manifest.json <<'STAGE28_MANIFEST'
+        [
+          {
+            "id": "checkout",
+            "name": "Checkout"
+          },
+          {
+            "id": "initialize",
+            "name": "Initialize diagnostics"
+          },
+          {
+            "id": "free_disk",
+            "name": "Free disk"
+          },
+          {
+            "id": "dependencies",
+            "name": "Install dependencies"
+          },
+          {
+            "id": "baseline",
+            "name": "Clone SBE1V1K baseline"
+          },
+          {
+            "id": "downloads_cache",
+            "name": "Cache OpenWrt downloads"
+          },
+          {
+            "id": "qsdk_sources",
+            "name": "Fetch exact QSDK sources"
+          },
+          {
+            "id": "ssdk_source_inspection",
+            "name": "Inspect pinned SSDK source and package build evidence"
+          },
+          {
+            "id": "phy_headers",
+            "name": "Export pinned PHY headers and verify include parent"
+          },
+          {
+            "id": "source_download",
+            "name": "Download sources"
+          },
+          {
+            "id": "kernel_build",
+            "name": "Build OpenWrt kernel"
+          },
+          {
+            "id": "kernel_toolchain",
+            "name": "Locate kernel and toolchain"
+          },
+          {
+            "id": "kernel_symvers",
+            "name": "Verify kernel Module.symvers"
+          },
+          {
+            "id": "include_flags",
+            "name": "Generate QSDK include flags"
+          },
+          {
+            "id": "ppe_compat",
+            "name": "Apply exact successful Stage12 PPE patch"
+          },
+          {
+            "id": "api_probe",
+            "name": "Repeat verified Stage12 DSA and vmalloc compile probe"
+          },
+          {
+            "id": "nss_debug",
+            "name": "Compile QCA NSS Debug"
+          },
+          {
+            "id": "bridge_audit",
+            "name": "Audit Linux 6.18.39 bridge semantics and patch SSDK"
+          },
+          {
+            "id": "bridge_probe",
+            "name": "Compile and MODPOST exact Stage16 bridge helper"
+          },
+          {
+            "id": "prototypes",
+            "name": "Audit pinned declarations and add exact SSDK MIB prototypes"
+          },
+          {
+            "id": "ssdk_build",
+            "name": "Build exact SSDK through verified mk entry"
+          },
+          {
+            "id": "ppe_build",
+            "name": "Build PPE with SSDK and NSS Debug exports"
+          }
+        ]
+        STAGE28_MANIFEST
+        printf 'repository=%s\nrun_id=%s\nrun_attempt=%s\nworkflow_ref=%s\nworkflow_sha=%s\n' \
+          "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+          "$GITHUB_WORKFLOW_REF" "$GITHUB_WORKFLOW_SHA" > results/run-context.txt
+        mkdir -p results/workflow-source
+        if [ -d .github/workflows ]; then
+          cp -a .github/workflows/. results/workflow-source/
+        fi
+      id: initialize
+    - name: Free disk
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/free_disk"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        sudo rm -rf /usr/local/lib/android || true
+        sudo rm -rf /usr/share/dotnet || true
+        sudo rm -rf /opt/ghc || true
+        sudo apt-get clean
+        df -h
+      id: free_disk
+    - name: Install dependencies
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/dependencies"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential clang flex bison g++ gawk \
+          gcc-multilib gettext git libncurses-dev \
+          libssl-dev python3-setuptools rsync swig \
+          unzip zlib1g-dev file wget curl jq bc kmod
+      id: dependencies
+    - name: Clone SBE1V1K baseline
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/baseline"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        git clone \
+          https://github.com/luckkyboy/SBE1V1K.git \
+          openwrt
+
+        cd openwrt
+
+        git checkout \
+          02fb9517c9aefac9f3825a15ae46e7998bae7edd
+
+        cp configs/sbe1v1k.config .config
+
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        make defconfig
+      id: baseline
+    - name: Cache OpenWrt downloads
+      continue-on-error: true
+      uses: actions/cache@v4
+      with:
+        path: openwrt/dl
+        key: sbe1v1k-stage28-${{ runner.os }}-${{ hashFiles('openwrt/.config') }}
+        restore-keys: |
+          sbe1v1k-stage20-${{ runner.os }}-
+          sbe1v1k-stage19-${{ runner.os }}-
+          sbe1v1k-stage18-${{ runner.os }}-
+          sbe1v1k-stage17-${{ runner.os }}-
+          sbe1v1k-stage16-${{ runner.os }}-
+          sbe1v1k-stage15-${{ runner.os }}-
+          sbe1v1k-stage14-${{ runner.os }}-
+          sbe1v1k-stage13-${{ runner.os }}-
+          sbe1v1k-stage12-${{ runner.os }}-
+          sbe1v1k-openwrt-dl-${{ runner.os }}-
+      id: downloads_cache
+    - name: Fetch exact QSDK sources
+      shell: bash
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/qsdk_sources"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        set -e
+
+        mkdir -p qsdk-src results
+
+        git clone \
+          https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe.git \
+          qsdk-src/qca-nss-ppe
+
+        git -C qsdk-src/qca-nss-ppe checkout \
+          87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+
+        git clone \
+          https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-ssdk.git \
+          qsdk-src/qca-ssdk
+
+        git -C qsdk-src/qca-ssdk checkout \
+          717b74016b0c131575bcd81b9e039d3f7974b02a
+
+        {
+          echo "PPE=$(git -C qsdk-src/qca-nss-ppe rev-parse HEAD)"
+          echo "SSDK=$(git -C qsdk-src/qca-ssdk rev-parse HEAD)"
+        } | tee results/qsdk-commits.txt
+
+        test "$(git -C qsdk-src/qca-nss-ppe rev-parse HEAD)" = 87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+        test "$(git -C qsdk-src/qca-ssdk rev-parse HEAD)" = 717b74016b0c131575bcd81b9e039d3f7974b02a
+        git clone https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-nss-phy.git qsdk-src/qca-nss-phy
+        git -C qsdk-src/qca-nss-phy checkout --detach 16eec6ac35820cb67af59223e8b4c2dba7179655
+        test "$(git -C qsdk-src/qca-nss-phy rev-parse HEAD)" = 16eec6ac35820cb67af59223e8b4c2dba7179655
+        echo "PHY=$(git -C qsdk-src/qca-nss-phy rev-parse HEAD)" >> results/qsdk-commits.txt
+        git -C qsdk-src/qca-nss-phy log -1 --format=fuller > results/phy-source-commit.txt
+        git -C qsdk-src/qca-nss-phy ls-tree -r --name-only HEAD > results/phy-source-tree.txt
+      id: qsdk_sources
+    - name: Inspect pinned SSDK source and package build evidence
+      run: "# Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.\nSTAGE28_STEP_DIR=\"$GITHUB_WORKSPACE/results/steps/ssdk_source_inspection\"\
+        \nmkdir -p \"$STAGE28_STEP_DIR\"\nprintf '%s\\n' RUNNING > \"$STAGE28_STEP_DIR/state.txt\"\ncp \"${BASH_SOURCE[0]}\"\
+        \ \"$STAGE28_STEP_DIR/script.sh\"\nexec > >(tee \"$STAGE28_STEP_DIR/console.log\") 2>&1\nstage28_finish() {\n  local\
+        \ stage28_rc=\"$1\" stage28_line=\"$2\" stage28_command=\"$3\"\n  trap - EXIT\n  printf '%s\\n' \"$stage28_rc\" >\
+        \ \"$STAGE28_STEP_DIR/exit-code.txt\"\n  if [ \"$stage28_rc\" -eq 0 ]; then\n    printf '%s\\n' PASS > \"$STAGE28_STEP_DIR/state.txt\"\
+        \n  else\n    printf '%s\\n' FAIL > \"$STAGE28_STEP_DIR/state.txt\"\n    printf 'line=%s\\ncommand=%s\\n' \"$stage28_line\"\
+        \ \"$stage28_command\" > \"$STAGE28_STEP_DIR/failure.txt\"\n  fi\n  exit \"$stage28_rc\"\n}\ntrap 'stage28_finish\
+        \ \"$?\" \"$LINENO\" \"$BASH_COMMAND\"' EXIT\n# Original step body follows.\nset -euo pipefail\nSSDK=\"$GITHUB_WORKSPACE/qsdk-src/qca-ssdk\"\
+        \nmkdir -p results/ssdk-source-context\ngit -C \"$SSDK\" ls-tree -r --name-only HEAD > results/ssdk-source-tree.txt\n\
+        git -C \"$SSDK\" log -1 --format=fuller > results/ssdk-source-commit.txt\nfind \"$SSDK\" -path \"$SSDK/.git\" -prune\
+        \ -o -type f \\( -iname '*makefile*' -o -name '*.mk' -o -name '*build*.sh' -o -name 'make.sh' -o -name 'Kbuild' \\\
+        ) -print | sort > results/ssdk-build-entry-inventory.txt\ncp -a \"$SSDK/mk\" results/ssdk-source-context/\ncat > results/ssdk-source-context/QSDK-package-Makefile\
+        \ <<'QSDK_PACKAGE'\n\ninclude $(TOPDIR)/rules.mk\ninclude $(INCLUDE_DIR)/kernel.mk\n\nPKG_NAME:=qca-ssdk\nPKG_SOURCE_PROTO:=git\n\
+        PKG_BRANCH:=master\nPKG_RELEASE:=1\n\nifeq ($(CONFIG_TARGET_ipq),y)\n\tsubtarget:=$(SUBTARGET)\nelse\n\tsubtarget:=$(CONFIG_TARGET_BOARD)\n\
+        endif\n\nifneq (, $(findstring _64, $(subtarget)))\n\thal_arch:=$(subst _64,,$(subtarget))\nelse ifneq (, $(findstring\
+        \ _32, $(subtarget)))\n\thal_arch:=$(subst _32,,$(subtarget))\nelse\n\thal_arch:=$(subtarget)\nendif\n\ninclude $(INCLUDE_DIR)/local-development.mk\n\
+        ifeq ($(DUMP)$(PKG_VERSION),)\n\tPKG_VERSION:=$(shell git ls-remote $(PKG_SOURCE_URL) $(PKG_BRANCH) | cut -b -7)\n\
+        endif\n\nLOCAL_VARIANT=$(patsubst qca-ssdk-%,%,$(patsubst qca-ssdk-%,%,$(BUILD_VARIANT)))\ninclude $(INCLUDE_DIR)/package.mk\n\
+        \ndefine KernelPackage/qca-ssdk/default-nohnat\n  SECTION:=kernel\n  CATEGORY:=Kernel modules\n  SUBMENU:=Network\
+        \ Devices\n  TITLE:=Kernel driver for QCA SSDK\n  FILES:=$(PKG_BUILD_DIR)/build/bin/qca-ssdk.ko\n  AUTOLOAD:=$(call\
+        \ AutoLoad,30,qca-ssdk)\n  PROVIDES:=qca-ssdk\nendef\n\ndefine KernelPackage/qca-ssdk-nohnat\n$(call KernelPackage/qca-ssdk/default-nohnat)\n\
+        \  DEPENDS:=@!(TARGET_ipq_ipq40xx||TARGET_ipq40xx)||TARGET_ar71xx \\\n\t+kmod-qca-nss-phy\n  VARIANT:=nohnat\n\n \
+        \ ifneq (, $(findstring $(hal_arch), \"ipq50xx\"))\n    ifeq (, $(CONFIG_LOWMEM_FLASH))\n      ifneq ($(LINUX_VERSION),$(filter\
+        \ 5.4%,$(LINUX_VERSION)))\n      DEPENDS+=kmod-ipt-filter +kmod-ppp\n      QCASSDK_CONFIG_OPTS+= HNAT_FEATURE=enable\n\
+        \      endif\n    endif\n  endif\nendef\n\ndefine KernelPackage/qca-ssdk-nohnat/Description\nThis package contains\
+        \ a qca-ssdk driver for QCA chipset\nendef\n\ndefine KernelPackage/qca-ssdk-hnat\n$(call KernelPackage/qca-ssdk/default-nohnat)\n\
+        \  DEPENDS:=@TARGET_ipq_ipq40xx||TARGET_ipq40xx||TARGET_ar71xx||TARGET_ipq806x +kmod-ipt-extra \\\n\t  +kmod-ipt-filter\
+        \ +(TARGET_ipq806x||TARGET_ipq):kmod-qca-rfs +kmod-ppp\n  TITLE+= (hnat)\n  VARIANT:=hnat\nendef\n\ndefine KernelPackage/qca-ssdk-hnat/Description\n\
+        This package contains a qca-ssdk-hnat driver for QCA chipset\nendef\n\nGCC_VERSION=$(shell echo \"$(CONFIG_GCC_VERSION)\"\
+        \ | sed 's/[^0-9.]*\\([0-9.]*\\).*/\\1/')\nifeq ($(GCC_VERSION), 4.8)\n\tGCC_VERSION=4.8.3\nendif\n\nifdef CONFIG_TOOLCHAIN_BIN_PATH\n\
+        \tTOOLCHAIN_BIN_PATH=$(CONFIG_TOOLCHAIN_BIN_PATH)\nelse\n\tTOOLCHAIN_BIN_PATH=$(TOOLCHAIN_DIR)/bin\nendif\n\nifdef\
+        \ CONFIG_TARGET_NAME\n\tQCASSDK_CONFIG_OPTS+= \\\n\t\t\t      TARGET_NAME=$(CONFIG_TARGET_NAME)\nelse ifneq ($(CONFIG_ARCH),)\n\
+        \tQCASSDK_CONFIG_OPTS+= \\\n\t\t\t      TARGET_NAME=$(subst \",,$(CONFIG_ARCH))-openwrt-linux$(if $(CONFIG_TARGET_SUFFIX),-$(subst\
+        \ \",,$(CONFIG_TARGET_SUFFIX)))\nendif\n\nQCASSDK_CONFIG_OPTS+= TOOL_PATH=$(TOOLCHAIN_BIN_PATH) \\\n             \
+        \   SYS_PATH=$(LINUX_DIR) \\\n                TOOLPREFIX=$(TARGET_CROSS) \\\n                KVER=$(LINUX_VERSION)\
+        \ \\\n                ARCH=$(LINUX_KARCH) \\\n\t\tTARGET_SUFFIX=$(CONFIG_TARGET_SUFFIX) \\\n\t\tGCC_VERSION=$(GCC_VERSION)\
+        \ \\\n\t\tSoC=$(hal_arch) \\\n\t\tCFLAGS=-I$(STAGING_DIR)/usr/include\n\nifeq ($(LOCAL_VARIANT),hnat)\n    QCASSDK_CONFIG_OPTS+=\
+        \ HNAT_FEATURE=enable\n    ifeq ($(CONFIG_TARGET_ar71xx),)\n    \tQCASSDK_CONFIG_OPTS+= RFS_FEATURE=enable\n    endif\n\
+        endif\n\nifneq (, $(findstring $(hal_arch), \"ipq95xx\"))\n\tQCASSDK_CONFIG_OPTS+= CHIP_TYPE=APPE\nelse ifneq (, $(findstring\
+        \ $(hal_arch), \"ipq807x\"))\n\tQCASSDK_CONFIG_OPTS+= CHIP_TYPE=HPPE\nelse ifneq (, $(findstring $(hal_arch), \"ipq60xx\"\
+        ))\n\tQCASSDK_CONFIG_OPTS+= CHIP_TYPE=CPPE\nelse ifneq (, $(findstring $(hal_arch), \"ipq50xx\"))\n\tQCASSDK_CONFIG_OPTS+=\
+        \ CHIP_TYPE=MP\nelse ifneq (, $(findstring $(hal_arch), \"ipq53xx\"))\n\tQCASSDK_CONFIG_OPTS+= CHIP_TYPE=MPPE\nelse\
+        \ ifneq (, $(findstring $(hal_arch), \"ipq54xx\"))\n\tQCASSDK_CONFIG_OPTS+= CHIP_TYPE=MRPPE\nendif\n\nifneq (, $(findstring\
+        \ $(CONFIG_KERNEL_IPQ_MEM_PROFILE), 256)$(CONFIG_LOWMEM_FLASH))\n\tQCASSDK_CONFIG_OPTS+= MINI_SSDK=enable\n\tifeq\
+        \ ($(CONFIG_LOWMEM_FLASH),y)\n\t\tQCASSDK_CONFIG_OPTS+= LOWMEM_FLASH=enable\n\tendif\nendif\n\ndefine Build/InstallDev\n\
+        \t$(INSTALL_DIR) $(1)/usr/include/qca-ssdk\n\t$(INSTALL_DIR) $(1)/usr/include/qca-ssdk/api\n\t$(INSTALL_DIR) $(1)/usr/include/qca-ssdk/ref\n\
+        \t$(INSTALL_DIR) $(1)/usr/include/qca-ssdk/fal\n\t$(INSTALL_DIR) $(1)/usr/include/qca-ssdk/sal\n\t$(INSTALL_DIR) $(1)/usr/include/qca-ssdk/init\n\
+        \t$(CP) -rf $(PKG_BUILD_DIR)/include/api/sw_ioctl.h $(1)/usr/include/qca-ssdk/api\n\tif [ -f $(PKG_BUILD_DIR)/include/ref/ref_vsi.h\
+        \ ]; then \\\n\t$(CP) -rf $(PKG_BUILD_DIR)/include/ref/ref_vsi.h $(1)/usr/include/qca-ssdk/ref/; \\\n\tfi\n\tif [\
+        \ -f $(PKG_BUILD_DIR)/include/ref/ref_fdb.h ]; then \\\n\t$(CP) -rf $(PKG_BUILD_DIR)/include/ref/ref_fdb.h $(1)/usr/include/qca-ssdk/ref/;\
+        \ \\\n\tfi\n\tif [ -f $(PKG_BUILD_DIR)/include/ref/ref_port_ctrl.h ]; then \\\n\t$(CP) -rf $(PKG_BUILD_DIR)/include/ref/ref_port_ctrl.h\
+        \ $(1)/usr/include/qca-ssdk/ref/; \\\n\tfi\n\t$(CP) -rf $(PKG_BUILD_DIR)/include/init $(1)/usr/include/qca-ssdk\n\t\
+        $(CP) -rf $(PKG_BUILD_DIR)/include/fal $(1)/usr/include/qca-ssdk\n\t$(CP) -rf $(PKG_BUILD_DIR)/include/common/*.h\
+        \ $(1)/usr/include/qca-ssdk\n\t$(CP) -rf $(PKG_BUILD_DIR)/include/sal/os/linux/*.h $(1)/usr/include/qca-ssdk\n\t$(CP)\
+        \ -rf $(PKG_BUILD_DIR)/include/sal/os/*.h $(1)/usr/include/qca-ssdk\n\nendef\n\nLNX_CONFIG_OPTS :=\n\nifneq (, $(findstring\
+        \ $(hal_arch), \"ipq807x\" \"ipq60xx\" \"ipq95xx\" \"ipq53xx\"))\nLNX_CONFIG_OPTS += LNX_MAKEOPTS='$(KERNEL_MAKEOPTS)'\
+        \ MODULE_TYPE=KSLIB modules\nelse ifeq ($(LINUX_VERSION), $(filter 6.1%, $(LINUX_VERSION)))\nLNX_CONFIG_OPTS += LNX_MAKEOPTS='$(KERNEL_MAKEOPTS)'\
+        \ MODULE_TYPE=KSLIB modules\nelse ifeq ($(LINUX_VERSION), $(filter 6.6%, $(LINUX_VERSION)))\nLNX_CONFIG_OPTS += LNX_MAKEOPTS='$(KERNEL_MAKEOPTS)'\
+        \ MODULE_TYPE=KSLIB modules\nendif\n\ndefine Build/Compile\n\t$(MAKE) -C $(PKG_BUILD_DIR)/mk $(strip $(QCASSDK_CONFIG_OPTS))\
+        \ $(LNX_CONFIG_OPTS)\nendef\n\ndefine KernelPackage/qca-ssdk-nohnat/install\n\t$(INSTALL_DIR) $(1)/etc/init.d\n\t\
+        $(INSTALL_BIN) ./files/qca-ssdk $(1)/etc/init.d/qca-ssdk\nendef\n\ndefine KernelPackage/qca-ssdk-hnat/install\n\t\
+        $(INSTALL_DIR) $(1)/etc/init.d\n\t$(INSTALL_BIN) ./files/qca-ssdk $(1)/etc/init.d/qca-ssdk\nendef\n\n$(eval $(call\
+        \ KernelPackage,qca-ssdk-nohnat))\n$(eval $(call KernelPackage,qca-ssdk-hnat))\nQSDK_PACKAGE\ncat > results/ssdk-build-provenance.txt\
+        \ <<'PROVENANCE'\nSource: https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-ssdk.git\nSource commit: 717b74016b0c131575bcd81b9e039d3f7974b02a\n\
+        Package: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/ssdk.git\nPackage reference commit: c7ebac1882395c7ee35453cde6775c7026b813b8\n\
+        Package reference branch: win.nss.1.1 (fixed snapshot, not claimed as a release manifest pairing)\nPackage Build/Compile:\
+        \ make -C $(PKG_BUILD_DIR)/mk\nipq95xx -> CHIP_TYPE=APPE; MODULE_TYPE=KSLIB; LNX_MAKEOPTS; modules\nmk/Makefile ->\
+        \ kernel M=$(MK_PATH); copies mk/Module.symvers to root and ko to build/bin.\nStage16 retains Stage13/14 MINI_SSDK=disable\
+        \ PTP_FEATURE=disable SWCONFIG_FEATURE=disable.\nNo OS_VER override or kernel version spoofing; effective values are\
+        \ captured.\nmk/build.sh is a developer matrix runner referring to absent make.sh, not the package entry.\nPROVENANCE\n\
+        python3 <<'PY'\nfrom pathlib import Path\nimport hashlib\nexpected = {'mk/build.sh': '1307f7f33feeae5f1f7c30b2159026757b6983fb3a5fbdefca688732015a7de9',\
+        \ 'mk/cflags.mk': '905e4f5ae54f52e2e48720511e83d788ac25d623657f019e54bd72b4e6bded2a', 'mk/chip.mk': '04a92d2fa375c0aa65b9ca935fc00b74fcebaf6011f25513d93c400cdc086e3c',\
+        \ 'mk/feature.mk': '6295cf05c4311950bd2e9cc3e00f89171c6eb09be99384e4f944d792d32b50a7', 'mk/make.sh': '7fb02f94256ad2f8fd1a2e7794ec17893bc7db17f577cf62e5da2a53b68db808',\
+        \ 'mk/Makefile': 'adf8f279aba5635deba314138874eb5b33211c2c84f782f216bd05b923be4f1f', 'mk/obj.mk': 'c222542a7702df0fb719f25097e7a3a69aeccdb11d0c006517a4a42829fdb66b'}\n\
+        base = Path('qsdk-src/qca-ssdk')\nlines = []\nfor name, digest in expected.items():\n    actual = hashlib.sha256((base\
+        \ / name).read_bytes()).hexdigest()\n    lines.append(f'{actual}  {name}')\n    assert actual == digest, f'Unexpected\
+        \ SSDK build input: {name}'\nPath('results/ssdk-build-input-sha256.txt').write_text('\\n'.join(lines) + '\\n')\nPY\n"
+      id: ssdk_source_inspection
+    - name: Export pinned PHY headers and verify include parent
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/phy_headers"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        set -euo pipefail
+        python3 <<'PY'
+        from pathlib import Path
+        import hashlib, json, re, shutil
+        root = Path.cwd()
+        phy = root / 'qsdk-src/qca-nss-phy'
+        ssdk = root / 'qsdk-src/qca-ssdk'
+        parent = root / 'qsdk-include'
+        dest = parent / 'qca-nss-phy'
+        dest.mkdir(parents=True, exist_ok=True)
+        out = root / 'results'
+        # Qualcomm nss-host c887f125 Build/InstallDev exports nss_ext/*h here.
+        # Also export the three linux_std headers directly referenced by SSDK 717b740.
+        headers = sorted((phy / 'nss_ext').glob('*.h')) + [
+            phy / 'linux_std/qcom_phy_lib.h',
+            phy / 'linux_std/clock/qca8k_clk.h',
+            phy / 'linux_std/mdio_ahb/mdio-ahb.h',
+        ]
+        assert headers and len({p.name for p in headers}) == len(headers)
+        manifest = []
+        for p in headers:
+            assert p.is_file(), p
+            shutil.copy2(p, dest / p.name)
+            digest = hashlib.sha256(p.read_bytes()).hexdigest()
+            assert hashlib.sha256((dest / p.name).read_bytes()).hexdigest() == digest
+            manifest.append(f'{digest}  {p.relative_to(phy).as_posix()} -> qca-nss-phy/{p.name}')
+        references = set()
+        for base in (ssdk, root / 'qsdk-src/qca-nss-ppe'):
+            for p in base.rglob('*'):
+                if p.suffix in ('.c', '.h'):
+                    references.update(re.findall(r'#\s*include\s*[<"](qca-nss-phy/[^">]+)[">]', p.read_text(errors='replace')))
+        assert 'qca-nss-phy/nss_phy_ptp.h' in references
+        missing = sorted(name for name in references if not (parent / name).is_file())
+        (out / 'phy-header-manifest.txt').write_text('\n'.join(manifest) + '\n')
+        (out / 'phy-header-references.txt').write_text('\n'.join(sorted(references)) + '\n')
+        status = {'source_commit': '16eec6ac35820cb67af59223e8b4c2dba7179655',
+                  'include_parent': str(parent), 'exported_header_count': len(headers),
+                  'missing_headers': missing, 'verified': not missing}
+        (out / 'phy-header-status.json').write_text(json.dumps(status, indent=2) + '\n')
+        shutil.copytree(dest, out / 'phy-exported-headers/qca-nss-phy', dirs_exist_ok=True)
+        assert not missing, f'Missing real PHY headers: {missing}'
+        print(json.dumps(status, indent=2))
+        PY
+      id: phy_headers
+    - name: Download sources
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/source_download"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        cd openwrt
+        make download -j$(nproc)
+      id: source_download
+    - name: Build OpenWrt kernel
+      shell: bash
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/kernel_build"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        set -o pipefail
+        cd openwrt
+
+        make tools/install -j$(nproc) \
+          2>&1 | tee ../tools.log
+
+        make toolchain/install -j$(nproc) \
+          2>&1 | tee ../toolchain.log
+
+        make target/linux/compile -j$(nproc) \
+          2>&1 | tee ../kernel-compile.log
+      id: kernel_build
+    - name: Locate kernel and toolchain
+      shell: bash
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/kernel_toolchain"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        set -euo pipefail
+        mapfile -t kernels < <(find "$GITHUB_WORKSPACE/openwrt/build_dir" -type d -path '*/linux-qualcommbe_ipq95xx/linux-6.18.39')
+        test "${#kernels[@]}" = 1
+        KERNEL_DIR="${kernels[0]}"
+        mapfile -t compilers < <(find -L "$GITHUB_WORKSPACE/openwrt/staging_dir" -path '*/toolchain-aarch64*/bin/aarch64-openwrt-linux-musl-gcc' -type f)
+        test "${#compilers[@]}" = 1
+        GCC="${compilers[0]}"
+        TOOLCHAIN_DIR="$(dirname "$(dirname "$GCC")")"
+        CROSS_COMPILE="${GCC%gcc}"
+        test -x "$GCC"
+        grep -q 'CONFIG_TARGET_qualcommbe_ipq95xx=y' openwrt/.config
+        grep -q 'CONFIG_ARM64=y' "$KERNEL_DIR/.config"
+        grep -q 'CONFIG_MODULES=y' "$KERNEL_DIR/.config"
+        grep -Eq '"6\.18\.39(["-])' "$KERNEL_DIR/include/generated/utsrelease.h"
+        {
+          echo "KERNEL_DIR=$KERNEL_DIR"
+          echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR"
+          echo "GCC=$GCC"
+          echo "CROSS_COMPILE=$CROSS_COMPILE"
+        } | tee results/environment.txt
+        "$GCC" --version > results/compiler-version.txt
+        cat "$KERNEL_DIR/include/generated/utsrelease.h" > results/kernel-version.txt
+        git -C openwrt rev-parse HEAD > results/openwrt-commit.txt
+      id: kernel_toolchain
+    - name: Verify kernel Module.symvers
+      shell: bash
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/kernel_symvers"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        set +e
+
+        KERNEL_DIR=$(grep '^KERNEL_DIR=' \
+          results/environment.txt | cut -d= -f2-)
+
+        {
+          echo "===== KERNEL BUILD CHECK ====="
+          echo "Kernel: $KERNEL_DIR"
+          echo ""
+
+          if [ -s "$KERNEL_DIR/Module.symvers" ]; then
+            echo "Module.symvers: PRESENT"
+            echo -n "Lines: "
+            wc -l < "$KERNEL_DIR/Module.symvers"
+            echo -n "Size: "
+            stat -c '%s bytes' "$KERNEL_DIR/Module.symvers"
+          else
+            echo "Module.symvers: MISSING OR EMPTY"
+          fi
+        } | tee results/kernel-symvers-check.txt
+
+        test -s "$KERNEL_DIR/Module.symvers"
+      id: kernel_symvers
+    - name: Generate QSDK include flags
+      shell: bash
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/include_flags"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        set -e
+
+        SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+        PPE="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe"
+
+        test -f "$SSDK/include/fal/fal_rss_hash.h"
+        test -f "$SSDK/include/sal/os/aos_mem.h"
+        test -f "$PPE/nss_debug/exports/nss_debug.h"
+
+        find "$SSDK" \
+          -type f \
+          -name '*.h' \
+          -printf '%h\n' \
+          | sort -u \
+          > results/ssdk-header-dirs.txt
+
+        : > results/qsdk-header-flags.txt
+        printf -- '-I%s ' "$GITHUB_WORKSPACE/qsdk-include" >> results/qsdk-header-flags.txt
+
+        printf -- '-I%s ' "$SSDK/include" \
+          >> results/qsdk-header-flags.txt
+
+        while IFS= read -r DIR
+        do
+          printf -- '-I%s ' "$DIR" \
+            >> results/qsdk-header-flags.txt
+        done < results/ssdk-header-dirs.txt
+
+        printf -- '-I%s ' \
+          "$PPE/nss_debug/exports" \
+          >> results/qsdk-header-flags.txt
+
+        printf -- '%s ' \
+          '-Wno-error=ignored-qualifiers' \
+          '-Wno-error=missing-prototypes' \
+          '-Wno-error=shift-count-overflow' \
+          >> results/qsdk-header-flags.txt
+      id: include_flags
+    - name: Apply exact successful Stage12 PPE patch
+      shell: bash
+      run: "# Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.\nSTAGE28_STEP_DIR=\"$GITHUB_WORKSPACE/results/steps/ppe_compat\"\
+        \nmkdir -p \"$STAGE28_STEP_DIR\"\nprintf '%s\\n' RUNNING > \"$STAGE28_STEP_DIR/state.txt\"\ncp \"${BASH_SOURCE[0]}\"\
+        \ \"$STAGE28_STEP_DIR/script.sh\"\nexec > >(tee \"$STAGE28_STEP_DIR/console.log\") 2>&1\nstage28_finish() {\n  local\
+        \ stage28_rc=\"$1\" stage28_line=\"$2\" stage28_command=\"$3\"\n  trap - EXIT\n  printf '%s\\n' \"$stage28_rc\" >\
+        \ \"$STAGE28_STEP_DIR/exit-code.txt\"\n  if [ \"$stage28_rc\" -eq 0 ]; then\n    printf '%s\\n' PASS > \"$STAGE28_STEP_DIR/state.txt\"\
+        \n  else\n    printf '%s\\n' FAIL > \"$STAGE28_STEP_DIR/state.txt\"\n    printf 'line=%s\\ncommand=%s\\n' \"$stage28_line\"\
+        \ \"$stage28_command\" > \"$STAGE28_STEP_DIR/failure.txt\"\n  fi\n  exit \"$stage28_rc\"\n}\ntrap 'stage28_finish\
+        \ \"$?\" \"$LINENO\" \"$BASH_COMMAND\"' EXIT\n# Original step body follows.\nset -euo pipefail\ncat > results/linux-6.18-stage12-compat.patch\
+        \ <<'STAGE12_PATCH'\ndiff --git a/drv/ppe_drv/ppe_drv.c b/drv/ppe_drv/ppe_drv.c\nindex e113996e..b83ea536 100644\n\
+        --- a/drv/ppe_drv/ppe_drv.c\n+++ b/drv/ppe_drv/ppe_drv.c\n@@ -313,7 +313,7 @@ void ppe_drv_vlan_flow_key_enable(void)\n\
+        \  * ppe_drv_sixth_tuple_mode_handler()\n  *\tchange the sixth mode.\n  */\n-static int ppe_drv_sixth_tuple_mode_handler(struct\
+        \ ctl_table *table, int write,\n+static int ppe_drv_sixth_tuple_mode_handler(const struct ctl_table *table, int write,\n\
+        \ \t\tvoid __user *buffer, size_t *lenp, loff_t *ppos)\n {\n \tint ret, cur_sixth_tuple_mode;\n@@ -2576,7 +2576,7\
+        \ @@ fail:\n  * ppe_drv_remove()\n  *\tremove the ppe driver\n  */\n-static int ppe_drv_remove(struct platform_device\
+        \ *pdev)\n+static void ppe_drv_remove(struct platform_device *pdev)\n {\n \tstruct ppe_drv *p = platform_get_drvdata(pdev);\n\
+        \ \tint i = 0;\n@@ -2770,7 +2770,7 @@ static int ppe_drv_remove(struct platform_device *pdev)\n \tppe_drv_flow_dump_exit();\n\
+        \ \tppe_drv_if_map_exit();\n \n-\treturn 0;\n+\treturn;\n }\n \n /*\n@@ -2965,7 +2965,7 @@ static void ppe_drv_set_ppe_if_bm_to_port(void)\n\
+        \  * ppe_drv_if_bm_to_offload_handler()\n  *\tAPI to configure the interface bitmask where the offload is enabled\n\
+        \  */\n-static int ppe_drv_if_bm_to_offload_handler(struct ctl_table *table, int write,\n+static int ppe_drv_if_bm_to_offload_handler(const\
+        \ struct ctl_table *table, int write,\n \t\tvoid __user *buffer, size_t *lenp, loff_t *ppos)\n {\n \tint ret;\n@@\
+        \ -2999,7 +2999,7 @@ static int ppe_drv_if_bm_to_offload_handler(struct ctl_table *table, int write,\n  * ppe_drv_disable_port_mtu_check_handler()\n\
+        \  * \tSet disable port mtu config\n  */\n-static int ppe_drv_disable_port_mtu_check_handler(struct ctl_table *table,\n\
+        +static int ppe_drv_disable_port_mtu_check_handler(const struct ctl_table *table,\n \t\t\t\t\t\tint write, void __user\
+        \ *buffer,\n \t\t\t\t\t\tsize_t *lenp, loff_t *ppos)\n {\n@@ -3022,7 +3022,7 @@ static int ppe_drv_disable_port_mtu_check_handler(struct\
+        \ ctl_table *table,\n  * ppe_drv_l4_checksum_exception_enable()\n  *\tAPI to enable/disable the exception for l4 checksum.\n\
+        \  */\n-int ppe_drv_l4_checksum_exception_enable(struct ctl_table *table, int write,\n+int ppe_drv_l4_checksum_exception_enable(const\
+        \ struct ctl_table *table, int write,\n \t\tvoid __user *buffer, size_t *lenp, loff_t *ppos)\n {\n \tint ret;\n@@\
+        \ -3059,7 +3059,7 @@ int ppe_drv_l4_checksum_exception_enable(struct ctl_table *table, int write,\n  * ppe_drv_mac_lrn_exception_en()\n\
+        \  *\tAPI to enable/disable the exception for MAC address learn exception.\n  */\n-int ppe_drv_mac_lrn_exception_en(struct\
+        \ ctl_table *table, int write,\n+int ppe_drv_mac_lrn_exception_en(const struct ctl_table *table, int write,\n \t\t\
+        void __user *buffer, size_t *lenp, loff_t *ppos)\n {\n \tint ret;\n@@ -3079,7 +3079,7 @@ int ppe_drv_mac_lrn_exception_en(struct\
+        \ ctl_table *table, int write,\n  * ppe_drv_loopback_port_feature_write_handler()\n  *\tsysctl handler for loopback\
+        \ port write operation.\n  */\n-static int ppe_drv_loopback_port_feature_write_handler(struct ctl_table *table, int\
+        \ write,\n+static int ppe_drv_loopback_port_feature_write_handler(const struct ctl_table *table, int write,\n \t\t\
+        void __user *buffer, size_t *lenp, loff_t *ppos)\n {\n \tstruct ppe_drv *p = ppe_drv_gbl;\n@@ -3134,7 +3134,7 @@ static\
+        \ int ppe_drv_loopback_port_feature_write_handler(struct ctl_table *table,\n  * ppe_drv_wlan_host_assist_qdisc_en_handler()\n\
+        \  *\tHandler for wlan_host_assist_qdisc_en sysctl\n  */\n-static int ppe_drv_wlan_host_assist_qdisc_en_handler(struct\
+        \ ctl_table *table, int write,\n+static int ppe_drv_wlan_host_assist_qdisc_en_handler(const struct ctl_table *table,\
+        \ int write,\n \t\tvoid __user *buffer, size_t *lenp, loff_t *ppos)\n {\n \tint ret;\n@@ -3183,7 +3183,7 @@ static\
+        \ int ppe_drv_wlan_host_assist_qdisc_en_handler(struct ctl_table *table, in\n  *\t\t- Clears BIT(1) and BIT(2) to\
+        \ disable IPsec AH and ESP flow keys\n  *\t\t- Writes the updated configuration back to hardware\n  */\n-static int\
+        \ ppe_drv_ipsec_pass_through_en_handler(struct ctl_table *table, int write,\n+static int ppe_drv_ipsec_pass_through_en_handler(const\
+        \ struct ctl_table *table, int write,\n \t\tvoid __user *buffer, size_t *lenp, loff_t *ppos)\n {\n \tint ret;\n@@\
+        \ -3254,7 +3254,7 @@ static int ppe_drv_ipsec_pass_through_en_handler(struct ctl_table *table, int wr\n  * ppe_drv_eth2eth_offload_if_bitmap_handler()\n\
+        \  * \tSet eth to eth offload with if bitmap config\n  */\n-static int ppe_drv_eth2eth_offload_if_bitmap_handler(struct\
+        \ ctl_table *table,\n+static int ppe_drv_eth2eth_offload_if_bitmap_handler(const struct ctl_table *table,\n \t\t\t\
+        \t\t\tint write, void __user *buffer,\n \t\t\t\t\t\tsize_t *lenp, loff_t *ppos)\n {\n@@ -3277,7 +3277,7 @@ static\
+        \ int ppe_drv_eth2eth_offload_if_bitmap_handler(struct ctl_table *table,\n  * ppe_drv_static_dbg_level_handler()\n\
+        \  *\tSet static debug level for ppe-driver.\n  */\n-static int ppe_drv_static_dbg_level_handler(struct ctl_table\
+        \ *table,\n+static int ppe_drv_static_dbg_level_handler(const struct ctl_table *table,\n \t\t\t\t\tint write, void\
+        \ __user *buffer,\n \t\t\t\t\tsize_t *lenp, loff_t *ppos)\n {\n@@ -3323,7 +3323,7 @@ static int ppe_drv_static_dbg_level_handler(struct\
+        \ ctl_table *table,\n  * ppe_drv_pkt_padding_handler\n  * \tsysctl to enable/disable stripping of packet padding\n\
+        \  */\n-static int ppe_drv_pkt_padding_handler(struct ctl_table *table,  int write, void __user *buffer, size_t *lenp,\
+        \ loff_t *ppos)\n+static int ppe_drv_pkt_padding_handler(const struct ctl_table *table,  int write, void __user *buffer,\
+        \ size_t *lenp, loff_t *ppos)\n {\n \tfal_pktedit_padding_t padding = { 0 };\n \tchar *start_ch_ptr = NULL;\n@@ -3416,7\
+        \ +3416,7 @@ static int ppe_drv_pkt_padding_handler(struct ctl_table *table,  int write, void\n  * ppe_drv_upstream_dev_handler()\n\
+        \  *      Set upstream device.\n  */\n-static int ppe_drv_upstream_dev_handler(struct ctl_table *table,\n+static int\
+        \ ppe_drv_upstream_dev_handler(const struct ctl_table *table,\n \t\tint write, void __user *buffer,\n \t\tsize_t *lenp,\
+        \ loff_t *ppos)\n {\n@@ -3707,7 +3707,7 @@ bool ppe_drv_l2vp_sc_rmv(uint32_t dest_port_id)\n  * ppe_drv_src2uni_handler()\n\
+        \  *      Set Source Profile to UNI port mapping.\n  */\n-static int ppe_drv_src2uni_handler(struct ctl_table *table,\n\
+        +static int ppe_drv_src2uni_handler(const struct ctl_table *table,\n \t\tint write, void __user *buffer,\n \t\tsize_t\
+        \ *lenp, loff_t *ppos)\n {\n@@ -3858,7 +3858,7 @@ static int ppe_drv_src2uni_handler(struct ctl_table *table,\n \t\
+        \t\t\t\t\tcontinue;\n \n \t\t\t\t\tif (!((pp_local->type == PPE_DRV_PORT_PHYSICAL) ||\n-\t\t\t\t\t      ((pp_local->type\
+        \ == PPE_DRV_PORT_VIRTUAL) && dsa_slave_dev_check(pp_local->dev))))\n+\t\t\t\t\t      ((pp_local->type == PPE_DRV_PORT_VIRTUAL)\
+        \ && dsa_user_dev_check(pp_local->dev))))\n \t\t\t\t\t\tcontinue;\n \n \t\t\t\t\tq_dst.src_profile = src_profile;\n\
+        @@ -3931,7 +3931,7 @@ static int ppe_drv_src2uni_handler(struct ctl_table *table,\n \t\t\tcontinue;\n \n \t\tif (!((pp_local->type\
+        \ == PPE_DRV_PORT_PHYSICAL) ||\n-\t\t      ((pp_local->type == PPE_DRV_PORT_VIRTUAL) && dsa_slave_dev_check(pp_local->dev))))\n\
+        +\t\t      ((pp_local->type == PPE_DRV_PORT_VIRTUAL) && dsa_user_dev_check(pp_local->dev))))\n \t\t\tcontinue;\n \n\
+        \ \t\tq_dst.src_profile = src_profile;\n@@ -4235,7 +4235,7 @@ static void ppe_drv_lpbk_iface_name_fmt(char *buf, size_t\
+        \ len,\n  * \techo 'flush' : Remove all the entries from the map.\n  * \techo 'flush <ingress_dev> <egress_dev>' :\
+        \ Removes one specific pair\n  */\n-static int ppe_drv_lpbk_buffer_map_handler(struct ctl_table *table,\n+static int\
+        \ ppe_drv_lpbk_buffer_map_handler(const struct ctl_table *table,\n \t\tint write, void __user *buffer,\n \t\tsize_t\
+        \ *lenp, loff_t *ppos)\n {\n@@ -4409,7 +4409,7 @@ action:\n  * \techo 1 > /proc/sys/ppe/ppe_drv/ddr_buffer_auto_en\
+        \ (enable)\n  * \techo 0 > /proc/sys/ppe/ppe_drv/ddr_buffer_auto_en (disable)\n  */\n-static int ppe_drv_ddr_buffer_auto_en_handler(struct\
+        \ ctl_table *table,\n+static int ppe_drv_ddr_buffer_auto_en_handler(const struct ctl_table *table,\n \t\tint write,\
+        \ void __user *buffer,\n \t\tsize_t *lenp, loff_t *ppos)\n {\ndiff --git a/drv/ppe_drv/ppe_drv_flow.c b/drv/ppe_drv/ppe_drv_flow.c\n\
+        index 5da9357b..63ea6983 100644\n--- a/drv/ppe_drv/ppe_drv_flow.c\n+++ b/drv/ppe_drv/ppe_drv_flow.c\n@@ -13,6 +13,21\
+        \ @@\n #include \"ppe_drv.h\"\n #include \"tun/ppe_drv_tun.h\"\n \n+#include <linux/vmalloc.h>\n+\n+\n+/*\n+ * Temporary\
+        \ QSDK14 / Linux 6.18 MAP-T compatibility.\n+ * Compile-depth probe only.\n+ */\n+static inline bool\n+ppe_drv_flow_dev_is_mapt(struct\
+        \ net_device *dev)\n+{\n+    (void)dev;\n+    return false;\n+}\n+\n+\n static struct ppe_drv_flow_table_info *flow_table_info;\n\
+        \ \n static bool ppe_drv_flow_v6_wifi_qos_get(struct ppe_drv_v6_conn_flow *pcf, uint8_t *wifi_qos, bool *wifi_qos_en);\n\
+        @@ -3323,7 +3338,7 @@ struct ppe_drv_flow *ppe_drv_flow_v4_add(struct ppe_drv_v4_conn_flow *pcf, struc\n \t\t */\n\
+        \ \t\tflow_cfg.fwd_type = FAL_FLOW_FORWARD;\n \t\tppe_drv_trace(\"%p: flow_tbl[fwd_type]: L2-Multicast: %u\", pcf,\
+        \ FAL_FLOW_FORWARD);\n-\t} else if ((match_src_ip != xlate_src_ip) || (dev_eg && (dev_eg->priv_flags_ext & IFF_EXT_MAPT)))\
+        \ {\n+\t} else if ((match_src_ip != xlate_src_ip) || (dev_eg && ppe_drv_flow_dev_is_mapt(dev_eg))) {\n \t\t/*\n \t\
+        \t * Case SNAT\n \t\t */\n@@ -3331,7 +3346,7 @@ struct ppe_drv_flow *ppe_drv_flow_v4_add(struct ppe_drv_v4_conn_flow\
+        \ *pcf, struc\n \t\tflow_cfg.snat_nexthop = nh->index;\n \t\tflow_cfg.snat_srcport = ppe_drv_v4_conn_flow_xlate_src_ident_get(pcf);\n\
+        \ \t\tppe_drv_trace(\"%p: flow_tbl[nat_type]: SNAT: %u snat_port: %u\", pcf, FAL_FLOW_SNAT, flow_cfg.snat_srcport);\n\
+        -\t} else if ((match_dest_ip != xlate_dest_ip) || (dev_in && (dev_in->priv_flags_ext & IFF_EXT_MAPT))) {\n+\t} else\
+        \ if ((match_dest_ip != xlate_dest_ip) || (dev_in && ppe_drv_flow_dev_is_mapt(dev_in))) {\n \t\t/*\n \t\t * Case DNAT\n\
+        \ \t\t */\ndiff --git a/drv/ppe_drv/ppe_drv_nexthop.c b/drv/ppe_drv/ppe_drv_nexthop.c\nindex b112d2aa..25dc5a5d 100644\n\
+        --- a/drv/ppe_drv/ppe_drv_nexthop.c\n+++ b/drv/ppe_drv/ppe_drv_nexthop.c\n@@ -526,7 +526,7 @@ struct ppe_drv_nexthop\
+        \ *ppe_drv_nexthop_v6_get_and_ref(struct ppe_drv_v6_conn_fl\n \t\tis_vlan_as_vp = is_vlan_dev(iface_tx->dev) && (iface_tx->type\
+        \ == PPE_DRV_IFACE_TYPE_VIRTUAL);\n \t\tis_vlan_as_veip = is_vlan_dev(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VEIP);\n\
+        \ #if defined(NSS_VLAN_BASED_DSA_SUPPORT) || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)\n-\t\tis_dsa_dev = dsa_slave_dev_check(iface_tx->dev)\
+        \ && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);\n+\t\tis_dsa_dev = dsa_user_dev_check(iface_tx->dev) && (iface_tx->type\
+        \ == PPE_DRV_IFACE_TYPE_VIRTUAL);\n #endif\n \t}\n \n@@ -594,7 +594,7 @@ struct ppe_drv_nexthop *ppe_drv_nexthop_v6_get_and_ref(struct\
+        \ ppe_drv_v6_conn_fl\n \t\t\t\t * a VLAN-based DSA interface, program the VLAN ID as C-VLAN so that\n \t\t\t\t * S-VLAN\
+        \ remains available for DSA tagging.\n \t\t\t\t */\n-\t\t\t\tif ((is_dsa_dev) && (dp) && (dp->cpu_dp->tag_ops->proto\
+        \ == DSA_TAG_PROTO_QCA_8021Q)) {\n+\t\t\t\tif ((is_dsa_dev) && (dp) && (dp->cpu_dp->tag_ops->proto == DSA_TAG_PROTO_8021Q))\
+        \ {\n \t\t\t\t\tppe_drv_trace(\"%p: DSA egress, programming bridge VLAN %u as CTAG\",\n \t\t\t\t\t\t\tpcf, in_vlan);\n\
+        \ \t\t\t\t\tfal_nh.ctag_fmt = 1;\n@@ -1022,7 +1022,7 @@ struct ppe_drv_nexthop *ppe_drv_nexthop_v4_get_and_ref(struct\
+        \ ppe_drv_v4_conn_fl\n \t\tis_vlan_as_vp = is_vlan_dev(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);\n\
+        \ \t\tis_vlan_as_veip = is_vlan_dev(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VEIP);\n #if defined(NSS_VLAN_BASED_DSA_SUPPORT)\
+        \ || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)\n-\t\tis_dsa_dev = dsa_slave_dev_check(iface_tx->dev) && (iface_tx->type\
+        \ == PPE_DRV_IFACE_TYPE_VIRTUAL);\n+\t\tis_dsa_dev = dsa_user_dev_check(iface_tx->dev) && (iface_tx->type == PPE_DRV_IFACE_TYPE_VIRTUAL);\n\
+        \ #endif\n \t}\n \n@@ -1091,7 +1091,7 @@ struct ppe_drv_nexthop *ppe_drv_nexthop_v4_get_and_ref(struct ppe_drv_v4_conn_fl\n\
+        \ \t\t\t\t * a VLAN-based DSA interface, program the VLAN ID as C-VLAN so that\n \t\t\t\t * S-VLAN remains available\
+        \ for DSA tagging.\n \t\t\t\t */\n-\t\t\t\tif ((is_dsa_dev) && (dp) && (dp->cpu_dp->tag_ops->proto == DSA_TAG_PROTO_QCA_8021Q))\
+        \ {\n+\t\t\t\tif ((is_dsa_dev) && (dp) && (dp->cpu_dp->tag_ops->proto == DSA_TAG_PROTO_8021Q)) {\n \t\t\t\t\tppe_drv_trace(\"\
+        %p: DSA egress, programming bridge VLAN %u as CTAG\",\n \t\t\t\t\t\t\tpcf, in_vlan);\n \t\t\t\t\tfal_nh.ctag_fmt =\
+        \ 1;\ndiff --git a/drv/ppe_drv/ppe_drv_port.c b/drv/ppe_drv/ppe_drv_port.c\nindex ba4b3e68..da5c3f71 100644\n--- a/drv/ppe_drv/ppe_drv_port.c\n\
+        +++ b/drv/ppe_drv/ppe_drv_port.c\n@@ -1647,7 +1647,7 @@ bool ppe_drv_port_ucast_queue_set(struct ppe_drv_port *pp,\
+        \ int src_profile, uint\n \t}\n \n #if defined(NSS_VLAN_BASED_DSA_SUPPORT) || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)\n\
+        -\tif ((pp->type == PPE_DRV_PORT_VIRTUAL) && dsa_slave_dev_check(pp->dev)) {\n+\tif ((pp->type == PPE_DRV_PORT_VIRTUAL)\
+        \ && dsa_user_dev_check(pp->dev)) {\n \t\tprofile = PPE_DRV_REDIR_PROFILE_ID;\n \t}\n #endif\ndiff --git a/drv/ppe_drv/ppe_drv_v4.c\
+        \ b/drv/ppe_drv/ppe_drv_v4.c\nindex 9300c401..63ec2fca 100644\n--- a/drv/ppe_drv/ppe_drv_v4.c\n+++ b/drv/ppe_drv/ppe_drv_v4.c\n\
+        @@ -2043,7 +2043,7 @@ bool ppe_drv_v4_if_walk(struct ppe_drv_v4_conn_flow *pcf, struct ppe_drv_top_if_\n \n \tis_vlan_as_veip\
+        \ = is_vlan_dev(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VEIP);\n #if defined(NSS_VLAN_BASED_DSA_SUPPORT)\
+        \ || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)\n-\tis_dsa_dev = dsa_slave_dev_check(tx_port_if->dev) && (tx_port_if->type\
+        \ == PPE_DRV_IFACE_TYPE_VIRTUAL);\n+\tis_dsa_dev = dsa_user_dev_check(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VIRTUAL);\n\
+        \ #endif\n \n \tif (vlan_cnt && !is_vlan_as_veip && !is_vlan_as_vp && !eg_vsi_if && !is_dsa_dev) {\ndiff --git a/drv/ppe_drv/ppe_drv_v6.c\
+        \ b/drv/ppe_drv/ppe_drv_v6.c\nindex 40150328..b8f1158d 100644\n--- a/drv/ppe_drv/ppe_drv_v6.c\n+++ b/drv/ppe_drv/ppe_drv_v6.c\n\
+        @@ -2573,7 +2573,7 @@ bool ppe_drv_v6_if_walk(struct ppe_drv_v6_conn_flow *pcf, struct ppe_drv_top_if_\n \n \tis_vlan_as_veip\
+        \ = is_vlan_dev(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VEIP);\n #if defined(NSS_VLAN_BASED_DSA_SUPPORT)\
+        \ || defined(NSS_ATH_HDR_BASED_DSA_SUPPORT)\n-\tis_dsa_dev = dsa_slave_dev_check(tx_port_if->dev) && (tx_port_if->type\
+        \ == PPE_DRV_IFACE_TYPE_VIRTUAL);\n+\tis_dsa_dev = dsa_user_dev_check(tx_port_if->dev) && (tx_port_if->type == PPE_DRV_IFACE_TYPE_VIRTUAL);\n\
+        \ #endif\n \n \tif (vlan_cnt && !is_vlan_as_veip && !is_vlan_as_vp && !eg_vsi_if && !is_dsa_dev) {\ndiff --git a/drv/ppe_drv/ppe_drv_vlan.c\
+        \ b/drv/ppe_drv/ppe_drv_vlan.c\nindex 036e678a..829cd03e 100644\n--- a/drv/ppe_drv/ppe_drv_vlan.c\n+++ b/drv/ppe_drv/ppe_drv_vlan.c\n\
+        @@ -3,6 +3,7 @@\n  * SPDX-License-Identifier: ISC\n  */\n \n+#include <linux/vmalloc.h>\n #include <linux/etherdevice.h>\n\
+        \ #include <linux/if_vlan.h>\n #ifdef NSS_VLAN_BASED_DSA_SUPPORT\n@@ -295,23 +296,23 @@ ppe_drv_ret_t ppe_drv_vlan_as_vp_del_xlate_rules(struct\
+        \ ppe_drv_iface *iface, st\n \t/*\n \t * Handling for DSA/VLAN on DSA interface\n \t */\n-\tif (!base_dev && dsa_slave_dev_check(iface->dev))\
+        \ {\n+\tif (!base_dev && dsa_user_dev_check(iface->dev)) {\n \t\t/*\n \t\t * We reach here if it's not a VLAN dev,\
+        \ eg: lan1.\n \t\t * base_dev is NULL at this point. Set base_dev as lan1's CPU port.\n \t\t */\n \t\tdp = dsa_port_from_netdev(iface->dev);\n\
+        \ \t\tif (dp) {\n-\t\t\tbase_dev = dsa_port_to_master(dp);\n+\t\t\tbase_dev = dsa_port_to_conduit(dp);\n \t\t}\n-\t\
+        } else if (base_dev && dsa_slave_dev_check(base_dev)) {\n+\t} else if (base_dev && dsa_user_dev_check(base_dev)) {\n\
+        \ \t\t/*\n \t\t * VLAN over DSA interface ? eg: lan1.10.\n \t\t * base_dev would already been set to lan1. Set base_dev\
+        \ as lan1's CPU port.\n \t\t */\n \t\tdp = dsa_port_from_netdev(base_dev);\n \t\tif (dp) {\n-\t\t\tbase_dev = dsa_port_to_master(dp);\n\
+        +\t\t\tbase_dev = dsa_port_to_conduit(dp);\n \t\t}\n \t}\n #endif\n@@ -421,23 +422,23 @@ ppe_drv_ret_t ppe_drv_vlan_as_vp_add_xlate_rules(struct\
+        \ ppe_drv_iface *iface, st\n \t/*\n \t * Handling for DSA/VLAN on DSA interface\n \t */\n-\tif (!base_dev && dsa_slave_dev_check(iface->dev))\
+        \ {\n+\tif (!base_dev && dsa_user_dev_check(iface->dev)) {\n \t\t/*\n \t\t * We reach here if it's not a VLAN dev,\
+        \ eg: lan1.\n \t\t * base_dev is NULL at this point. Set base_dev as lan1's CPU port.\n \t\t */\n \t\tdp = dsa_port_from_netdev(iface->dev);\n\
+        \ \t\tif (dp) {\n-\t\t\tbase_dev = dsa_port_to_master(dp);\n+\t\t\tbase_dev = dsa_port_to_conduit(dp);\n \t\t}\n-\t\
+        } else if (base_dev && dsa_slave_dev_check(base_dev)) {\n+\t} else if (base_dev && dsa_user_dev_check(base_dev)) {\n\
+        \ \t\t/*\n \t\t * VLAN over DSA interface ? eg: lan1.10.\n \t\t * base_dev would already been set to lan1. Set base_dev\
+        \ as lan1's CPU port.\n \t\t */\n \t\tdp = dsa_port_from_netdev(base_dev);\n \t\tif (dp) {\n-\t\t\tbase_dev = dsa_port_to_master(dp);\n\
+        +\t\t\tbase_dev = dsa_port_to_conduit(dp);\n \t\t}\n \t}\n #endif\nSTAGE12_PATCH\ngit -C qsdk-src/qca-nss-ppe apply\
+        \ --check \"$GITHUB_WORKSPACE/results/linux-6.18-stage12-compat.patch\"\ngit -C qsdk-src/qca-nss-ppe apply \"$GITHUB_WORKSPACE/results/linux-6.18-stage12-compat.patch\"\
+        \ngit -C qsdk-src/qca-nss-ppe diff > results/linux-6.18-stage13-ppe-compat.patch\nsha256sum results/linux-6.18-stage12-compat.patch\
+        \ > results/ppe-patch-sha256.txt\n"
+      id: ppe_compat
+    - name: Repeat verified Stage12 DSA and vmalloc compile probe
+      shell: bash
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/api_probe"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        set -euo pipefail
+        source results/environment.txt
+        export STAGING_DIR="$GITHUB_WORKSPACE/openwrt/staging_dir"
+        mkdir -p results/stage12-api-probe
+        cat > results/stage12-api-probe/stage12_api.c <<'PROBE_C'
+        #include <linux/module.h>
+        #include <linux/vmalloc.h>
+        #include <net/dsa.h>
+        static __used struct net_device *stage12_dsa(const struct dsa_port *dp)
+        {
+            return dsa_port_to_conduit(dp);
+        }
+        static __used void stage12_vmalloc(void)
+        {
+            void *p = vzalloc(64);
+            vfree(p);
+        }
+        MODULE_LICENSE("GPL");
+        PROBE_C
+        echo 'obj-m += stage12_api.o' > results/stage12-api-probe/Makefile
+        set +e
+        make -C "$KERNEL_DIR" M="$GITHUB_WORKSPACE/results/stage12-api-probe" \
+          ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" stage12_api.o V=1 \
+          2>&1 | tee results/stage12-api-probe.log
+        rc=${PIPESTATUS[0]}
+        echo "$rc" > results/stage12-api-probe-exit-code.txt
+        exit "$rc"
+      id: api_probe
+    - name: Compile QCA NSS Debug
+      shell: bash
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/nss_debug"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        export STAGING_DIR="$GITHUB_WORKSPACE/openwrt/staging_dir"
+        set +e
+        set -o pipefail
+
+        KERNEL_DIR=$(grep '^KERNEL_DIR=' \
+          results/environment.txt | cut -d= -f2-)
+
+        CROSS_PREFIX=$(grep '^CROSS_COMPILE=' \
+          results/environment.txt | cut -d= -f2-)
+
+        DEBUG_DIR="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe/nss_debug"
+
+        FLAGS=$(cat results/qsdk-header-flags.txt)
+
+        make \
+          -C "$KERNEL_DIR" \
+          M="$DEBUG_DIR" \
+          ARCH=arm64 \
+          CROSS_COMPILE="$CROSS_PREFIX" \
+          KCFLAGS="$FLAGS" \
+          modules \
+          V=1 \
+          2>&1 | tee results/nss-debug-compile.log
+
+        RC=${PIPESTATUS[0]}
+
+        echo "$RC" \
+          > results/nss-debug-exit-code.txt
+
+        exit 0
+      id: nss_debug
+    - name: Audit Linux 6.18.39 bridge semantics and patch SSDK
+      shell: bash
+      run: "# Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.\nSTAGE28_STEP_DIR=\"$GITHUB_WORKSPACE/results/steps/bridge_audit\"\
+        \nmkdir -p \"$STAGE28_STEP_DIR\"\nprintf '%s\\n' RUNNING > \"$STAGE28_STEP_DIR/state.txt\"\ncp \"${BASH_SOURCE[0]}\"\
+        \ \"$STAGE28_STEP_DIR/script.sh\"\nexec > >(tee \"$STAGE28_STEP_DIR/console.log\") 2>&1\nstage28_finish() {\n  local\
+        \ stage28_rc=\"$1\" stage28_line=\"$2\" stage28_command=\"$3\"\n  trap - EXIT\n  printf '%s\\n' \"$stage28_rc\" >\
+        \ \"$STAGE28_STEP_DIR/exit-code.txt\"\n  if [ \"$stage28_rc\" -eq 0 ]; then\n    printf '%s\\n' PASS > \"$STAGE28_STEP_DIR/state.txt\"\
+        \n  else\n    printf '%s\\n' FAIL > \"$STAGE28_STEP_DIR/state.txt\"\n    printf 'line=%s\\ncommand=%s\\n' \"$stage28_line\"\
+        \ \"$stage28_command\" > \"$STAGE28_STEP_DIR/failure.txt\"\n  fi\n  exit \"$stage28_rc\"\n}\ntrap 'stage28_finish\
+        \ \"$?\" \"$LINENO\" \"$BASH_COMMAND\"' EXIT\n# Original step body follows.\nset -euo pipefail\nsource results/environment.txt\n\
+        export KERNEL_DIR\npython3 <<'PY'\nfrom pathlib import Path\nimport os, re, json, hashlib, shutil, difflib\nout =\
+        \ Path('results/bridge-api')\nout.mkdir(parents=True, exist_ok=True)\nkernel = Path(os.environ['KERNEL_DIR'])\nfiles\
+        \ = ['net/bridge/br_fdb.c', 'net/bridge/br_device.c',\n         'net/bridge/br_private.h', 'net/core/rtnetlink.c',\n\
+        \         'include/linux/netdevice.h', 'include/linux/if_bridge.h']\n(out/'review.txt').write_text(\"Stage16 reviewed\
+        \ source evidence\\n\\nLinux 6.18.39:\\nhttps://github.com/gregkh/linux/blob/v6.18.39/net/bridge/br_fdb.c\\nhttps://github.com/gregkh/linux/blob/v6.18.39/include/linux/netdevice.h\\\
+        nhttps://github.com/gregkh/linux/blob/v6.18.39/net/core/rtnetlink.c\\nhttps://github.com/gregkh/linux/blob/v6.18.39/net/bridge/br_device.c\\\
+        n\\nHistorical QSDK helper implementation (comparison evidence, NOT a release\\nmanifest pairing for SSDK 717b740):\\\
+        nhttps://github.com/Leo357449107/qsdk_cmiot-ax6/blob/d5887fa1ec8b8163c127d0ed619857da894486ee/qca/src/linux-4.4/net/bridge/br_fdb.c\\\
+        nSource SHA256: 36a2d9915c74e33b0dc602c2e7874afb05f1cf4fe28687d587b1e471cdd1f0ad\\n\\nBoth VID-0 paths delete the\
+        \ supplied MAC only on the supplied bridge port,\\nfirst in VID 0 then in each usable VLAN configured on that port.\
+        \ Other ports'\\nentries are rejected by the FDB destination-port comparison. No blanket flush.\\nNonzero VID validation\
+        \ differs across kernels and is deliberately NOT exposed\\nby this two-argument compatibility helper; the pinned SSDK\
+        \ call uses zero.\\n\\nbr_fdb_delete is not exported. Use the bridge master's ndo_fdb_del callback,\\npassing the\
+        \ original port (not the master) and all seven actual arguments.\\nDo not call the physical port's ndo_fdb_del and\
+        \ do not use external_learn_del.\\nThe bridge performs hash locking, switchdev notification and RTM_DELNEIGH.\\nnotified\
+        \ is initialized and passed by address; no duplicate notification.\\n\\nDevice lifetime: existing dev_get_by_name/dev_put\
+        \ retained; RTNL protects\\nmembership, master lifetime and VLAN traversal during callback invocation.\\nUse rtnl_trylock\
+        \ to avoid blocking under unknown caller-held SSDK/RTNL locks.\\nContention, atomic context or an RTNL-owning caller\
+        \ gets SW_BUSY and must retry\\nfrom process context without RTNL. Never use rtnl_is_locked as ownership proof.\\\
+        nENOENT means already absent; other failures are logged and returned to SSDK.\\nThis is a compile probe, not runtime\
+        \ validation of ACL/FDB or DSA/MAP-T.\\n\")\n(out/'legacy-QSDK-helper.txt').write_text('int br_fdb_delete_by_netdev(struct\
+        \ net_device *dev,\\n\\t\\t\\t    const unsigned char *addr, u16 vid)\\n{\\n\\tint err;\\n\\tstruct net_bridge_vlan_group\
+        \ *vg;\\n\\tstruct net_bridge_vlan *v;\\n\\tstruct net_bridge_port *p = br_port_get_rcu(dev);\\n\\n\\tif (!p) {\\\
+        n\\t\\tpr_info(\"bridge: %s not a bridge port\\\\n\",\\n\\t\\t\\tdev->name);\\n\\t\\treturn -EINVAL;\\n\\t}\\n\\tvg\
+        \ = nbp_vlan_group(p);\\n\\n\\tif (vid) {\\n\\t\\tv = br_vlan_find(vg, vid);\\n\\t\\tif (!v) {\\n\\t\\t\\tpr_info(\"\
+        bridge: with unconfigured vlan %d on %s\\\\n\"\\n\\t\\t\\t\\t, vid, dev->name);\\n\\t\\t\\treturn -EINVAL;\\n\\t\\\
+        t}\\n\\n\\t\\treturn __br_fdb_delete(p, addr, vid);\\n\\t}\\n\\terr = __br_fdb_delete(p, addr, 0);\\n\\n\\tif (!vg\
+        \ || !vg->num_vlans)\\n\\t\\treturn err;\\n\\n\\tlist_for_each_entry(v, &vg->vlan_list, vlist) {\\n\\t\\tif (!br_vlan_should_use(v))\\\
+        n\\t\\t\\tcontinue;\\n\\t\\terr &= __br_fdb_delete(p, addr, v->vid);\\n\\t}\\n\\treturn err;\\n}\\n')\ntexts = {}\n\
+        for name in files:\n    p = kernel / name\n    dest = out / name\n    dest.parent.mkdir(parents=True, exist_ok=True)\n\
+        \    shutil.copy2(p, dest)\n    texts[name] = p.read_text()\nstatus = {'verified': False, 'kernel': str(kernel), 'checks':\
+        \ {},\n          'sha256': {n: hashlib.sha256((kernel/n).read_bytes()).hexdigest() for n in files}}\ndef check(name,\
+        \ condition):\n    status['checks'][name] = bool(condition)\n    (out/'status.json').write_text(json.dumps(status,\
+        \ indent=2)+'\\n')\n    if not condition:\n        raise SystemExit('Bridge API audit failed: ' + name)\ndef function(text,\
+        \ name):\n    m = re.search(r'^.*\\b' + re.escape(name) + r'\\([^;]*?\\n\\{', text, re.M)\n    if not m:\n       \
+        \ raise SystemExit('Missing function: ' + name)\n    start = text.index('{', m.start())\n    depth, end = 1, start+1\n\
+        \    while depth:\n        depth += (text[end] == '{') - (text[end] == '}')\n        end += 1\n    return text[m.start():end]\n\
+        def compact(s):\n    return re.sub(r'\\s+', '', s)\nexpected = {'fdb_delete_by_addr_and_port': 'ffe4957b983af950eef7f88923d050951750f07269aac67a3c1484d2b7ce00cd',\
+        \ '__br_fdb_delete': '37993edc658da75c0dd8e2ee621a26df481a1822ac3e98b2ae08a61419328cfb', 'br_fdb_delete': '3f8f3a12adb098a6ddc91989b91464087d9291e98184ac1533e2394d08275891'}\n\
+        for name, expected_hash in expected.items():\n    body = function(texts['net/bridge/br_fdb.c'], name)\n    (out/(name+'.txt')).write_text(body+'\\\
+        n')\n    check(name + '_reviewed_6_18_39_body',\n          hashlib.sha256(compact(body).encode()).hexdigest() == expected_hash)\n\
+        netdev = compact(texts['include/linux/netdevice.h'])\ncheck('seven_argument_ndo_fdb_del',\n      '(*ndo_fdb_del)(structndmsg*ndm,structnlattr*tb[],structnet_device*dev,constunsignedchar*addr,u16vid,bool*notified,structnetlink_ext_ack*extack);'\
+        \ in netdev)\ncheck('bridge_ops_dispatch', '.ndo_fdb_del=br_fdb_delete,' in compact(texts['net/bridge/br_device.c']))\n\
+        rtnl = compact(texts['net/core/rtnetlink.c'])\ncheck('rtnetlink_uses_master_ops_with_original_port',\n      'structnet_device*br_dev=netdev_master_upper_dev_get(dev);'\
+        \ in rtnl and\n      'ops=br_dev->netdev_ops;' in rtnl and\n      'ops->ndo_fdb_del(ndm,tb,dev,addr,vid,&notified,extack)'\
+        \ in rtnl)\nexported = {r.split()[1] for r in (kernel/'Module.symvers').read_text().splitlines() if len(r.split())\
+        \ >= 4}\ncheck('required_helpers_exported', {'rtnl_trylock', 'rtnl_unlock', 'netdev_master_upper_dev_get'} <= exported)\n\
+        check('bridge_enabled', bool(re.search(r'^CONFIG_BRIDGE=[ym]$', (kernel/'.config').read_text(), re.M)))\ncheck('legacy_helper_absent',\
+        \ 'br_fdb_delete_by_netdev' not in texts['include/linux/if_bridge.h'] and 'br_fdb_delete_by_netdev' not in exported)\n\
+        \nssdk = Path('qsdk-src/qca-ssdk')\np = ssdk/'src/ref/ref_acl.c'\nbefore = p.read_text()\ncheck('pinned_ref_acl_source',\
+        \ hashlib.sha256(before.encode()).hexdigest() == '9f2270d3d338e9e3e00228500266aba0fb2c15ba79f975998605445000757d23')\n\
+        call = 'br_fdb_delete_by_netdev(eth_dev, entry->src_mac.uc, 0);'\ncheck('single_expected_call', before.count(call)\
+        \ == 1)\nheader = ssdk/'src/ref/ssdk_stage16_bridge.h'\nheader.write_text(r\"\"\"/* SPDX-License-Identifier: GPL-2.0-only\
+        \ */\n#ifndef SSDK_STAGE16_BRIDGE_H\n#define SSDK_STAGE16_BRIDGE_H\n\n#include <linux/errno.h>\n#include <linux/if_bridge.h>\n\
+        #include <linux/interrupt.h>\n#include <linux/netdevice.h>\n#include <linux/neighbour.h>\n#include <linux/rtnetlink.h>\n\
+        \n/*\n * Replacement for the ref_acl.c br_fdb_delete_by_netdev(port, addr, 0)\n * call ONLY. Linux 6.18.39 br_fdb_delete()\
+        \ keeps port ownership checks and\n * deletes VID 0 plus the port's usable VLANs, like the QSDK VID-0 path.\n * Use\
+        \ the bridge master's ops but pass the original PORT as the device.\n * The bridge handles its hash lock, switchdev\
+        \ and RTM_DELNEIGH notification.\n * Caller owns a dev reference. Never wait for RTNL under unknown SSDK locks:\n\
+        \ * return -EAGAIN on contention (including a caller already holding RTNL).\n * The API caller must retry SW_BUSY\
+        \ from process context without RTNL held.\n */\nstatic inline int ssdk_stage16_fdb_delete(struct net_device *port,\n\
+        \t\t\t\t\tconst unsigned char *addr)\n{\n\tstruct net_device *bridge;\n\tstruct ndmsg ndm = { .ndm_family = AF_BRIDGE,\n\
+        \t\t\t    .ndm_flags = NTF_MASTER };\n\tstruct nlattr *tb[NDA_MAX + 1] = { NULL };\n\tbool notified = false;\n\tint\
+        \ err = -EINVAL;\n\n\tif (in_atomic() || in_interrupt() || irqs_disabled())\n\t\treturn -EAGAIN;\n\tif (!rtnl_trylock())\n\
+        \t\treturn -EAGAIN;\n\n\tif (!netif_is_bridge_port(port))\n\t\tgoto out;\n\tbridge = netdev_master_upper_dev_get(port);\n\
+        \tif (!bridge || !netif_is_bridge_master(bridge))\n\t\tgoto out;\n\terr = -EOPNOTSUPP;\n\tif (!bridge->netdev_ops\
+        \ || !bridge->netdev_ops->ndo_fdb_del)\n\t\tgoto out;\n\n\tndm.ndm_ifindex = port->ifindex;\n\terr = bridge->netdev_ops->ndo_fdb_del(&ndm,\
+        \ tb, port, addr, 0,\n\t\t\t\t\t    &notified, NULL);\nout:\n\trtnl_unlock();\n\treturn err;\n}\n#endif\n\"\"\")\n\
+        replacement = 'int fdb_err;\\n\\n\\t\\t\\tfdb_err = ssdk_stage16_fdb_delete(eth_dev, entry->src_mac.uc);\\n\\t\\t\\\
+        t/* A missing FDB entry already satisfies the deletion request. */\\n\\t\\t\\tif (fdb_err && fdb_err != -ENOENT) {\\\
+        n\\t\\t\\t\\tSSDK_ERROR(\"bridge FDB delete failed on %s: %d\\\\n\",\\n\\t\\t\\t\\t\\t\\teth_dev->name, fdb_err);\\\
+        n\\t\\t\\t\\trv = fdb_err == -EAGAIN ? SW_BUSY :\\n\\t\\t\\t\\t\\t(fdb_err == -EOPNOTSUPP ? SW_NOT_SUPPORTED : SW_FAIL);\\\
+        n\\t\\t\\t}'\nafter = before.replace('#include <linux/if_bridge.h>', '#include <linux/if_bridge.h>\\n#include \"ssdk_stage16_bridge.h\"\
+        ').replace(call, replacement)\np.write_text(after)\npatch = ''.join(difflib.unified_diff(before.splitlines(True),\
+        \ after.splitlines(True),\n              fromfile='a/src/ref/ref_acl.c', tofile='b/src/ref/ref_acl.c'))\npatch +=\
+        \ ''.join(difflib.unified_diff([], header.read_text().splitlines(True),\n              fromfile='/dev/null', tofile='b/src/ref/ssdk_stage16_bridge.h'))\n\
+        Path('results/ssdk-stage16-bridge.patch').write_text(patch)\nshutil.copy2(p, out/'ref_acl.c')\nshutil.copy2(header,\
+        \ out/header.name)\nstatus['verified'] = True\nstatus['scope'] = 'ref_acl VID-0 call only; original port + MAC, VID\
+        \ 0 and usable port VLANs'\nstatus['locking'] = 'RTNL trylock; contention/atomic context => SW_BUSY, no silent skip'\n\
+        (out/'status.json').write_text(json.dumps(status, indent=2)+'\\n')\nprint(json.dumps(status, indent=2))\nPY\n"
+      id: bridge_audit
+    - name: Compile and MODPOST exact Stage16 bridge helper
+      shell: bash
+      run: "# Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.\nSTAGE28_STEP_DIR=\"$GITHUB_WORKSPACE/results/steps/bridge_probe\"\
+        \nmkdir -p \"$STAGE28_STEP_DIR\"\nprintf '%s\\n' RUNNING > \"$STAGE28_STEP_DIR/state.txt\"\ncp \"${BASH_SOURCE[0]}\"\
+        \ \"$STAGE28_STEP_DIR/script.sh\"\nexec > >(tee \"$STAGE28_STEP_DIR/console.log\") 2>&1\nstage28_finish() {\n  local\
+        \ stage28_rc=\"$1\" stage28_line=\"$2\" stage28_command=\"$3\"\n  trap - EXIT\n  printf '%s\\n' \"$stage28_rc\" >\
+        \ \"$STAGE28_STEP_DIR/exit-code.txt\"\n  if [ \"$stage28_rc\" -eq 0 ]; then\n    printf '%s\\n' PASS > \"$STAGE28_STEP_DIR/state.txt\"\
+        \n  else\n    printf '%s\\n' FAIL > \"$STAGE28_STEP_DIR/state.txt\"\n    printf 'line=%s\\ncommand=%s\\n' \"$stage28_line\"\
+        \ \"$stage28_command\" > \"$STAGE28_STEP_DIR/failure.txt\"\n  fi\n  exit \"$stage28_rc\"\n}\ntrap 'stage28_finish\
+        \ \"$?\" \"$LINENO\" \"$BASH_COMMAND\"' EXIT\n# Original step body follows.\nset -euo pipefail\nsource results/environment.txt\n\
+        export STAGING_DIR=\"$GITHUB_WORKSPACE/openwrt/staging_dir\"\nexport PATH=\"$TOOLCHAIN_DIR/bin:$PATH\"\nPROBE=\"$GITHUB_WORKSPACE/results/stage16-bridge-probe\"\
+        \nmkdir -p \"$PROBE\"\ncp qsdk-src/qca-ssdk/src/ref/ssdk_stage16_bridge.h \"$PROBE/\"\ncat > \"$PROBE/Makefile\" <<'MK'\n\
+        obj-m := stage16_bridge_probe.o\nMK\ncat > \"$PROBE/stage16_bridge_probe.c\" <<'C'\n#include <linux/module.h>\n#include\
+        \ \"ssdk_stage16_bridge.h\"\n/* Compile and MODPOST only. This module is never loaded. */\nint stage16_bridge_probe(struct\
+        \ net_device *port, const unsigned char *addr);\nint stage16_bridge_probe(struct net_device *port, const unsigned\
+        \ char *addr)\n{\n\treturn ssdk_stage16_fdb_delete(port, addr);\n}\nEXPORT_SYMBOL_GPL(stage16_bridge_probe);\nMODULE_LICENSE(\"\
+        GPL\");\nC\nset +e\nmake -C \"$KERNEL_DIR\" M=\"$PROBE\" ARCH=arm64 CROSS_COMPILE=\"$CROSS_COMPILE\" \\\n  KCFLAGS=-Werror\
+        \ modules V=1 2>&1 | tee results/stage16-bridge-probe.log\nrc=${PIPESTATUS[0]}\necho \"$rc\" > results/stage16-bridge-probe-exit-code.txt\n\
+        set -e\ntest \"$rc\" = 0\ntest -s \"$PROBE/stage16_bridge_probe.ko\"\n\"${CROSS_COMPILE}nm\" -u \"$PROBE/stage16_bridge_probe.ko\"\
+        \ > results/stage16-bridge-probe-undefined.txt\nmodinfo \"$PROBE/stage16_bridge_probe.ko\" > results/stage16-bridge-probe-modinfo.txt\n"
+      id: bridge_probe
+    - name: Audit pinned declarations and add exact SSDK MIB prototypes
+      shell: bash
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/prototypes"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        set -euo pipefail
+        mkdir -p results/stage28-prototypes
+        python3 <<'PY' 2>&1 | tee results/stage28-prototypes/audit.log
+        from pathlib import Path
+        import hashlib, json, re, difflib, sys, traceback, os, subprocess
+        workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+        root = workspace / 'qsdk-src/qca-ssdk'
+        out = workspace / 'results/stage28-prototypes'
+        out.mkdir(parents=True, exist_ok=True)
+        expected = {'include/ref/ref_mib.h': '0727c3d0e155570151445cd4237d46caf1f77a8b05e3606dad2b9f3ef5a68b13', 'src/init/ssdk_init.c': '97f7606b99b5bf78e0ba48ea3d7b0a6bc8ada4e62c8b0c9bcc15c381288393ec', 'src/ref/ref_mib.c': '8526b0d13e650e0d6148b0d6bbb3c24177aa69a008d9dd5dedd4d736f7790e42'}
+        names = ('_qca_ar8327_sw_capture_port_tx_counter',
+                 '_qca_ar8327_sw_capture_port_rx_counter', 'qca_ar8327_sw_mib_task')
+        status = {'state': 'RUNNING', 'phase': 'source_preflight', 'source_root': str(root), 'verified': False, 'method': 'shared exact prototypes; unchanged bodies and linkage'}
+        (out/'status.json').write_text(json.dumps(status, indent=2))
+        # Persist failures before the workflow proceeds to always-upload diagnostics.
+        hash_checks = []
+        def audit_failure(exc_type, exc, tb):
+            status.update(state='FAIL', verified=False, error_type=exc_type.__name__, error=str(exc))
+            (out/'status.json').write_text(json.dumps(status, indent=2) + '\n')
+            (out/'failure.txt').write_text(''.join(traceback.format_exception(exc_type, exc, tb)))
+            sys.__excepthook__(exc_type, exc, tb)
+        sys.excepthook = audit_failure
+        required_commit = '717b74016b0c131575bcd81b9e039d3f7974b02a'
+        status['required_commit'] = required_commit
+        if not root.is_dir():
+            raise RuntimeError(f'SSDK source directory missing: {root}')
+        actual_commit = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
+        status['actual_commit'] = actual_commit
+        (out/'status.json').write_text(json.dumps(status, indent=2) + '\n')
+        if actual_commit != required_commit:
+            raise RuntimeError(f'SSDK commit mismatch: expected={required_commit}; actual={actual_commit}')
+        status['phase'] = 'source_hashes'
+        before = {}
+        for rel, digest in expected.items():
+            p = root/rel
+            raw = p.read_bytes()
+            actual = hashlib.sha256(raw).hexdigest()
+            blob = subprocess.check_output(['git', '-C', str(root), 'show', required_commit + ':' + rel])
+            blob_digest = hashlib.sha256(blob).hexdigest()
+            hash_checks.append(dict(path=rel, expected_git_blob_sha256=digest, actual_sha256=actual,
+                                    git_blob_sha256=blob_digest, crlf_count=raw.count(b'\r\n'),
+                                    matches_blob=raw == blob))
+            (out/'hash-checks.json').write_text(json.dumps(hash_checks, indent=2) + '\n')
+            assert blob_digest == digest, f'Pinned blob hash differs: {rel}'
+            assert actual == digest, f'Unexpected pinned source: {rel}; expected={digest}; actual={actual}'
+            before[rel] = p.read_text()
+            (out/(p.name + '.before')).write_text(before[rel])
+        status['phase'] = 'declarations_and_uses'
+        hits = []
+        paths = {name: set() for name in names}
+        for p in sorted(root.rglob('*')):
+            if p.suffix not in ('.c', '.h') or '.git' in p.parts:
+                continue
+            for i, line in enumerate(p.read_text(errors='replace').splitlines(), 1):
+                for name in names:
+                    if re.search(r'\b' + re.escape(name) + r'\b', line):
+                        rel = p.relative_to(root).as_posix()
+                        paths[name].add(rel)
+                        hits.append(f'{rel}:{i}:{line}')
+        (out/'declarations-and-uses.txt').write_text('\n'.join(hits) + '\n')
+        assert paths[names[0]] == paths[names[1]] == {'src/ref/ref_mib.c'}, paths
+        assert paths[names[2]] == {'src/ref/ref_mib.c', 'src/init/ssdk_init.c'}, paths
+        c = before['src/ref/ref_mib.c']
+        h = before['include/ref/ref_mib.h']
+        init = before['src/init/ssdk_init.c']
+        for name in names[:2]:
+            assert len(re.findall(r'\bint\s+' + name + r'\(a_uint32_t dev_id, int port\)\s*\{', c)) == 1
+        assert len(re.findall(r'\bvoid\s+qca_ar8327_sw_mib_task\(struct qca_phy_priv \*priv\)\s*\{', c)) == 1
+        assert '#include "ref_mib.h"' in init
+        extern = 'extern void qca_ar8327_sw_mib_task(struct qca_phy_priv *priv);\n'
+        assert init.count(extern) == 1
+        anchor = '#if defined(IN_SWCONFIG)'
+        assert h.count(anchor) == 1
+        decls = ('/* Stage28: common declarations, also required with SWCONFIG disabled. */\n'
+                 'struct qca_phy_priv;\n'
+                 'int _qca_ar8327_sw_capture_port_tx_counter(a_uint32_t dev_id, int port);\n'
+                 'int _qca_ar8327_sw_capture_port_rx_counter(a_uint32_t dev_id, int port);\n'
+                 'void qca_ar8327_sw_mib_task(struct qca_phy_priv *priv);\n\n')
+        h = h.replace('#define _REF_MIB_H_\n', '#define _REF_MIB_H_\n\n#include "sw.h"\n')
+        h = h.replace(anchor, decls + anchor)
+        assert c.count('#include "ref_vlan.h"') == 1
+        c = c.replace('#include "ref_vlan.h"', '#include "ref_vlan.h"\n#include "ref_mib.h"')
+        init = init.replace(extern, '')
+        # Validate exact declaration placement as well as definitions before writing.
+        status['phase'] = 'patch_postconditions'
+        assert h.count('#define _REF_MIB_H_') == 1
+        assert h.count('#include "sw.h"') == 1
+        for declaration in decls.splitlines()[2:5]:
+            assert h.count(declaration) == 1, declaration
+            assert h.index(declaration) < h.index(anchor), declaration
+        assert c.count('#include "ref_mib.h"') == 1
+        assert c.index('#include "ref_mib.h"') < c.index(names[0])
+        assert c.replace('\n#include "ref_mib.h"', '', 1) == before['src/ref/ref_mib.c']
+        assert init == before['src/init/ssdk_init.c'].replace(extern, '', 1)
+        after = {'src/ref/ref_mib.c': c, 'include/ref/ref_mib.h': h, 'src/init/ssdk_init.c': init}
+        patch = ''
+        for rel, text in after.items():
+            (root/rel).write_text(text, newline='\n')
+            (out/Path(rel).name).write_text(text)
+            patch += ''.join(difflib.unified_diff(before[rel].splitlines(True), text.splitlines(True), fromfile='a/'+rel, tofile='b/'+rel))
+        (out/'ssdk-stage28-prototypes.patch').write_text(patch)
+        status.update(state='PASS', phase='complete', verified=True, source_sha256=expected, declarations=list(names))
+        (out/'status.json').write_text(json.dumps(status, indent=2) + '\n')
+        print('Three shared prototypes verified; no function body or linkage changes.')
+        PY
+      id: prototypes
+    - name: Apply Linux 6.18 SFP MDIO-I2C and PHY registration compatibility
+      shell: bash
+      run: |
+        set -euo pipefail
+        source results/environment.txt
+        SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+        SRC="$SSDK/src/hsl/phy/sfp_phy.c"
+        MDIO_I2C="$KERNEL_DIR/drivers/net/mdio/mdio-i2c.c"
+        OUT="$GITHUB_WORKSPACE/results/stage28-sfp-compat"
+        mkdir -p "$OUT"
+        test -f "$SRC"
+        test -f "$MDIO_I2C"
+        cp "$SRC" "$OUT/sfp_phy.c.before"
+
+        grep -n -C 8 -E 'qcom_mdio_i2c_data|phy_driver_register|phy_driver_unregister|phy_drivers_register|phy_drivers_unregister' \
+          "$SRC" > "$OUT/qca-before-use-sites.txt" || true
+
+        # Verify Linux 6.18's real mdio-i2c private-data ABI before patching.
+        grep -n -C 6 -E 'struct i2c_adapter \*i2c = bus->priv|bus->priv = i2c' \
+          "$MDIO_I2C" > "$OUT/linux-mdio-i2c-priv-contract.txt" || true
+        grep -q -F 'struct i2c_adapter *i2c = bus->priv;' "$MDIO_I2C" || {
+          echo "Linux 6.18 mdio-i2c bus->priv contract not verified; refusing patch" >&2
+          exit 91
+        }
+
+        grep -n -E 'phy_drivers_register|phy_drivers_unregister' \
+          "$KERNEL_DIR/include/linux/phy.h" > "$OUT/linux-phy-registration-api.txt"
+        grep -q 'int phy_drivers_register' "$KERNEL_DIR/include/linux/phy.h"
+        grep -q 'void phy_drivers_unregister' "$KERNEL_DIR/include/linux/phy.h"
+
+        python3 - <<'PY'
+        from pathlib import Path
+        p = Path("qsdk-src/qca-ssdk/src/hsl/phy/sfp_phy.c")
+        t = p.read_text()
+        repl = [
+          ("struct qcom_mdio_i2c_data *bus_priv;",
+           "struct i2c_adapter *bus_priv;"),
+          ("i2c_transfer(bus_priv->i2c, msgs, ARRAY_SIZE(msgs))",
+           "i2c_transfer(bus_priv, msgs, ARRAY_SIZE(msgs))"),
+          ("phy_driver_register(&sfp_phy_driver, THIS_MODULE)",
+           "phy_drivers_register(&sfp_phy_driver, 1, THIS_MODULE)"),
+          ("phy_driver_unregister(&sfp_phy_driver)",
+           "phy_drivers_unregister(&sfp_phy_driver, 1)"),
+        ]
+        for old, new in repl:
+            n = t.count(old)
+            if n != 1:
+                raise SystemExit(f"Refusing non-exact SFP patch: expected 1, got {n}: {old}")
+            t = t.replace(old, new, 1)
+        p.write_text(t)
+        PY
+
+        cp "$SRC" "$OUT/sfp_phy.c.after"
+        git -C "$SSDK" diff -- src/hsl/phy/sfp_phy.c > "$OUT/sfp-phy-stage28.patch"
+        grep -n -C 8 -E 'i2c_adapter \*bus_priv|i2c_transfer\(bus_priv|phy_drivers_register|phy_drivers_unregister' \
+          "$SRC" > "$OUT/qca-after-use-sites.txt"
+
+        cat > "$OUT/semantic-note.txt" <<'EOF'
+        No qcom_mdio_i2c_data layout was invented.
+        Linux 6.18 mdio-i2c uses struct i2c_adapter * directly as mii_bus->priv.
+        QSDK SFP EEPROM I2C access is adapted to that verified contract.
+        The single PHY driver uses exported plural registration APIs with n=1.
+        Compile validation only; SFP/Combo-port runtime testing is still required.
+        EOF
+      id: sfp_compat
+
+    - name: Apply Linux 6.18 PHY EEE state compatibility
+      shell: bash
+      run: |
+        set -euo pipefail
+        source results/environment.txt
+        SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+        SRC="$SSDK/src/init/ssdk_init.c"
+        PHYH="$KERNEL_DIR/include/linux/phy.h"
+        EEEH="$KERNEL_DIR/include/net/eee.h"
+        OUT="$GITHUB_WORKSPACE/results/stage28-eee-compat"
+        mkdir -p "$OUT"
+        test -f "$SRC"
+        test -f "$PHYH"
+        test -f "$EEEH"
+
+        cp "$SRC" "$OUT/ssdk_init.c.before"
+        grep -n -C 8 'eee_enabled' "$SRC" > "$OUT/qca-eee-before.txt" || true
+        grep -n -C 5 -E 'struct eee_config eee_cfg|struct phy_device' "$PHYH" \
+          > "$OUT/linux-phy-eee-layout.txt" || true
+        grep -n -C 5 -E 'struct eee_config|bool eee_enabled' "$EEEH" \
+          > "$OUT/linux-eee-config.txt" || true
+
+        # Linux 6.18 moved the master EEE enable state into phydev->eee_cfg.
+        grep -q -F 'struct eee_config eee_cfg;' "$PHYH" || {
+          echo "phy_device::eee_cfg not verified; refusing patch" >&2
+          exit 92
+        }
+        grep -q -F 'bool eee_enabled;' "$EEEH" || {
+          echo "eee_config::eee_enabled not verified; refusing patch" >&2
+          exit 93
+        }
+
+        python3 - <<'PY'
+        from pathlib import Path
+        p = Path("qsdk-src/qca-ssdk/src/init/ssdk_init.c")
+        t = p.read_text()
+        old = "phydev->eee_enabled"
+        new = "phydev->eee_cfg.eee_enabled"
+        n = t.count(old)
+        if n != 1:
+            raise SystemExit(f"Refusing broad EEE patch: expected exactly 1 occurrence, got {n}")
+        p.write_text(t.replace(old, new, 1))
+        PY
+
+        cp "$SRC" "$OUT/ssdk_init.c.after"
+        git -C "$SSDK" diff -- src/init/ssdk_init.c > "$OUT/ssdk-init-stage28.patch"
+        grep -n -C 8 'eee_cfg.eee_enabled' "$SRC" > "$OUT/qca-eee-after.txt"
+
+        cat > "$OUT/semantic-note.txt" <<'EOF'
+        QSDK tested phydev->eee_enabled as the master EEE on/off state.
+        Linux 6.18 stores that same user configuration state in
+        phydev->eee_cfg.eee_enabled. Stage28 maps only this exact use.
+        No EEE behavior is disabled or hard-coded.
+        EOF
+      id: eee_compat
+
+    - name: Apply Linux 6.18 phylink PCS compatibility
+      shell: bash
+      run: |
+        set -euo pipefail
+        source results/environment.txt
+        SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+        SRC="$SSDK/src/init/ssdk_init.c"
+        PHYLINK_H="$KERNEL_DIR/include/linux/phylink.h"
+        OUT="$GITHUB_WORKSPACE/results/stage28-phylink-compat"
+        mkdir -p "$OUT"
+        test -f "$SRC"
+        test -f "$PHYLINK_H"
+
+        cp "$SRC" "$OUT/ssdk_init.c.before"
+        grep -n -C 10 -E 'ssdk_pcs_get_state|pcs_get_state|neg_mode' "$SRC" \
+          > "$OUT/qca-phylink-before.txt" || true
+        grep -n -C 8 -E 'pcs_get_state|struct phylink_pcs' "$PHYLINK_H" \
+          > "$OUT/linux618-phylink-api.txt" || true
+
+        # Refuse to patch unless the running OpenWrt kernel tree proves the
+        # Linux 6.18 callback shape that Stage23's compiler reported.
+        python3 - <<'PY'
+        from pathlib import Path
+        h = Path("openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-qualcommbe_ipq95xx/linux-6.18.39/include/linux/phylink.h")
+        # Fall back to the KERNEL_DIR discovered by the workflow if the
+        # canonical build_dir path changes; shell validation below is primary.
+        if h.exists():
+            text = h.read_text(errors="ignore")
+            if "pcs_get_state" not in text:
+                raise SystemExit("pcs_get_state not found in phylink.h")
+        PY
+
+        # The Stage23 compiler established:
+        # pcs_get_state(struct phylink_pcs *, unsigned int,
+        #               struct phylink_link_state *)
+        # Linux 6.18 passes negotiation mode into the callback; the old
+        # persistent phylink_pcs.neg_mode member no longer exists.
+        python3 - <<'PY'
+        from pathlib import Path
+        p = Path("qsdk-src/qca-ssdk/src/init/ssdk_init.c")
+        t = p.read_text()
+
+        old_sig = "static void ssdk_pcs_get_state(struct phylink_pcs *pcs, struct phylink_link_state *state)"
+        new_sig = "static void ssdk_pcs_get_state(struct phylink_pcs *pcs, unsigned int neg_mode, struct phylink_link_state *state)"
+        if t.count(old_sig) != 1:
+            raise SystemExit(f"Expected exactly one old pcs_get_state signature, got {t.count(old_sig)}")
+        t = t.replace(old_sig, new_sig, 1)
+
+        # This callback only reads current hardware/link state; it did not use
+        # the old pcs->neg_mode value. Mark the new argument intentionally unused.
+        anchor = new_sig + "\n{"
+        if t.count(anchor) != 1:
+            raise SystemExit("Unable to locate patched pcs_get_state body")
+        t = t.replace(anchor, anchor + "\n\t(void)neg_mode;", 1)
+
+        old_member = "\tport_priv->phylink_pcs.neg_mode = true;\n"
+        if t.count(old_member) != 1:
+            raise SystemExit(f"Expected exactly one removed phylink_pcs.neg_mode assignment, got {t.count(old_member)}")
+        t = t.replace(old_member, "", 1)
+
+        p.write_text(t)
+        PY
+
+        cp "$SRC" "$OUT/ssdk_init.c.after"
+        git -C "$SSDK" diff -- src/init/ssdk_init.c > "$OUT/ssdk-init-stage28.patch"
+        grep -n -C 10 -E 'ssdk_pcs_get_state|pcs_get_state|neg_mode' "$SRC" \
+          > "$OUT/qca-phylink-after.txt" || true
+
+        cat > "$OUT/semantic-note.txt" <<'EOF'
+        Linux 6.18 changed phylink PCS get_state to receive neg_mode as a
+        callback argument and removed phylink_pcs.neg_mode storage.
+        QSDK's get_state implementation does not depend on negotiation mode,
+        so Stage28 accepts and intentionally ignores the new argument, and
+        removes only the obsolete member assignment. No link-state logic is
+        disabled or hard-coded.
+        EOF
+      id: phylink_compat
+
+    - name: Apply corrected Linux 6.18 DSA compatibility
+      shell: bash
+      run: |
+        set -euo pipefail
+        source results/environment.txt
+        SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+        SRC="$SSDK/src/init/ssdk_init.c"
+        DSAH="$KERNEL_DIR/include/net/dsa.h"
+        OUT="$GITHUB_WORKSPACE/results/stage28-dsa-compat"
+        mkdir -p "$OUT"
+        test -f "$SRC"
+        test -f "$DSAH"
+        cp "$SRC" "$OUT/ssdk_init.c.before"
+        grep -q 'dsa_user_dev_check' "$DSAH"
+        grep -q 'dsa_port_to_conduit' "$DSAH"
+
+        python3 - <<'PY'
+        from pathlib import Path
+        p = Path("qsdk-src/qca-ssdk/src/init/ssdk_init.c")
+        t = p.read_text()
+
+        if t.count("dsa_slave_dev_check") != 2:
+            raise SystemExit("Unexpected dsa_slave_dev_check count")
+        t = t.replace("dsa_slave_dev_check", "dsa_user_dev_check")
+
+        if t.count("dp->cpu_dp->master") != 1:
+            raise SystemExit("Unexpected cpu_dp->master count")
+        t = t.replace("dp->cpu_dp->master", "dsa_port_to_conduit(dp)", 1)
+
+        a = t.index("static int ssdk_dsa_event_nb(")
+        nb = "static struct notifier_block ssdk_dsa_notifier_nb = {\\n\\t.notifier_call = ssdk_dsa_event_nb,\\n};\\n"
+        b0 = t.index(nb, a)
+        t = t[:a] + t[b0 + len(nb):]
+
+        lines = t.splitlines(keepends=True)
+        out = []
+        i = 0
+        while i < len(lines):
+            if lines[i] == "#if IS_ENABLED(CONFIG_NET_DSA)\n" and i + 6 < len(lines):
+                window = "".join(lines[i:i+7])
+                if "register_dsa_blocking_notifier(&ssdk_dsa_notifier_nb);" in window:
+                    i += 7
+                    continue
+                if "unregister_dsa_blocking_notifier(&ssdk_dsa_notifier_nb);" in window:
+                    i += 7
+                    continue
+            out.append(lines[i])
+            i += 1
+        t = "".join(out)
+
+        anchor = "\tswitch (event) {\n"
+        pos = t.index(anchor, t.index("static int ssdk_dev_event(")) + len(anchor)
+        nl = [
+            "#if IS_ENABLED(CONFIG_NET_DSA)\n",
+            "\t\tcase NETDEV_CHANGE:\n",
+            "\t\t\tif (dsa_user_dev_check(dev))\n",
+            "\t\t\t\treturn ssdk_dsa_event_link_change(dev, netif_carrier_ok(dev));\n",
+            "\t\t\tbreak;\n",
+            "#endif\n",
+        ]
+        t = t[:pos] + "".join(nl) + t[pos:]
+
+        if "\\\\n\\\\t" in t:
+            raise SystemExit("Literal escaped newline/tab sequence detected")
+        if "register_dsa_blocking_notifier" in t or "unregister_dsa_blocking_notifier" in t:
+            raise SystemExit("Obsolete DSA notifier call remains")
+        if t.count("case NETDEV_CHANGE:") != 1:
+            raise SystemExit("Expected exactly one NETDEV_CHANGE compatibility case")
+        if t.count("#if IS_ENABLED(CONFIG_NET_DSA)") < 1:
+            raise SystemExit("DSA conditional structure unexpectedly missing")
+        p.write_text(t)
+        PY
+
+        grep -q '^#if IS_ENABLED(CONFIG_NET_DSA)$' "$SRC"
+        grep -q $'^\t\tcase NETDEV_CHANGE:$' "$SRC"
+        ! grep -Fq '\\n\\t' "$SRC"
+
+        cp "$SRC" "$OUT/ssdk_init.c.after"
+        git -C "$SSDK" diff -- src/init/ssdk_init.c > "$OUT/ssdk-init-stage28.patch"
+        sed -n '/static int ssdk_dev_event/,/return NOTIFY_DONE;/p' "$SRC" > "$OUT/ssdk-dev-event-after.txt"
+
+        if grep -Fq '\n\t' "$OUT/ssdk-dev-event-after.txt"; then
+          echo "Literal escaped newline survived patch" >&2
+          exit 96
+        fi
+
+        cat > "$OUT/semantic-note.txt" <<'EOF'
+        Stage28 fixes Stage25's literal \n/\t text-generation bug and removes
+        the complete obsolete DSA notifier registration blocks, so no dangling
+        if statement remains. NETDEV_CHANGE is emitted as real C source lines.
+        Runtime DSA/Combo-port link-change validation is still required.
+        EOF
+      id: dsa_compat
+
+    - name: Build exact SSDK through verified mk entry
+      shell: bash
+      run: "# Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.\nSTAGE28_STEP_DIR=\"$GITHUB_WORKSPACE/results/steps/ssdk_build\"\
+        \nmkdir -p \"$STAGE28_STEP_DIR\"\nprintf '%s\\n' RUNNING > \"$STAGE28_STEP_DIR/state.txt\"\ncp \"${BASH_SOURCE[0]}\"\
+        \ \"$STAGE28_STEP_DIR/script.sh\"\nexec > >(tee \"$STAGE28_STEP_DIR/console.log\") 2>&1\nstage28_finish() {\n  local\
+        \ stage28_rc=\"$1\" stage28_line=\"$2\" stage28_command=\"$3\"\n  trap - EXIT\n  printf '%s\\n' \"$stage28_rc\" >\
+        \ \"$STAGE28_STEP_DIR/exit-code.txt\"\n  if [ \"$stage28_rc\" -eq 0 ]; then\n    printf '%s\\n' PASS > \"$STAGE28_STEP_DIR/state.txt\"\
+        \n  else\n    printf '%s\\n' FAIL > \"$STAGE28_STEP_DIR/state.txt\"\n    printf 'line=%s\\ncommand=%s\\n' \"$stage28_line\"\
+        \ \"$stage28_command\" > \"$STAGE28_STEP_DIR/failure.txt\"\n  fi\n  exit \"$stage28_rc\"\n}\ntrap 'stage28_finish\
+        \ \"$?\" \"$LINENO\" \"$BASH_COMMAND\"' EXIT\n# Original step body follows.\nset -euo pipefail\nsource results/environment.txt\n\
+        export STAGING_DIR=\"$GITHUB_WORKSPACE/openwrt/staging_dir\"\nexport PATH=\"$TOOLCHAIN_DIR/bin:$PATH\"\nSSDK=\"$GITHUB_WORKSPACE/qsdk-src/qca-ssdk\"\
+        \nMK_PATH=\"$SSDK/mk\"\ntest -f \"$MK_PATH/Makefile\"\ntest -s \"$KERNEL_DIR/Module.symvers\"\ntest \"$(git -C \"\
+        $SSDK\" rev-parse HEAD)\" = 717b74016b0c131575bcd81b9e039d3f7974b02a\ngit -C \"$SSDK\" status --short > results/ssdk-source-status.txt\n\
+        \n# Qualcomm feed c7ebac1 Build/Compile uses $(PKG_BUILD_DIR)/mk.\n# Both paths are explicit: setting PRJ_PATH alone\
+        \ skips MK_PATH initialization.\n# Keep the Stage13 full-size / no-swconfig / no-PTP compile-probe choices.\n# Do\
+        \ not run mk/build.sh: it references an absent make.sh and a devtest tree.\nvars=(\n  PRJ_PATH=\"$SSDK\" MK_PATH=\"\
+        $MK_PATH\" SYS_PATH=\"$KERNEL_DIR\"\n  ARCH=arm64 CROSS_COMPILE=\"$CROSS_COMPILE\" TOOLPREFIX=\"$CROSS_COMPILE\"\n\
+        \  TOOL_PATH=\"$TOOLCHAIN_DIR/bin\" KVER=6.18.39\n  TARGET_NAME=aarch64-openwrt-linux-musl TARGET_SUFFIX=musl\n  \"\
+        GCC_VERSION=$($GCC -dumpfullversion)\"\n  SoC=ipq95xx CHIP_TYPE=APPE MODULE_TYPE=KSLIB\n  MINI_SSDK=disable PTP_FEATURE=disable\
+        \ SWCONFIG_FEATURE=disable\n  \"KCFLAGS=-I$GITHUB_WORKSPACE/qsdk-include\"\n  SHELL=/bin/bash V=1\n  \"LNX_MAKEOPTS=ARCH=arm64\
+        \ CROSS_COMPILE=$CROSS_COMPILE V=1\"\n)\n# Serial compilation makes the first compiler diagnostic unambiguous.\nargs=(-C\
+        \ \"$MK_PATH\" -j1 \"${vars[@]}\" modules)\nprintf '%q ' make \"${args[@]}\" > results/ssdk-build-command.txt\nprintf\
+        \ '\\n' >> results/ssdk-build-command.txt\n\ncat > results/ssdk-inspect.mk <<'MK'\n.PHONY: stage28_inspect\nstage28_inspect:\n\
+        \t@$(foreach v,PRJ_PATH MK_PATH SYS_PATH ARCH CROSS_COMPILE SoC CHIP_TYPE SUPPORT_CHIP KVER OS_VER MODULE_TYPE MINI_SSDK\
+        \ FAL IN_ACL IN_IP IN_PPPOE IN_POLICER IN_QM IN_QOS IN_VSI IN_VPORT IN_TUNNEL IN_MAPT IN_COSMAP IN_SERVCODE SWCONFIG\
+        \ IN_PTP KCFLAGS MODULE_CFLAG MODULE_INC SSDK_OBJ,$(info $(v)=$($(v)))) true\nMK\nset +e\nmake -C \"$MK_PATH\" \"\
+        ${vars[@]}\" -f \"$MK_PATH/Makefile\" \\\n  -f \"$GITHUB_WORKSPACE/results/ssdk-inspect.mk\" stage28_inspect \\\n\
+        \  > results/ssdk-effective-config.txt 2>&1\ninspect_rc=$?\necho \"$inspect_rc\" > results/ssdk-config-inspect-exit-code.txt\n\
+        if [ \"$inspect_rc\" != 0 ]; then\n  cp results/ssdk-effective-config.txt results/ssdk-compile.log\n  echo \"$inspect_rc\"\
+        \ > results/ssdk-exit-code.txt\n  exit 0\nfi\n\n# First attempt keeps the inherited warning policy after the prototype\
+        \ fix.\nmake \"${args[@]}\" 2>&1 | tee results/ssdk-compile.log\nstrict_rc=${PIPESTATUS[0]}\ncp results/ssdk-compile.log\
+        \ results/ssdk-strict-compile.log\necho \"$strict_rc\" > results/ssdk-strict-exit-code.txt\necho NOT_USED > results/ssdk-warning-fallback.txt\n\
+        rc=$strict_rc\n# Retry only if every compiler error is missing-prototypes, with no MODPOST error.\n# This assignment\
+        \ is passed only to this SSDK invocation, never exported globally.\nif [ \"$strict_rc\" != 0 ] && python3 <<'PY'\n\
+        from pathlib import Path\nimport re, sys\nlines = Path('results/ssdk-strict-compile.log').read_text(errors='replace').splitlines()\n\
+        errors = [line for line in lines if re.search(r'\\berror:', line, re.I)]\neligible = bool(errors) and all('[-Werror=missing-prototypes]'\
+        \ in line for line in errors)\neligible = eligible and not any(re.search(r'undefined!|No rule to make target|No such\
+        \ file or directory|internal compiler error|collect2:', line) for line in lines)\nsys.exit(0 if eligible else 1)\n\
+        PY\nthen\n  echo SSDK_ONLY_MISSING_PROTOTYPES > results/ssdk-warning-fallback.txt\n  retry_args=(-C \"$MK_PATH\" -j1\
+        \ \"${vars[@]}\"\n    \"KCFLAGS=-I$GITHUB_WORKSPACE/qsdk-include -Wno-error=missing-prototypes\" modules)\n  printf\
+        \ '%q ' make \"${retry_args[@]}\" > results/ssdk-retry-build-command.txt\n  printf '\\n' >> results/ssdk-retry-build-command.txt\n\
+        \  make \"${retry_args[@]}\" 2>&1 | tee results/ssdk-compile.log\n  rc=${PIPESTATUS[0]}\n  cp results/ssdk-compile.log\
+        \ results/ssdk-retry-compile.log\nfi\necho \"$rc\" > results/ssdk-exit-code.txt\nfind \"$SSDK\" -type f \\( -name\
+        \ '*.ko' -o -name Module.symvers \\) -print \\\n  | sort > results/ssdk-generated.txt\n# mk/Makefile copies these\
+        \ on success; check instead of fabricating a table.\nif [ \"$rc\" = 0 ]; then\n  if [ -s \"$MK_PATH/qca-ssdk.ko\"\
+        \ ] && [ -s \"$SSDK/build/bin/qca-ssdk.ko\" ] &&\n     [ -s \"$MK_PATH/Module.symvers\" ] && [ -s \"$SSDK/Module.symvers\"\
+        \ ] &&\n     cmp -s \"$MK_PATH/Module.symvers\" \"$SSDK/Module.symvers\" &&\n     cmp -s \"$MK_PATH/qca-ssdk.ko\"\
+        \ \"$SSDK/build/bin/qca-ssdk.ko\"; then\n    echo VERIFIED > results/ssdk-products-check.txt\n    modinfo \"$MK_PATH/qca-ssdk.ko\"\
+        \ > results/ssdk-modinfo.txt 2>&1\n  else\n    echo 'SSDK returned zero but expected products are missing or inconsistent.'\
+        \ \\\n      > results/ssdk-products-check.txt\n    echo 90 > results/ssdk-exit-code.txt\n  fi\nfi\ngit -C \"$SSDK\"\
+        \ diff > results/ssdk-build-changes.patch\ncp \"$SSDK/src/ref/ssdk_stage16_bridge.h\" results/ssdk-source-context/\n\
+        exit 0\n"
+      id: ssdk_build
+    - name: Build PPE with SSDK and NSS Debug exports
+      shell: bash
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/ppe_build"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        set +e
+        set -uo pipefail
+        source results/environment.txt
+        export STAGING_DIR="$GITHUB_WORKSPACE/openwrt/staging_dir"
+        export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+        SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+        DEBUG_DIR="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe/nss_debug"
+        PPE_DIR="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe/drv/ppe_drv"
+        FLAGS=$(cat results/qsdk-header-flags.txt)
+        extras=()
+        : > results/kbuild-extra-symbols.txt
+        # Never import incomplete/stale SSDK exports after a failed build.
+        if [ "$(cat results/ssdk-exit-code.txt 2>/dev/null)" = 0 ] &&
+           [ -s "$SSDK/Module.symvers" ] &&
+           [ -n "$(find "$SSDK" -name 'qca-ssdk.ko' -type f -print -quit)" ]; then
+          extras+=("$SSDK/Module.symvers")
+        else
+          echo 'SSDK dependency unavailable; PPE build is diagnostic only.' > results/ppe-dependency-status.txt
+        fi
+        if [ "$(cat results/nss-debug-exit-code.txt 2>/dev/null)" = 0 ] &&
+           [ -s "$DEBUG_DIR/Module.symvers" ] && [ -s "$DEBUG_DIR/qca-nss-debug.ko" ]; then
+          extras+=("$DEBUG_DIR/Module.symvers")
+        fi
+        for f in "${extras[@]}"; do printf '%s\n' "$f" >> results/kbuild-extra-symbols.txt; done
+        args=(-C "$KERNEL_DIR" M="$PPE_DIR" ARCH=arm64
+          CROSS_COMPILE="$CROSS_COMPILE" SoC=ipq95xx CONFIG_NET_DSA=y
+          KCFLAGS="$FLAGS" "KBUILD_EXTRA_SYMBOLS=${extras[*]}" modules V=1)
+        printf '%q ' make "${args[@]}" > results/ppe-build-command.txt
+        printf '\n' >> results/ppe-build-command.txt
+        make "${args[@]}" 2>&1 | tee results/ppe-compile.log
+        rc=${PIPESTATUS[0]}
+        echo "$rc" > results/ppe-exit-code.txt
+        if [ "$rc" = 0 ]; then
+          if [ -s "$PPE_DIR/qca-nss-ppe.ko" ]; then
+            modinfo "$PPE_DIR/qca-nss-ppe.ko" > results/ppe-modinfo.txt 2>&1
+            echo VERIFIED > results/ppe-products-check.txt
+          else
+            echo 'PPE returned zero without qca-nss-ppe.ko' > results/ppe-products-check.txt
+            echo 91 > results/ppe-exit-code.txt
+          fi
+        fi
+        exit 0
+      id: ppe_build
+    - name: Collect all products and audit unresolved symbols
+      shell: bash
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/collect"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        python3 <<'PY'
+        from pathlib import Path
+        import json
+        import os
+        import re
+        import shutil
+        import subprocess
+
+        root = Path.cwd()
+        out = root / 'results'
+        out.mkdir(exist_ok=True)
+        env = {}
+        envfile = out / 'environment.txt'
+        if envfile.exists():
+            env = dict(line.split('=', 1) for line in envfile.read_text().splitlines() if '=' in line)
+        ssdk = root / 'qsdk-src/qca-ssdk'
+        ppe = root / 'qsdk-src/qca-nss-ppe/drv/ppe_drv'
+        debug = root / 'qsdk-src/qca-nss-ppe/nss_debug'
+
+        def write(name, lines):
+            (out / name).write_text('\n'.join(lines) + ('\n' if lines else ''))
+
+        def rc(name):
+            p = out / (name + '-exit-code.txt')
+            return p.read_text().strip() if p.exists() else 'NOT_RUN'
+
+        def symbols(path):
+            if not path.is_file():
+                return set()
+            return {row.split()[1] for row in path.read_text().splitlines() if len(row.split()) >= 4}
+
+        products = []
+        for base in (ssdk, root / 'qsdk-src/qca-nss-ppe'):
+            if not base.exists():
+                continue
+            for p in sorted(base.rglob('*')):
+                if p.is_file() and (p.suffix in ('.ko', '.o', '.mod') or p.name in ('Module.symvers', 'modules.order')):
+                    rel = p.relative_to(root)
+                    dest = out / 'modules' / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(p, dest)
+                    products.append(f'{rel.as_posix()}\t{p.stat().st_size}')
+        write('module-products.txt', products)
+
+        ssdk_tables = []
+        for p in sorted(ssdk.rglob('Module.symvers')) if ssdk.exists() else []:
+            names = symbols(p)
+            ssdk_tables.append(f'{p.relative_to(root)}\tbytes={p.stat().st_size}\texports={len(names)}\tfal={sum(x.startswith("fal_") for x in names)}')
+        write('ssdk-symvers-inventory.txt', ssdk_tables)
+        exports = symbols(ssdk / 'Module.symvers')
+        fal_exports = sorted(x for x in exports if x.startswith('fal_'))
+        write('ssdk-fal-exports.txt', fal_exports)
+        write('ssdk-all-exports.txt', sorted(exports))
+
+        for name in ('ssdk', 'nss-debug', 'ppe'):
+            log = out / (name + '-compile.log')
+            lines = log.read_text(errors='replace').splitlines() if log.exists() else []
+            write(name + '-errors.txt', [l for l in lines if re.search(r'error:|fatal error:|undefined!|implicit declaration|No rule to make target|No such file|has no member|incompatible pointer|conflicting types|too few arguments|too many arguments', l, re.I)])
+            if name == 'ppe':
+                write('ppe-modpost-unresolved.txt', [l for l in lines if 'undefined!' in l or 'suppressed' in l and 'unresolved' in l])
+                write('ppe-compile-depth.txt', [l for l in lines if re.search(r'CC \[M\]|LD \[M\]|MODPOST|\.ko', l)])
+
+        # Runs inside the inherited all-products diagnostic Python block.
+        ssdk_log = out / 'ssdk-compile.log'
+        ssdk_lines = ssdk_log.read_text(errors='replace').splitlines() if ssdk_log.exists() else []
+        compiler_error = re.compile(r'\.(?:c|h):\d+(?::\d+)?:\s+(?:fatal\s+)?error:')
+        compiler_command = re.compile(r'aarch64[^\s]*-(?:gcc|cc)\b.*(?:\s-c\s).*\.c(?:\s|$)')
+        first_index = next((i for i, line in enumerate(ssdk_lines) if compiler_error.search(line)), None)
+        compile_commands = [line for line in ssdk_lines if compiler_command.search(line)]
+        write('ssdk-compiler-commands.txt', compile_commands)
+        write('ssdk-compile-depth.txt', [line for line in ssdk_lines if re.search(r'CC\s+\[M\]|LD\s+\[M\]|MODPOST|\.ko', line)])
+        if first_index is not None:
+            write('ssdk-first-compiler-error.txt', [f'log_line={first_index + 1}', ssdk_lines[first_index]])
+            write('ssdk-first-compiler-error-context.txt', ssdk_lines[max(0, first_index-20):first_index+41])
+            match = re.search(r'([^\s:]+\.(?:c|h)):(\d+)', ssdk_lines[first_index])
+            if match:
+                name, line_no = match.group(1), int(match.group(2))
+                for candidate in (Path(name), ssdk / 'mk' / name, ssdk / name):
+                    candidate = candidate.resolve()
+                    if candidate.is_file() and candidate.is_relative_to(ssdk.resolve()):
+                        source = candidate.read_text(errors='replace').splitlines()
+                        write('ssdk-first-error-source.txt', [str(candidate)] + [f'{i+1}: {source[i]}' for i in range(max(0,line_no-21), min(len(source),line_no+20))])
+                        break
+        else:
+            write('ssdk-first-compiler-error.txt', ['No source-positioned compiler error found; inspect ssdk-errors.txt and ssdk-compile.log.'])
+        objects = sorted(p.relative_to(ssdk).as_posix() for p in ssdk.rglob('*.o')) if ssdk.exists() else []
+        write('ssdk-object-inventory.txt', objects)
+        ssdk_started = bool(compile_commands or objects or first_index is not None)
+        write('ssdk-stage28-status.txt', [f'compiler_started={ssdk_started}', f'object_count={len(objects)}', f'first_compiler_error_line={first_index + 1 if first_index is not None else "NONE"}', f'make_exit={rc("ssdk")}'])
+
+        # An exhaustive strong-undefined-symbol comparison independent of MODPOST's
+        # first-ten-errors display limit. This does not replace MODPOST's CRC,
+        # namespace and license validation.
+        kernel_table = Path(env['KERNEL_DIR']) / 'Module.symvers' if 'KERNEL_DIR' in env else None
+        available = symbols(kernel_table) if kernel_table else set()
+        extra_file = out / 'kbuild-extra-symbols.txt'
+        extra_paths = extra_file.read_text().splitlines() if extra_file.exists() else []
+        for path in extra_paths:
+            available.update(symbols(Path(path)))
+        nm_status = 'NOT_AVAILABLE'
+        needed, missing = set(), set()
+        obj = ppe / 'qca-nss-ppe.o'
+        if obj.is_file() and 'CROSS_COMPILE' in env:
+            try:
+                proc = subprocess.run([env['CROSS_COMPILE'] + 'nm', '-u', str(obj)], capture_output=True, text=True)
+                (out / 'ppe-nm-undefined.raw.txt').write_text(proc.stdout + proc.stderr)
+                nm_status = str(proc.returncode)
+                if proc.returncode == 0:
+                    needed = {parts[-1] for line in proc.stdout.splitlines() if len(parts := line.split()) >= 2 and parts[-2] == 'U'}
+                    missing = needed - available
+            except OSError as exc:
+                nm_status = str(exc)
+        write('ppe-required-symbols.txt', sorted(needed))
+        write('ppe-unresolved-all.txt', sorted(missing))
+        write('ppe-fal-resolution.tsv', ['symbol\tSSDK_exported\tavailable_to_MODPOST'] + [f'{s}\t{int(s in exports)}\t{int(s in available)}' for s in sorted(needed) if s.startswith('fal_')])
+
+        for name in ('tools.log', 'toolchain.log', 'kernel-compile.log'):
+            if (root / name).is_file():
+                shutil.copy2(root / name, out / name)
+        if (root / 'openwrt/.config').is_file():
+            shutil.copy2(root / 'openwrt/.config', out / 'openwrt.config')
+        if kernel_table and kernel_table.is_file():
+            shutil.copy2(kernel_table, out / 'kernel-Module.symvers')
+            config = kernel_table.parent / '.config'
+            if config.is_file():
+                shutil.copy2(config, out / 'kernel.config')
+
+        ssdk_modules = sorted(str(p.relative_to(root)) for p in ssdk.rglob('qca-ssdk.ko')) if ssdk.exists() else []
+        phy_status_file = out / 'phy-header-status.json'
+        phy_status = json.loads(phy_status_file.read_text()) if phy_status_file.exists() else {}
+        phy_flag_seen = any('-I' + str(root / 'qsdk-include') in line for line in compile_commands)
+        bridge_status_path = out / 'bridge-api/status.json'
+        bridge_status = json.loads(bridge_status_path.read_text()) if bridge_status_path.exists() else {}
+        prototype_status_file = out / 'stage28-prototypes/status.json'
+        prototype_status = json.loads(prototype_status_file.read_text()) if prototype_status_file.exists() else {}
+        fallback_file = out / 'ssdk-warning-fallback.txt'
+        fallback = fallback_file.read_text().strip() if fallback_file.exists() else 'NOT_RUN'
+        missing_warnings = [line for line in ssdk_lines if 'warning:' in line and '[-Wmissing-prototypes]' in line]
+        write('ssdk-missing-prototypes-warnings.txt', missing_warnings)
+        # Also capture non-source failures such as assembler, linker, MODPOST and make.
+        real_error = next((line for line in ssdk_lines if re.search(r'\berror:|fatal error:|undefined!|No rule to make target|make(?:\[\d+\])?: \*\*\*', line, re.I)), None)
+        write('ssdk-first-real-error.txt', [real_error] if real_error else ['No error found; see exit code and full log.'])
+        # Preserve skipped/unstarted states rather than inventing failed verifications.
+        step_outcomes = json.loads(os.environ.get('STAGE28_STEPS_JSON', '{}'))
+        (out / 'github-step-outcomes.json').write_text(json.dumps(step_outcomes, indent=2) + '\n')
+        manifest_file = out / 'step-manifest.json'
+        manifest = json.loads(manifest_file.read_text()) if manifest_file.is_file() else [{'id': 'checkout', 'name': 'Checkout'}, {'id': 'initialize', 'name': 'Initialize diagnostics'}, {'id': 'free_disk', 'name': 'Free disk'}, {'id': 'dependencies', 'name': 'Install dependencies'}, {'id': 'baseline', 'name': 'Clone SBE1V1K baseline'}, {'id': 'downloads_cache', 'name': 'Cache OpenWrt downloads'}, {'id': 'qsdk_sources', 'name': 'Fetch exact QSDK sources'}, {'id': 'ssdk_source_inspection', 'name': 'Inspect pinned SSDK source and package build evidence'}, {'id': 'phy_headers', 'name': 'Export pinned PHY headers and verify include parent'}, {'id': 'source_download', 'name': 'Download sources'}, {'id': 'kernel_build', 'name': 'Build OpenWrt kernel'}, {'id': 'kernel_toolchain', 'name': 'Locate kernel and toolchain'}, {'id': 'kernel_symvers', 'name': 'Verify kernel Module.symvers'}, {'id': 'include_flags', 'name': 'Generate QSDK include flags'}, {'id': 'ppe_compat', 'name': 'Apply exact successful Stage12 PPE patch'}, {'id': 'api_probe', 'name': 'Repeat verified Stage12 DSA and vmalloc compile probe'}, {'id': 'nss_debug', 'name': 'Compile QCA NSS Debug'}, {'id': 'bridge_audit', 'name': 'Audit Linux 6.18.39 bridge semantics and patch SSDK'}, {'id': 'bridge_probe', 'name': 'Compile and MODPOST exact Stage16 bridge helper'}, {'id': 'prototypes', 'name': 'Audit pinned declarations and add exact SSDK MIB prototypes'}, {'id': 'ssdk_build', 'name': 'Build exact SSDK through verified mk entry'}, {'id': 'ppe_build', 'name': 'Build PPE with SSDK and NSS Debug exports'}]
+        step_records = []
+        for item in manifest:
+            sid = item['id']
+            context = step_outcomes.get(sid, {})
+            record = dict(item, **context)
+            status_dir = out / 'steps' / sid
+            exit_file = status_dir / 'exit-code.txt'
+            if exit_file.is_file():
+                record['shell_exit'] = exit_file.read_text().strip()
+            failure = status_dir / 'failure.txt'
+            if failure.is_file():
+                record['shell_failure'] = failure.read_text()
+            if sid == 'downloads_cache' and context.get('outcome') == 'failure':
+                record['state'] = 'WARN'
+            elif context.get('outcome') == 'failure' or record.get('shell_exit', '0') != '0':
+                record['state'] = 'FAIL'
+            elif context.get('outcome') == 'success':
+                record['state'] = 'PASS'
+            elif context.get('outcome') == 'cancelled':
+                record['state'] = 'CANCELLED'
+            elif (status_dir / 'state.txt').is_file():
+                record['state'] = (status_dir / 'state.txt').read_text().strip()
+            else:
+                record['state'] = 'NOT_RUN'
+            step_records.append(record)
+        (out / 'step-results.json').write_text(json.dumps(step_records, indent=2) + '\n')
+        first_failed_step = next((s for s in step_records if s['state'] == 'FAIL' and s['id'] != 'downloads_cache'), None)
+        incomplete_steps = [s for s in step_records if s['state'] in ('RUNNING', 'CANCELLED')]
+        prototype_state = prototype_status.get('state', 'NOT_RUN')
+        if not prototype_status and (out / 'steps/prototypes/state.txt').exists():
+            prototype_state = 'STARTED_WITHOUT_STATUS'
+        (out / 'first-failed-step.json').write_text(json.dumps(first_failed_step, indent=2) + '\n')
+        stats = {
+            'prototype_audit_state': prototype_state,
+            'prototype_audit_verified': prototype_status.get('verified'),
+            'prototype_audit_detail': prototype_status,
+            'first_failed_step': first_failed_step,
+            'incomplete_steps': incomplete_steps,
+            'ssdk_strict_exit': rc('ssdk-strict'),
+            'ssdk_warning_fallback': fallback,
+            'ssdk_missing_prototypes_warning_count': len(missing_warnings),
+            'ssdk_first_real_error': real_error,
+            'stage': 19,
+            'bridge_api_state': 'PASS' if bridge_status.get('verified') else ('FAIL' if bridge_status else 'NOT_RUN'),
+            'bridge_api_verified': bridge_status.get('verified'),
+            'bridge_probe_exit': rc('stage16-bridge-probe'),
+            'bridge_probe_ko': (out / 'stage16-bridge-probe/stage16_bridge_probe.ko').is_file(),
+            'phy_commit_required': '16eec6ac35820cb67af59223e8b4c2dba7179655',
+            'phy_header_status': phy_status,
+            'phy_include_in_ssdk_gcc': phy_flag_seen,
+            'purpose': 'Compile probe only; no flashing; inherited MAP-T/DSA compatibility is not runtime validation',
+            'ssdk_commit_required': '717b74016b0c131575bcd81b9e039d3f7974b02a',
+            'kernel_required': '6.18.39',
+            'target': 'IPQ9574/ipq95xx/APPE/arm64',
+            'ssdk_exit': rc('ssdk'), 'nss_debug_exit': rc('nss-debug'), 'ppe_exit': rc('ppe'),
+            'ssdk_modules': ssdk_modules,
+            'ssdk_compiler_started': ssdk_started,
+            'ssdk_object_count': len(objects),
+            'ssdk_source_object_count': sum(p.startswith('src/') and not p.endswith('.mod.o') for p in objects),
+            'ssdk_first_compiler_error': ssdk_lines[first_index] if first_index is not None else None,
+            'ssdk_symvers_bytes': (ssdk / 'Module.symvers').stat().st_size if (ssdk / 'Module.symvers').exists() else 0,
+            'ssdk_export_count': len(exports), 'ssdk_fal_export_count': len(fal_exports),
+            'nss_debug_ko': (debug / 'qca-nss-debug.ko').is_file(),
+            'ppe_ko': (ppe / 'qca-nss-ppe.ko').is_file(),
+            'ppe_linked_object': obj.is_file(),
+            'ppe_source_object_count': sum(1 for p in ppe.glob('*.o') if p.name != 'qca-nss-ppe.o' and not p.name.endswith('.mod.o')),
+            'ppe_all_object_count': len(list(ppe.glob('*.o'))),
+            'extra_symvers': extra_paths, 'symbol_audit_exit': nm_status,
+            'ppe_unresolved_count': len(missing) if nm_status == '0' else None,
+            'ppe_unresolved_fal_count': sum(s.startswith('fal_') for s in missing) if nm_status == '0' else None,
+        }
+        stats['success'] = bool(first_failed_step is None and not incomplete_steps and stats['prototype_audit_verified'] and stats['bridge_api_verified'] and stats['bridge_probe_exit'] == '0' and stats['bridge_probe_ko'] and phy_status.get('verified') and phy_flag_seen and all(rc(n) == '0' for n in ('ssdk', 'nss-debug', 'ppe')) and ssdk_started and ssdk_modules and fal_exports and stats['ppe_ko'] and stats['nss_debug_ko'] and nm_status == '0' and not missing and str(ssdk / 'Module.symvers') in extra_paths)
+        (out / 'stage28-summary.json').write_text(json.dumps(stats, indent=2) + '\n')
+        summary = ['STAGE 28: ' + ('PASS' if stats['success'] else 'FAIL / INCOMPLETE')]
+        summary += [f'{k}: {v}' for k, v in stats.items()]
+        write('stage28-summary.txt', summary)
+        print('\n'.join(summary))
+        if os.environ.get('GITHUB_STEP_SUMMARY'):
+            with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+                f.write('```text\n' + '\n'.join(summary) + '\n```\n')
+        PY
+      if: always()
+      env:
+        STAGE28_STEPS_JSON: ${{ toJSON(steps) }}
+      id: collect
+    - name: Upload Stage28 diagnostics and modules
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: SBE1V1K-V0.2-QSDK-Stage28
+        path: results/
+        retention-days: 14
+        if-no-files-found: error
+      id: upload
+    - name: Require real SSDK and PPE module success
+      shell: bash
+      run: |
+        # Stage28 diagnostics: absolute paths survive cd; no ERR trap modifies PIPESTATUS.
+        STAGE28_STEP_DIR="$GITHUB_WORKSPACE/results/steps/require_success"
+        mkdir -p "$STAGE28_STEP_DIR"
+        printf '%s\n' RUNNING > "$STAGE28_STEP_DIR/state.txt"
+        cp "${BASH_SOURCE[0]}" "$STAGE28_STEP_DIR/script.sh"
+        exec > >(tee "$STAGE28_STEP_DIR/console.log") 2>&1
+        stage28_finish() {
+          local stage28_rc="$1" stage28_line="$2" stage28_command="$3"
+          trap - EXIT
+          printf '%s\n' "$stage28_rc" > "$STAGE28_STEP_DIR/exit-code.txt"
+          if [ "$stage28_rc" -eq 0 ]; then
+            printf '%s\n' PASS > "$STAGE28_STEP_DIR/state.txt"
+          else
+            printf '%s\n' FAIL > "$STAGE28_STEP_DIR/state.txt"
+            printf 'line=%s\ncommand=%s\n' "$stage28_line" "$stage28_command" > "$STAGE28_STEP_DIR/failure.txt"
+          fi
+          exit "$stage28_rc"
+        }
+        trap 'stage28_finish "$?" "$LINENO" "$BASH_COMMAND"' EXIT
+        # Original step body follows.
+        python3 <<'PY'
+        import json
+        from pathlib import Path
+        p = Path('results/stage28-summary.json')
+        assert p.is_file(), 'Missing Stage28 diagnostics'
+        s = json.loads(p.read_text())
+        assert s['success'], 'Stage28 compile incomplete; download the uploaded diagnostics'
+        PY
+      if: always()
+      id: require_success
