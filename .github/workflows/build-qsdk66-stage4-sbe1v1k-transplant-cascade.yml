@@ -1,0 +1,545 @@
+name: SBE1V1K QSDK 6.6 Stage 4 - Device Transplant Cascade
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OPENWRT_TAG: v24.10.2
+  FEED_IPQ_BRANCH: ath.13.0
+  DEVICE_BASE_COMMIT: 02fb9517c9aefac9f3825a15ae46e7998bae7edd
+  STAGE: QSDK-6.6-Stage4
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+jobs:
+  transplant-cascade:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 210
+
+    steps:
+      - name: Checkout current project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install OpenWrt build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3 python3-setuptools \
+            rsync swig unzip zlib1g-dev file wget curl xsltproc libxml-parser-perl \
+            python3-dev time jq patch quilt ccache zstd libelf-dev bc device-tree-compiler
+
+      - name: Initialize Stage 4 workspace
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf stage4-work stage4-results
+          mkdir -p stage4-work stage4-results/{sources,integration,device,config,bootstrap,kernel,packages,image,discovery}
+          {
+            echo "stage=${STAGE}"
+            echo "date_utc=$(date -u +%FT%TZ)"
+            echo "runner=$(uname -a)"
+            echo "repo=${GITHUB_REPOSITORY}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "openwrt_tag=${OPENWRT_TAG}"
+            echo "feed_ipq_branch=${FEED_IPQ_BRANCH}"
+          } | tee stage4-results/environment.txt
+
+      - name: Cache downloads and ccache
+        uses: actions/cache@v4
+        with:
+          path: |
+            stage4-work/openwrt/dl
+            .ccache
+          key: qsdk66-stage4-${{ runner.os }}-${{ env.OPENWRT_TAG }}-${{ env.FEED_IPQ_BRANCH }}
+          restore-keys: |
+            qsdk66-stage4-${{ runner.os }}-
+            qsdk66-${{ runner.os }}-
+
+      - name: Fetch OpenWrt, feed-ipq and SBE1V1K source
+        id: sources
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          O="$GITHUB_WORKSPACE/stage4-work/openwrt"
+          F="$GITHUB_WORKSPACE/stage4-work/feed-ipq"
+          D="$GITHUB_WORKSPACE/stage4-work/sbe1v1k"
+          OUT="$GITHUB_WORKSPACE/stage4-results/sources"
+
+          clone_retry() {
+            local name="$1" url="$2" ref="$3" dst="$4" log="$OUT/${name}-clone.log"
+            rm -rf "$dst"
+            local rc=1
+            for n in 1 2 3; do
+              echo "[$name] attempt=$n url=$url ref=$ref" | tee -a "$log"
+              git clone --depth=1 --branch "$ref" "$url" "$dst" >>"$log" 2>&1
+              rc=$?
+              [ "$rc" -eq 0 ] && break
+              rm -rf "$dst"
+              sleep $((n * 6))
+            done
+            echo "$rc" > "$OUT/${name}-clone-exit.txt"
+            if [ "$rc" -eq 0 ]; then
+              git -C "$dst" rev-parse HEAD | tee "$OUT/${name}-commit.txt"
+              git -C "$dst" log -1 --format=fuller > "$OUT/${name}-commit-log.txt"
+            fi
+          }
+
+          clone_retry openwrt https://github.com/openwrt/openwrt.git "$OPENWRT_TAG" "$O"
+          clone_retry feed-ipq https://github.com/zilogic-systems/feed-ipq.git "$FEED_IPQ_BRANCH" "$F"
+
+          rm -rf "$D"
+          git init -q "$D"
+          git -C "$D" remote add origin https://github.com/luckkyboy/SBE1V1K.git
+          rc=1
+          for n in 1 2 3; do
+            git -C "$D" fetch --depth=1 origin "$DEVICE_BASE_COMMIT" >"$OUT/device-fetch.log" 2>&1
+            rc=$?
+            [ "$rc" -eq 0 ] && break
+            sleep $((n * 6))
+          done
+          echo "$rc" > "$OUT/device-fetch-exit.txt"
+          if [ "$rc" -eq 0 ]; then
+            git -C "$D" checkout -q --detach FETCH_HEAD
+            git -C "$D" rev-parse HEAD | tee "$OUT/device-commit.txt"
+          fi
+          exit 0
+
+      - name: Integrate native QSDK13 IPQ95xx target and feeds
+        id: integrate
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          O="$GITHUB_WORKSPACE/stage4-work/openwrt"
+          F="$GITHUB_WORKSPACE/stage4-work/feed-ipq"
+          OUT="$GITHUB_WORKSPACE/stage4-results/integration"
+          rc=0
+          exec > >(tee "$OUT/integration.log") 2>&1
+
+          if [ ! -d "$O" ] || [ ! -d "$F" ]; then
+            echo 90 > "$OUT/integration-exit.txt"
+            exit 0
+          fi
+
+          echo "=== selectively apply feed-ipq OpenWrt 24.10 patches ==="
+          : > "$OUT/patch-status.tsv"
+          shopt -s nullglob
+          mapfile -t patches < <(find "$F/patches/openwrt/24.10" -type f -name '*.patch' 2>/dev/null | sort)
+          for p in "${patches[@]}"; do
+            name="$(basename "$p")"
+            if git -C "$O" apply --check "$p" >/dev/null 2>&1; then
+              git -C "$O" apply "$p"
+              prc=$?
+              echo -e "$name\tAPPLIED\t$prc" >> "$OUT/patch-status.tsv"
+            elif (cd "$O" && patch --dry-run -p1 --forward --batch < "$p" >/dev/null 2>&1); then
+              (cd "$O" && patch -p1 --forward --batch < "$p")
+              prc=$?
+              echo -e "$name\tPATCHED\t$prc" >> "$OUT/patch-status.tsv"
+            else
+              # Stage 3 proved the baseline builds without the non-applicable bbfdm/xmppc patches.
+              echo -e "$name\tSKIPPED_NOT_APPLICABLE\t0" >> "$OUT/patch-status.tsv"
+            fi
+          done
+
+          echo "=== install IPQ95xx target ==="
+          rm -rf "$O/target/linux/ipq95xx"
+          cp -a "$F/targets/ipq95xx" "$O/target/linux/ipq95xx" || rc=2
+
+          echo "=== add feed-ipq feed roots ==="
+          cp "$O/feeds.conf.default" "$OUT/feeds.conf.default.before"
+          : > "$OUT/local-feeds-added.txt"
+          for d in "$F"/feeds/*; do
+            [ -d "$d" ] || continue
+            name="ipq_$(basename "$d" | tr '.-' '__')"
+            echo "src-link $name $d" >> "$O/feeds.conf.default"
+            echo "$name $d" >> "$OUT/local-feeds-added.txt"
+          done
+          if [ -d "$F/ipq-ext" ]; then
+            echo "src-link ipq_ext $F/ipq-ext" >> "$O/feeds.conf.default"
+            echo "ipq_ext $F/ipq-ext" >> "$OUT/local-feeds-added.txt"
+          fi
+
+          (cd "$O" && ./scripts/feeds update -a) > "$OUT/feeds-update.log" 2>&1
+          furc=$?
+          (cd "$O" && ./scripts/feeds install -a) > "$OUT/feeds-install.log" 2>&1
+          firc=$?
+          echo "feeds_update_exit=$furc" >> "$OUT/integration.log"
+          echo "feeds_install_exit=$firc" >> "$OUT/integration.log"
+          [ "$furc" -ne 0 ] && rc=3
+          [ "$firc" -ne 0 ] && rc=4
+          echo "$rc" > "$OUT/integration-exit.txt"
+          exit 0
+
+      - name: Transplant SBE1V1K DTS and engineering device profile
+        id: transplant
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          O="$GITHUB_WORKSPACE/stage4-work/openwrt"
+          D="$GITHUB_WORKSPACE/stage4-work/sbe1v1k"
+          OUT="$GITHUB_WORKSPACE/stage4-results/device"
+          rc=0
+
+          SRC_DTS="$D/target/linux/qualcommbe/dts/ipq9570-sbe1v1k.dts"
+          if [ ! -f "$SRC_DTS" ]; then
+            echo "missing source DTS: $SRC_DTS" | tee "$OUT/transplant.log"
+            echo 90 > "$OUT/transplant-exit.txt"
+            exit 0
+          fi
+
+          cp "$SRC_DTS" "$OUT/ipq9570-sbe1v1k.source.dts"
+          sha256sum "$SRC_DTS" > "$OUT/source-dts.sha256"
+
+          for arch in arm64 arm; do
+            QDIR="$O/target/linux/ipq95xx/files-6.6/arch/$arch/boot/dts/qcom"
+            [ -d "$QDIR" ] || continue
+            cp "$SRC_DTS" "$QDIR/ipq9574-sbe1v1k.dts" || rc=1
+            MF="$QDIR/Makefile"
+            if [ -f "$MF" ] && ! grep -q 'ipq9574-sbe1v1k.dtb' "$MF"; then
+              printf '\n# SBE1V1K engineering transplant\ndtb-$(CONFIG_ARCH_QCOM) += ipq9574-sbe1v1k.dtb\n' >> "$MF"
+            fi
+          done
+
+          IMG="$O/target/linux/ipq95xx/image/generic.mk"
+          if [ -f "$IMG" ] && ! grep -q '^define Device/askey_sbe1v1k' "$IMG"; then
+            printf '%s\n' \
+              '' \
+              '# SBE1V1K engineering-only profile. DO NOT FLASH.' \
+              '# DEVICE_DTS_CONFIG temporarily reuses the closest eMMC IPQ9574 reference' \
+              '# only so Stage 4 can exercise the QSDK image pipeline; board-config parity' \
+              '# must be verified before any flashable release.' \
+              'define Device/askey_sbe1v1k' \
+              '	$(call Device/FitImage)' \
+              '	$(call Device/EmmcImage)' \
+              '	DEVICE_VENDOR := Askey' \
+              '	DEVICE_MODEL := SBE1V1K' \
+              '	DEVICE_DTS := ipq9574-sbe1v1k' \
+              '	DEVICE_DTS_CONFIG := config-rdp433-mht-phy' \
+              '	DEVICE_FLASH_TYPE := emmc' \
+              '	DEVICE_BOARD_CONFIG := board-cfg-ipq9574' \
+              '	SOC := ipq9574' \
+              '	DEVICE_PACKAGES += uboot-ipq9574-mmc board-cfg-ipq95xx' \
+              'endef' \
+              'TARGET_DEVICES += askey_sbe1v1k' >> "$IMG"
+          fi
+
+          # Bring the standalone RTL826x firmware package into the tree if present.
+          if [ -d "$D/package/firmware/rtl826x-firmware" ]; then
+            rm -rf "$O/package/firmware/rtl826x-firmware"
+            cp -a "$D/package/firmware/rtl826x-firmware" "$O/package/firmware/rtl826x-firmware"
+            echo "rtl826x_firmware_package=COPIED" > "$OUT/rtl826x-status.txt"
+          else
+            echo "rtl826x_firmware_package=NOT_FOUND" > "$OUT/rtl826x-status.txt"
+          fi
+
+          # Inventory remaining runtime-only device support without blindly applying 6.18 patches to 6.6.
+          {
+            echo "=== SBE1V1K relevant source files ==="
+            find "$D" -type f | grep -Ei 'sbe1v1k|rtl8261|rtl826x' | sed "s#^$D/##" | sort || true
+            echo
+            echo "=== SBE1V1K references ==="
+            grep -RInE 'askey,sbe1v1k|askey_sbe1v1k|SBE1V1K|rtl8261n' "$D/target" "$D/package" 2>/dev/null | head -n 5000 || true
+            echo
+            echo "=== 6.18 patches touching SBE1V1K/RTL ==="
+            grep -RIlE 'SBE1V1K|rtl8261n|RTL8261' "$D/target/linux/qualcommbe/patches-6.18" 2>/dev/null | sort || true
+          } > "$OUT/remaining-runtime-support.txt"
+
+          echo "$rc" > "$OUT/transplant-exit.txt"
+          grep -nE 'askey_sbe1v1k|ipq9574-sbe1v1k' "$IMG" > "$OUT/profile-lines.txt" 2>/dev/null || true
+          find "$O/target/linux/ipq95xx/files-6.6" -type f -name '*sbe1v1k*' -o -name '*SBE1V1K*' 2>/dev/null | sort > "$OUT/transplanted-files.txt" || true
+          exit 0
+
+      - name: Configure SBE1V1K QSDK13 engineering profile
+        id: config
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          O="$GITHUB_WORKSPACE/stage4-work/openwrt"
+          OUT="$GITHUB_WORKSPACE/stage4-results/config"
+          cd "$O" || { echo 90 > "$OUT/config-exit.txt"; exit 0; }
+
+          cat > .config <<'EOF'
+          CONFIG_TARGET_ipq95xx=y
+          CONFIG_TARGET_ipq95xx_generic=y
+          CONFIG_TARGET_ipq95xx_generic_DEVICE_askey_sbe1v1k=y
+          CONFIG_DEVEL=y
+          CONFIG_BUILD_LOG=y
+          CONFIG_CCACHE=y
+          CONFIG_PACKAGE_kmod-qca-ssdk-qca-nohnat=y
+          CONFIG_PACKAGE_kmod-qca-nss-phy=y
+          CONFIG_PACKAGE_kmod-qca-nss-dp-qca=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe=y
+          EOF
+
+          # Select copied RTL826x firmware only if its package symbol exists after metadata generation.
+          make defconfig > "$OUT/defconfig-pass1.log" 2>&1
+          rc=$?
+          if grep -Rqs 'Package/rtl826x-firmware' package/firmware/rtl826x-firmware 2>/dev/null; then
+            echo 'CONFIG_PACKAGE_rtl826x-firmware=y' >> .config
+            make defconfig > "$OUT/defconfig-pass2.log" 2>&1
+            rc2=$?
+            [ "$rc2" -ne 0 ] && rc=$rc2
+          fi
+
+          echo "$rc" > "$OUT/config-exit.txt"
+          cp .config "$OUT/final.config" 2>/dev/null || true
+          grep -E '^(CONFIG_TARGET_|CONFIG_PACKAGE_.*(qca|nss|ppe|ssdk|netfn|ecm|rtl826)|CONFIG_KERNEL_.*(NSS|PPE|EDMA))' .config \
+            > "$OUT/selected-config.txt" 2>/dev/null || true
+          grep -nEi 'askey_sbe1v1k|rtl826|qca-nss|nss-ppe|nss-dp|ssdk|netfn|flowmgr|ecm' tmp/.config-package.in \
+            > "$OUT/available-kconfig.txt" 2>/dev/null || true
+          exit 0
+
+      - name: Download all selected sources
+        id: download
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          O="$GITHUB_WORKSPACE/stage4-work/openwrt"
+          OUT="$GITHUB_WORKSPACE/stage4-results/config"
+          cd "$O" || { echo 90 > "$OUT/download-exit.txt"; exit 0; }
+          make -j"$(nproc)" download V=s > "$OUT/download.log" 2>&1
+          rc=$?
+          echo "$rc" > "$OUT/download-exit.txt"
+          grep -nE '(ERROR|Error|failed|404|hash mismatch)' "$OUT/download.log" | tail -n 300 > "$OUT/download-errors.txt" || true
+          exit 0
+
+      - name: Bootstrap host tools and toolchain
+        id: bootstrap
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          O="$GITHUB_WORKSPACE/stage4-work/openwrt"
+          OUT="$GITHUB_WORKSPACE/stage4-results/bootstrap"
+          cd "$O" || { echo 90 > "$OUT/bootstrap-exit.txt"; exit 0; }
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+          timeout 3600 make -j"$(nproc)" tools/install V=s > "$OUT/tools.log" 2>&1
+          trc=$?
+          timeout 5400 make -j"$(nproc)" toolchain/install V=s > "$OUT/toolchain.log" 2>&1
+          crc=$?
+          echo "$trc" > "$OUT/tools-exit.txt"
+          echo "$crc" > "$OUT/toolchain-exit.txt"
+          if [ "$trc" -eq 0 ] && [ "$crc" -eq 0 ]; then rc=0; else rc=1; fi
+          echo "$rc" > "$OUT/bootstrap-exit.txt"
+          grep -nE '(^|[[:space:]])(error:|fatal error:|No rule to make target|Error [0-9]+)' "$OUT/tools.log" "$OUT/toolchain.log" \
+            | tail -n 300 > "$OUT/bootstrap-errors.txt" || true
+          exit 0
+
+      - name: Build Linux 6.6 kernel and SBE1V1K DTB
+        id: kernel
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          O="$GITHUB_WORKSPACE/stage4-work/openwrt"
+          OUT="$GITHUB_WORKSPACE/stage4-results/kernel"
+          cd "$O" || { echo 90 > "$OUT/kernel-exit.txt"; exit 0; }
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+          timeout 5400 make -j"$(nproc)" target/linux/compile V=s > "$OUT/kernel-build.log" 2>&1
+          rc=$?
+          echo "$rc" > "$OUT/kernel-exit.txt"
+          grep -nE '(^|[[:space:]])(error:|fatal error:|undefined reference|No rule to make target|Error [0-9]+)' \
+            "$OUT/kernel-build.log" | tail -n 500 > "$OUT/kernel-errors.txt" || true
+          tail -n 500 "$OUT/kernel-build.log" > "$OUT/kernel-tail.txt" 2>/dev/null || true
+
+          find build_dir -type f \( -name 'ipq9574-sbe1v1k.dtb' -o -name '*sbe1v1k*.dtb' \) \
+            -printf '%p\t%s bytes\n' 2>/dev/null | sort > "$OUT/sbe1v1k-dtb.txt" || true
+          dtb_count=$(wc -l < "$OUT/sbe1v1k-dtb.txt" 2>/dev/null || echo 0)
+          echo "$dtb_count" > "$OUT/sbe1v1k-dtb-count.txt"
+
+          # Decompile the first built DTB to catch obvious missing nodes/properties early.
+          first_dtb=$(awk 'NR==1{print $1}' "$OUT/sbe1v1k-dtb.txt")
+          if [ -n "$first_dtb" ] && [ -f "$first_dtb" ]; then
+            dtc -I dtb -O dts -o "$OUT/sbe1v1k-built.dts" "$first_dtb" 2>"$OUT/dtc-decompile.err" || true
+            grep -nE 'model =|compatible =|ethernet-ports|wifi@|rtl826|qca8075|qca8081|mmc|reserved-memory' \
+              "$OUT/sbe1v1k-built.dts" > "$OUT/sbe1v1k-built-keynodes.txt" 2>/dev/null || true
+          fi
+          exit 0
+
+      - name: Cascade-build QSDK acceleration packages
+        id: packages
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          O="$GITHUB_WORKSPACE/stage4-work/openwrt"
+          OUT="$GITHUB_WORKSPACE/stage4-results/packages"
+          cd "$O" || { echo 90 > "$OUT/package-batch-exit.txt"; exit 0; }
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+          : > "$OUT/package-candidates.tsv"
+          : > "$OUT/package-build-status.tsv"
+
+          discover_group() {
+            local group="$1" regex="$2"
+            find -L package/feeds package -type f -name Makefile 2>/dev/null | while read -r mf; do
+              if grep -qiE "$regex" "$mf"; then
+                dir="${mf%/Makefile}"
+                echo -e "$group\t$dir" >> "$OUT/package-candidates.tsv"
+              fi
+            done
+          }
+          discover_group ssdk 'KernelPackage/(qca-)?ssdk|PKG_NAME.*ssdk'
+          discover_group phy 'KernelPackage/qca-nss-phy|PKG_NAME.*qca-nss-phy'
+          discover_group nss_dp 'KernelPackage/.*nss.*dp|PKG_NAME.*nss-dp'
+          discover_group ppe 'KernelPackage/qca-nss-ppe|PKG_NAME.*nss-ppe'
+          discover_group netfn 'KernelPackage/.*netfn|PKG_NAME.*netfn|flowmgr'
+          discover_group ecm 'KernelPackage/.*ecm|PKG_NAME.*ecm'
+          discover_group rtl 'rtl826x-firmware|rtl8261n'
+          awk '!seen[$0]++' "$OUT/package-candidates.tsv" > "$OUT/package-candidates.unique.tsv"
+          mv "$OUT/package-candidates.unique.tsv" "$OUT/package-candidates.tsv"
+
+          overall=0
+          for group in ssdk phy nss_dp ppe netfn ecm rtl; do
+            while IFS=$'\t' read -r g dir; do
+              [ "$g" = "$group" ] || continue
+              rel="${dir#./}"
+              log="$OUT/build-${group}-$(basename "$dir").log"
+              echo "===== BUILD $group :: $rel =====" | tee "$log"
+              timeout 3600 make -j"$(nproc)" "$rel/compile" V=s >> "$log" 2>&1
+              brc=$?
+              echo -e "$group\t$rel\t$brc" | tee -a "$OUT/package-build-status.tsv"
+              grep -nE '(^|[[:space:]])(error:|fatal error:|undefined reference|undefined!|No rule to make target|Error [0-9]+)' \
+                "$log" | tail -n 250 > "$log.errors" || true
+              [ "$brc" -ne 0 ] && overall=1
+            done < "$OUT/package-candidates.tsv"
+          done
+
+          find build_dir -type f -name '*.ko' -printf '%p\t%s bytes\n' 2>/dev/null | sort > "$OUT/all-built-kos.txt" || true
+          grep -Ei 'qca|nss|ppe|ssdk|netfn|ecm|rtl826' "$OUT/all-built-kos.txt" > "$OUT/relevant-built-kos.txt" || true
+          echo "$overall" > "$OUT/package-batch-exit.txt"
+          exit 0
+
+      - name: Discover missing NetFN FlowMgr ECM source/package paths
+        id: discovery
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          O="$GITHUB_WORKSPACE/stage4-work/openwrt"
+          F="$GITHUB_WORKSPACE/stage4-work/feed-ipq"
+          OUT="$GITHUB_WORKSPACE/stage4-results/discovery"
+
+          grep -RInEi 'netfn|flowmgr|qca-nss-ecm|(^|[^a-z])ecm([^a-z]|$)' "$F" "$O/package/feeds" 2>/dev/null \
+            | head -n 5000 > "$OUT/local-netfn-ecm-hits.txt" || true
+
+          : > "$OUT/remote-probes.tsv"
+          for url in \
+            https://git.codelinaro.org/clo/qsdk/oss/system/feeds/nss-clients.git \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ecm.git \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-netfn.git \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-netfn-flowmgr.git; do
+            git ls-remote "$url" > "$OUT/$(basename "$url" .git).ls-remote.txt" 2>&1
+            prc=$?
+            echo -e "$url\t$prc" >> "$OUT/remote-probes.tsv"
+          done
+          exit 0
+
+      - name: Attempt engineering image pipeline
+        id: image
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          O="$GITHUB_WORKSPACE/stage4-work/openwrt"
+          OUT="$GITHUB_WORKSPACE/stage4-results/image"
+          cd "$O" || { echo 90 > "$OUT/image-exit.txt"; exit 0; }
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+          # This is compile validation only. The board-config is still an engineering placeholder.
+          timeout 5400 make -j"$(nproc)" target/install V=s > "$OUT/target-install.log" 2>&1
+          rc=$?
+          echo "$rc" > "$OUT/image-exit.txt"
+          grep -nE '(^|[[:space:]])(error:|fatal error:|Traceback|No rule to make target|Error [0-9]+)' \
+            "$OUT/target-install.log" | tail -n 500 > "$OUT/image-errors.txt" || true
+          tail -n 500 "$OUT/target-install.log" > "$OUT/image-tail.txt" 2>/dev/null || true
+          find bin/targets/ipq95xx -type f -printf '%p\t%s bytes\n' 2>/dev/null | sort > "$OUT/bin-artifacts.txt" || true
+          exit 0
+
+      - name: Generate Stage 4 summary
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          R="$GITHUB_WORKSPACE/stage4-results"
+          val() { [ -f "$1" ] && cat "$1" || echo NOT_RUN; }
+          IRC="$(val "$R/integration/integration-exit.txt")"
+          TRC="$(val "$R/device/transplant-exit.txt")"
+          CRC="$(val "$R/config/config-exit.txt")"
+          BRC="$(val "$R/bootstrap/bootstrap-exit.txt")"
+          KRC="$(val "$R/kernel/kernel-exit.txt")"
+          DTC="$(val "$R/kernel/sbe1v1k-dtb-count.txt")"
+          PRC="$(val "$R/packages/package-batch-exit.txt")"
+          IMRC="$(val "$R/image/image-exit.txt")"
+          KOS="$(wc -l < "$R/packages/relevant-built-kos.txt" 2>/dev/null || echo 0)"
+
+          cat > "$R/stage4-summary.txt" <<EOF
+          SBE1V1K QSDK 6.6 Stage 4 - Device Transplant Cascade
+          ====================================================
+          openwrt_tag: $OPENWRT_TAG
+          feed_ipq_branch: $FEED_IPQ_BRANCH
+          kernel_target: IPQ95xx / Linux 6.6.47 / Cortex-A73
+          integration_exit: $IRC
+          transplant_exit: $TRC
+          config_exit: $CRC
+          bootstrap_exit: $BRC
+          kernel_exit: $KRC
+          sbe1v1k_dtb_count: $DTC
+          qca_package_batch_exit: $PRC
+          relevant_ko_count: $KOS
+          engineering_image_exit: $IMRC
+          
+          Stage 4 gates:
+          - Gate A: SBE1V1K DTS compiles into ipq9574-sbe1v1k.dtb.
+          - Gate B: SSDK -> PHY -> NSS-DP -> PPE remains green after device transplant.
+          - Gate C: identify NetFN / FlowMgr / ECM package/source path in the QSDK13 environment.
+          - Gate D: exercise target/install only to expose image-pipeline blockers early.
+          
+          SAFETY:
+          - DEVICE_DTS_CONFIG currently reuses config-rdp433-mht-phy as an engineering placeholder.
+          - Any Stage 4 image is NOT flashable and MUST NOT be flashed.
+          - RTL8261N runtime driver/firmware, Wi-Fi/caldata, MAC/partition/recovery and board-config parity still require validation.
+          EOF
+
+          echo "===== STAGE 4 SUMMARY ====="
+          cat "$R/stage4-summary.txt"
+          echo "===== DTB ====="
+          cat "$R/kernel/sbe1v1k-dtb.txt" 2>/dev/null || true
+          echo "===== PACKAGE STATUS ====="
+          cat "$R/packages/package-build-status.tsv" 2>/dev/null || true
+          echo "===== IMAGE ERRORS ====="
+          cat "$R/image/image-errors.txt" 2>/dev/null || true
+
+      - name: Pack Stage 4 diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          du -ah stage4-results | sort -h > stage4-results/size-summary.txt || true
+          tar -C stage4-results -czf SBE1V1K-QSDK-6.6-Stage4-results.tar.gz .
+          ls -lh SBE1V1K-QSDK-6.6-Stage4-results.tar.gz
+
+      - name: Upload Stage 4 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-QSDK-6.6-Stage4
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            stage4-results/
+            SBE1V1K-QSDK-6.6-Stage4-results.tar.gz
