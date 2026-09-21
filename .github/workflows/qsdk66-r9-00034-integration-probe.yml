@@ -1,0 +1,370 @@
+name: SBE1V1K QSDK66 r9-00034 Integration Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  QSDK_TAG: NHSS.QSDK.14.0.r9-00034-O
+  OPENWRT_COMMIT: 00d52ae93de98724af4ba89e2b9f19aa4a416f36
+  LINUX_IPQ_COMMIT: 16f31b0750888769b5418c1f32f2cd385b09972d
+  OPENWRT_IPQ_PATCHES_COMMIT: 7536c0abfa4a2e7dbf9fffa6644ff16152bfe3a6
+  PHY_COMMIT: 16eec6ac35820cb67af59223e8b4c2dba7179655
+
+jobs:
+  integration-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install minimal dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y git patch python3
+
+      - name: Clone exact r9-00034 sources
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euxo pipefail
+
+          rm -rf work results
+          mkdir -p work results/{baseline,patches,target,phy}
+
+          clone_tag() {
+            local name="$1" url="$2" expect="$3" dst="$4"
+
+            git clone --depth=1 --branch "$QSDK_TAG" "$url" "$dst"
+
+            actual="$(git -C "$dst" rev-parse HEAD)"
+
+            printf '%s\t%s\t%s\t%s\n' \
+              "$name" "$expect" "$actual" "$url" \
+              >> results/baseline/commits.tsv
+
+            test "$actual" = "$expect"
+          }
+
+          printf 'repository\texpected\tactual\turl\n' \
+            > results/baseline/commits.tsv
+
+          clone_tag \
+            openwrt_repo \
+            https://git.codelinaro.org/clo/qsdk/oss/system/openwrt_repo.git \
+            "$OPENWRT_COMMIT" \
+            work/openwrt
+
+          clone_tag \
+            openwrt-ipq-patches \
+            https://git.codelinaro.org/clo/qsdk/oss/system/openwrt-ipq-patches.git \
+            "$OPENWRT_IPQ_PATCHES_COMMIT" \
+            work/openwrt-ipq-patches
+
+          clone_tag \
+            linux-ipq-6.6 \
+            https://git.codelinaro.org/clo/qsdk/oss/kernel/linux-ipq-6.6.git \
+            "$LINUX_IPQ_COMMIT" \
+            work/linux-ipq-6.6
+
+          clone_tag \
+            qca-nss-phy \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-nss-phy.git \
+            "$PHY_COMMIT" \
+            work/qca-nss-phy
+
+      - name: Inventory base OpenWrt before QSDK patches
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          O="$GITHUB_WORKSPACE/work/openwrt"
+
+          find "$O/target/linux" \
+            -mindepth 1 -maxdepth 2 -type d \
+            | sed "s#^$O/##" \
+            | sort \
+            > results/target/before-target-dirs.txt
+
+          {
+            echo "ipq95xx=$(test -d "$O/target/linux/ipq95xx" && echo yes || echo no)"
+            echo "qualcommbe=$(test -d "$O/target/linux/qualcommbe" && echo yes || echo no)"
+          } > results/target/before-status.txt
+
+      - name: Inventory exact QSDK OpenWrt patch stack
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          P="$GITHUB_WORKSPACE/work/openwrt-ipq-patches"
+
+          find "$P" -type f -name '*.patch' -print \
+            | sort -V \
+            > results/patches/all-patches.txt
+
+          count="$(wc -l < results/patches/all-patches.txt)"
+          echo "$count" > results/patches/patch-count.txt
+          test "$count" -gt 0
+
+          while IFS= read -r p; do
+            printf '%s\t%s\n' \
+              "$(sha256sum "$p" | awk '{print $1}')" \
+              "${p#$P/}"
+          done < results/patches/all-patches.txt \
+            > results/patches/SHA256SUMS.tsv
+
+          grep -RIlE \
+            'target/linux/ipq95xx|target/linux/qualcommbe|ipq9574|linux-ipq-6\.6|6\.6\.116|KERNEL_PATCHVER' \
+            "$P" --include='*.patch' \
+            | sed "s#^$P/##" \
+            | sort \
+            > results/patches/relevant-patches.txt || true
+
+      - name: Apply exact QSDK OpenWrt IPQ patch stack
+        id: apply
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          O="$GITHUB_WORKSPACE/work/openwrt"
+          P="$GITHUB_WORKSPACE/work/openwrt-ipq-patches"
+
+          : > results/patches/apply-status.tsv
+
+          index=0
+
+          while IFS= read -r patchfile; do
+            index=$((index + 1))
+            rel="${patchfile#$P/}"
+
+            echo
+            echo "===== [$index] $rel ====="
+
+            if git -C "$O" apply --check "$patchfile" \
+                 >results/patches/check.log 2>&1
+            then
+              git -C "$O" apply --whitespace=nowarn "$patchfile"
+              printf '%s\tAPPLIED_GIT\t0\n' "$rel" \
+                >> results/patches/apply-status.tsv
+              continue
+            fi
+
+            if (
+              cd "$O"
+              patch --dry-run -p1 --forward --batch < "$patchfile"
+            ) >results/patches/patch-dryrun.log 2>&1
+            then
+              (
+                cd "$O"
+                patch -p1 --forward --batch < "$patchfile"
+              )
+              printf '%s\tAPPLIED_PATCH\t0\n' "$rel" \
+                >> results/patches/apply-status.tsv
+              continue
+            fi
+
+            printf '%s\tFAILED\t1\n' "$rel" \
+              >> results/patches/apply-status.tsv
+
+            {
+              echo "failed_index=$index"
+              echo "failed_patch=$rel"
+              echo
+              echo "===== git apply --check ====="
+              cat results/patches/check.log 2>/dev/null || true
+              echo
+              echo "===== patch --dry-run ====="
+              cat results/patches/patch-dryrun.log 2>/dev/null || true
+            } > results/patches/FIRST-FAILURE.txt
+
+            exit 41
+          done < results/patches/all-patches.txt
+
+          git -C "$O" status --short \
+            > results/patches/openwrt-status-after.txt
+
+      - name: Inspect resulting IPQ target
+        id: target
+        if: steps.apply.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          O="$GITHUB_WORKSPACE/work/openwrt"
+
+          find "$O/target/linux" \
+            -mindepth 1 -maxdepth 3 -type d \
+            | sed "s#^$O/##" \
+            | sort \
+            > results/target/after-target-dirs.txt
+
+          TARGET_PATH=""
+
+          if [ -d "$O/target/linux/ipq95xx" ]; then
+            TARGET_PATH="$O/target/linux/ipq95xx"
+            echo "layout=ipq95xx" > results/target/layout.txt
+
+          elif [ -d "$O/target/linux/qualcommbe" ]; then
+            TARGET_PATH="$O/target/linux/qualcommbe"
+            echo "layout=qualcommbe" > results/target/layout.txt
+
+          else
+            echo "layout=NOT_FOUND" > results/target/layout.txt
+            exit 42
+          fi
+
+          echo "target_path=$TARGET_PATH" \
+            >> results/target/layout.txt
+
+          {
+            echo "===== TARGET MAKEFILES ====="
+
+            find "$TARGET_PATH" \
+              -maxdepth 3 -type f \
+              \( -name Makefile -o -name target.mk -o -name '*.mk' \) \
+              -print \
+              | sort
+
+            echo
+            echo "===== KERNEL VERSION REFERENCES ====="
+
+            grep -RInE \
+              'KERNEL_PATCHVER|KERNEL_TESTING_PATCHVER|6\.6\.116|LINUX_VERSION|linux-ipq-6\.6|KERNEL_GIT|KERNEL_SOURCE' \
+              "$TARGET_PATH" "$O/include" \
+              2>/dev/null | head -n 3000 || true
+
+            echo
+            echo "===== IPQ95XX / IPQ9574 REFERENCES ====="
+
+            grep -RInEi \
+              'ipq95xx|ipq9574|rdp433' \
+              "$TARGET_PATH" \
+              2>/dev/null | head -n 3000 || true
+
+          } > results/target/target-inspection.txt
+
+          while IFS= read -r f; do
+            {
+              echo
+              echo "=================================================="
+              echo "$f"
+              echo "=================================================="
+              sed -n '1,260p' "$f"
+            } >> results/target/build-files.txt
+          done < <(
+            find "$TARGET_PATH" \
+              -maxdepth 3 -type f \
+              \( -name Makefile -o -name target.mk -o -name '*.mk' \) \
+              | sort
+          )
+
+      - name: Inspect genuine qca-nss-phy Kbuild layout
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          PHY="$GITHUB_WORKSPACE/work/qca-nss-phy"
+
+          test -f "$PHY/linux_std/clock/qca8k_clk.c"
+          test -f "$PHY/linux_std/qca8084/qca8084.c"
+
+          find "$PHY" \
+            -type f \
+            \( -name Makefile -o -name Kbuild -o -name '*.mk' \) \
+            | sort \
+            > results/phy/build-files-list.txt
+
+          while IFS= read -r f; do
+            {
+              echo
+              echo "=================================================="
+              echo "${f#$PHY/}"
+              echo "=================================================="
+              sed -n '1,320p' "$f"
+            } >> results/phy/build-files-full.txt
+          done < results/phy/build-files-list.txt
+
+          grep -RInE \
+            'qca8k[-_]cc|qca8k_clk|qca8084[-_]phy|qca8084_phy|qca8084\.o|qca[-_]nss[-_]phy|qcom_phy_pcs_' \
+            "$PHY" \
+            --include=Makefile --include=Kbuild --include='*.mk' \
+            --include='*.c' --include='*.h' \
+            > results/phy/relevant-lines.txt || true
+
+          {
+            echo "===== qca8k clock Makefile ====="
+            sed -n '1,320p' "$PHY/linux_std/clock/Makefile" 2>/dev/null || true
+
+            echo
+            echo "===== qca8084 Makefile ====="
+            sed -n '1,320p' "$PHY/linux_std/qca8084/Makefile" 2>/dev/null || true
+
+            echo
+            echo "===== linux_std Makefile ====="
+            sed -n '1,420p' "$PHY/linux_std/Makefile" 2>/dev/null || true
+
+            echo
+            echo "===== root Makefile ====="
+            sed -n '1,420p' "$PHY/Makefile" 2>/dev/null || true
+
+          } > results/phy/key-makefiles.txt
+
+      - name: Final probe summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "QSDK66 r9-00034 Integration Probe"
+            echo "================================="
+            echo "apply=${{ steps.apply.outcome }}"
+            echo "target=${{ steps.target.outcome }}"
+            echo
+
+            echo "===== BASELINE ====="
+            cat results/baseline/commits.tsv 2>/dev/null || true
+
+            echo
+            echo "===== TARGET BEFORE ====="
+            cat results/target/before-status.txt 2>/dev/null || true
+
+            echo
+            echo "===== PATCH COUNT ====="
+            cat results/patches/patch-count.txt 2>/dev/null || true
+
+            echo
+            echo "===== TARGET LAYOUT AFTER ====="
+            cat results/target/layout.txt 2>/dev/null || true
+
+            echo
+            echo "===== FIRST PATCH FAILURE ====="
+            cat results/patches/FIRST-FAILURE.txt 2>/dev/null || true
+          } | tee results/PROBE-SUMMARY.txt
+
+      - name: Upload integration probe
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-QSDK66-r9-00034-Integration-Probe
+          path: results/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Require successful QSDK target integration
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.apply.outcome }}" = "success"
+          test "${{ steps.target.outcome }}" = "success"
+          test -s results/target/layout.txt
+          ! grep -q 'layout=NOT_FOUND' results/target/layout.txt
+          echo "QSDK OPENWRT TARGET INTEGRATION PASS"
