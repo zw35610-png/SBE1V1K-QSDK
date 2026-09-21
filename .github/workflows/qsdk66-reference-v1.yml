@@ -1,0 +1,995 @@
+name: SBE1V1K QSDK66 Reference v1 - r9-00034 Core Modules
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  QSDK_TAG: NHSS.QSDK.14.0.r9-00034-O
+
+  OPENWRT_COMMIT: 00d52ae93de98724af4ba89e2b9f19aa4a416f36
+  LINUX_IPQ_COMMIT: 16f31b0750888769b5418c1f32f2cd385b09972d
+  OPENWRT_IPQ_PATCHES_COMMIT: 7536c0abfa4a2e7dbf9fffa6644ff16152bfe3a6
+  QSDK_CONFIG_COMMIT: 190a2e4176da8b981e465c9c5b65e7846c0c041a
+  NSS_PROFILES_COMMIT: b3f18478d2dda01afbfcab17958fcd3db7f6e2d6
+
+  PHY_COMMIT: 16eec6ac35820cb67af59223e8b4c2dba7179655
+  SSDK_COMMIT: 717b74016b0c131575bcd81b9e039d3f7974b02a
+  PPE_COMMIT: 87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+  DP_PREFIX: 22555a9
+
+  DEVICE_COMMIT: 02fb9517c9aefac9f3825a15ae46e7998bae7edd
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+jobs:
+  reference-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Free runner disk
+        shell: bash
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3 python3-setuptools \
+            rsync swig unzip zlib1g-dev file wget curl xsltproc libxml-parser-perl \
+            python3-dev time jq patch quilt ccache zstd libelf-dev bc \
+            device-tree-compiler kmod
+
+      - name: Initialize workspace
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf reference-work results qsdk-src qsdk-include
+          mkdir -p \
+            reference-work \
+            results/{baseline,kernel,phy,ssdk,nss-debug,ppe,nss-dp,modules,device} \
+            qsdk-src qsdk-include
+
+          {
+            echo "qsdk_tag=$QSDK_TAG"
+            echo "purpose=compile core modules only; no flashable image"
+            echo "runner=$(uname -a)"
+            echo "date_utc=$(date -u +%FT%TZ)"
+          } > results/run-info.txt
+
+      - name: Clone exact QSDK r9-00034 baseline
+        id: baseline
+        continue-on-error: true
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euxo pipefail
+
+          clone_tag() {
+            local name="$1" url="$2" expect="$3" dst="$4"
+
+            rm -rf "$dst"
+            git clone --depth=1 --branch "$QSDK_TAG" "$url" "$dst"
+
+            actual="$(git -C "$dst" rev-parse HEAD)"
+            printf '%s\t%s\t%s\t%s\n' "$name" "$expect" "$actual" "$url" \
+              >> results/baseline/commits.tsv
+
+            test "$actual" = "$expect"
+          }
+
+          printf 'repository\texpected\tactual\turl\n' > results/baseline/commits.tsv
+
+          clone_tag \
+            openwrt_repo \
+            https://git.codelinaro.org/clo/qsdk/oss/system/openwrt_repo.git \
+            "$OPENWRT_COMMIT" \
+            reference-work/openwrt
+
+          clone_tag \
+            linux-ipq-6.6 \
+            https://git.codelinaro.org/clo/qsdk/oss/kernel/linux-ipq-6.6.git \
+            "$LINUX_IPQ_COMMIT" \
+            reference-work/linux-ipq-6.6
+
+          clone_tag \
+            openwrt-ipq-patches \
+            https://git.codelinaro.org/clo/qsdk/oss/system/openwrt-ipq-patches.git \
+            "$OPENWRT_IPQ_PATCHES_COMMIT" \
+            reference-work/openwrt-ipq-patches
+
+          clone_tag \
+            qsdk-config \
+            https://git.codelinaro.org/clo/qsdk/oss/releases/configs/qsdk.git \
+            "$QSDK_CONFIG_COMMIT" \
+            reference-work/qsdk-config
+
+          clone_tag \
+            nss-profiles \
+            https://git.codelinaro.org/clo/qsdk/oss/system/feeds/nss-profiles.git \
+            "$NSS_PROFILES_COMMIT" \
+            reference-work/nss-profiles
+
+      - name: Clone exact NSS core sources from same release
+        id: sources
+        if: steps.baseline.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euxo pipefail
+
+          clone_component() {
+            local name="$1" url="$2" dst="$3"
+            rm -rf "$dst"
+            git clone --depth=1 --branch "$QSDK_TAG" "$url" "$dst"
+            git -C "$dst" rev-parse HEAD
+          }
+
+          phy_actual="$(
+            clone_component qca-nss-phy \
+              https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-nss-phy.git \
+              qsdk-src/qca-nss-phy | tail -n1
+          )"
+          test "$phy_actual" = "$PHY_COMMIT"
+
+          ssdk_actual="$(
+            clone_component qca-ssdk \
+              https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-ssdk.git \
+              qsdk-src/qca-ssdk | tail -n1
+          )"
+          test "$ssdk_actual" = "$SSDK_COMMIT"
+
+          ppe_actual="$(
+            clone_component qca-nss-ppe \
+              https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe.git \
+              qsdk-src/qca-nss-ppe | tail -n1
+          )"
+          test "$ppe_actual" = "$PPE_COMMIT"
+
+          dp_actual="$(
+            clone_component qca-nss-dp \
+              https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-dp.git \
+              qsdk-src/qca-nss-dp | tail -n1
+          )"
+          [[ "$dp_actual" == "$DP_PREFIX"* ]]
+
+          {
+            echo "PHY=$phy_actual"
+            echo "SSDK=$ssdk_actual"
+            echo "PPE=$ppe_actual"
+            echo "DP=$dp_actual"
+          } | tee results/baseline/nss-core-commits.txt
+
+      - name: Fetch SBE1V1K device source for audit only
+        id: device
+        if: steps.baseline.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          D=reference-work/sbe1v1k
+          rm -rf "$D"
+          git init -q "$D"
+          git -C "$D" remote add origin https://github.com/luckkyboy/SBE1V1K.git
+          git -C "$D" fetch --depth=1 origin "$DEVICE_COMMIT"
+          git -C "$D" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$D" rev-parse HEAD)" = "$DEVICE_COMMIT"
+
+          SRC_DTS="$D/target/linux/qualcommbe/dts/ipq9570-sbe1v1k.dts"
+          test -f "$SRC_DTS"
+
+          cp "$SRC_DTS" results/device/ipq9570-sbe1v1k.dts
+          sha256sum "$SRC_DTS" > results/device/dts.sha256
+
+          find "$D" -type f \
+            | grep -Ei 'sbe1v1k|rtl8261|rtl826x' \
+            | sed "s#^$D/##" \
+            | sort \
+            > results/device/relevant-files.txt || true
+
+          # Reference v1 intentionally does NOT create a flash image and does
+          # NOT inject the old placeholder board-config/image recipe.
+
+      - name: Audit exact baseline before compiling
+        id: preflight
+        if: steps.baseline.outcome == 'success' && steps.sources.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          O="$GITHUB_WORKSPACE/reference-work/openwrt"
+          P="$GITHUB_WORKSPACE/reference-work/openwrt-ipq-patches"
+          C="$GITHUB_WORKSPACE/reference-work/qsdk-config"
+          L="$GITHUB_WORKSPACE/reference-work/linux-ipq-6.6"
+          PHY="$GITHUB_WORKSPACE/qsdk-src/qca-nss-phy"
+
+          test "$(git -C "$O" rev-parse HEAD)" = "$OPENWRT_COMMIT"
+          test "$(git -C "$L" rev-parse HEAD)" = "$LINUX_IPQ_COMMIT"
+          test -d "$O/target/linux/ipq95xx"
+
+          {
+            echo "===== OPENWRT TARGET ====="
+            sed -n '1,220p' "$O/target/linux/ipq95xx/Makefile" 2>/dev/null || true
+            echo
+            echo "===== IPQ95XX FILE TREE ====="
+            find "$O/target/linux/ipq95xx" -maxdepth 3 -type f | sort | head -n 1000
+            echo
+            echo "===== KERNEL 6.6 REFERENCES ====="
+            grep -RInE '6\.6\.116|KERNEL_PATCHVER|KERNEL_TESTING_PATCHVER|LINUX_VERSION' \
+              "$O/target/linux/ipq95xx" "$O/include" 2>/dev/null | head -n 1500 || true
+          } > results/baseline/openwrt-target.txt
+
+          {
+            echo "===== EXACT LINUX COMMIT REFERENCES ====="
+            grep -RIn "$LINUX_IPQ_COMMIT" "$O" "$P" "$C" 2>/dev/null || true
+            grep -RIn "${LINUX_IPQ_COMMIT:0:12}" "$O" "$P" "$C" 2>/dev/null || true
+            echo
+            echo "===== QSDK CONFIG IPQ95XX ====="
+            find "$C" -type f | grep -Ei 'ipq95|9574|qsdk' | head -n 1000 || true
+            echo
+            grep -RInEi 'ipq95xx|ipq9574|linux-ipq-6\.6' "$C" "$P" 2>/dev/null \
+              | head -n 3000 || true
+          } > results/baseline/release-binding.txt
+
+          test -f "$PHY/linux_std/clock/qca8k_clk.c"
+          test -f "$PHY/linux_std/qca8084/qca8084.c"
+
+          {
+            echo "===== PHY BUILD FILES ====="
+            find "$PHY/linux_std" -maxdepth 3 -type f \
+              \( -name Makefile -o -name Kbuild -o -name '*.mk' \) \
+              -print -exec sh -c 'echo "--- $1"; sed -n "1,220p" "$1"' _ {} \;
+          } > results/phy/build-files.txt
+
+          grep -RInE \
+            'qca8k-cc|qca8k_cc|qca8084-phy|qca8084_phy|qca-nss-phy|qca_nss_phy' \
+            "$PHY" --include=Makefile --include=Kbuild --include='*.mk' \
+            > results/phy/module-build-entries.txt || true
+
+          # Genuine qca8084 source is mandatory. No qcom_phy_lib bridge modules.
+          grep -RInE \
+            'qcom_phy_pcs_(interface_set|mode_check|speed_clock_set)' \
+            "$PHY/linux_std/qca8084" "$PHY/linux_std" \
+            --include='*.c' --include='*.h' \
+            > results/phy/qcom-pcs-sites.txt || true
+
+      - name: Configure exact OpenWrt ipq95xx generic kernel
+        id: configure
+        if: steps.preflight.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          O="$GITHUB_WORKSPACE/reference-work/openwrt"
+          cd "$O"
+
+          cat > .config <<'EOF'
+          CONFIG_TARGET_ipq95xx=y
+          CONFIG_TARGET_ipq95xx_generic=y
+          CONFIG_DEVEL=y
+          CONFIG_BUILD_LOG=y
+          CONFIG_CCACHE=y
+          CONFIG_PACKAGE_kmod-nat46=y
+          EOF
+
+          make defconfig V=s 2>&1 | tee "$GITHUB_WORKSPACE/results/kernel/defconfig.log"
+
+          grep -q '^CONFIG_TARGET_ipq95xx=y' .config
+          grep -q '^CONFIG_TARGET_ipq95xx_generic=y' .config
+
+          cp .config "$GITHUB_WORKSPACE/results/kernel/openwrt.config"
+
+          grep -E \
+            '^(CONFIG_TARGET_|CONFIG_GCC_VERSION|CONFIG_PACKAGE_kmod-nat46)' \
+            .config \
+            > "$GITHUB_WORKSPACE/results/kernel/selected-config.txt" || true
+
+      - name: Cache OpenWrt downloads
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: reference-work/openwrt/dl
+          key: qsdk66-r9-00034-dl-${{ runner.os }}-${{ env.OPENWRT_COMMIT }}
+          restore-keys: |
+            qsdk66-r9-00034-dl-${{ runner.os }}-
+
+      - name: Download selected sources
+        id: download
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cd reference-work/openwrt
+          make -j"$(nproc)" download V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/kernel/download.log"
+
+      - name: Build tools toolchain and Linux 6.6 kernel
+        id: kernel_build
+        if: steps.configure.outcome == 'success' && (steps.download.outcome == 'success' || steps.download.outcome == 'failure')
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd reference-work/openwrt
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+          make -j"$(nproc)" tools/install V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/kernel/tools.log"
+
+          make -j"$(nproc)" toolchain/install V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/kernel/toolchain.log"
+
+          make -j"$(nproc)" target/linux/compile V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/kernel/kernel-compile.log"
+
+      - name: Locate and verify exact kernel build environment
+        id: kernel_env
+        if: steps.kernel_build.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          O="$GITHUB_WORKSPACE/reference-work/openwrt"
+
+          mapfile -t symvers < <(
+            find "$O/build_dir" -type f -name Module.symvers \
+              -path '*linux*6.6.116*' -print 2>/dev/null | sort
+          )
+
+          printf '%s\n' "${symvers[@]}" > results/kernel/kernel-symvers-candidates.txt
+          test "${#symvers[@]}" -ge 1
+
+          KERNEL_DIR=""
+          for s in "${symvers[@]}"; do
+            d="$(dirname "$s")"
+            if [[ "$d" == *ipq95xx* ]]; then
+              KERNEL_DIR="$d"
+              break
+            fi
+          done
+
+          if [ -z "$KERNEL_DIR" ]; then
+            KERNEL_DIR="$(dirname "${symvers[0]}")"
+          fi
+
+          test -s "$KERNEL_DIR/Module.symvers"
+          test -f "$KERNEL_DIR/include/generated/utsrelease.h"
+          grep -Eq '"6\.6\.116(\+|[^0-9]|$)' \
+            "$KERNEL_DIR/include/generated/utsrelease.h"
+
+          mapfile -t gccs < <(
+            find -L "$O/staging_dir" \
+              -type f -path '*/toolchain-aarch64*/bin/aarch64-openwrt-linux-musl-gcc' \
+              -print 2>/dev/null | sort
+          )
+
+          printf '%s\n' "${gccs[@]}" > results/kernel/compiler-candidates.txt
+          test "${#gccs[@]}" -ge 1
+
+          GCC="${gccs[0]}"
+          TOOLCHAIN_DIR="$(dirname "$(dirname "$GCC")")"
+          CROSS_COMPILE="${GCC%gcc}"
+
+          test -x "$GCC"
+
+          KVER="$(make -s -C "$KERNEL_DIR" kernelversion)"
+          KREL="$(make -s -C "$KERNEL_DIR" kernelrelease)"
+
+          {
+            echo "KERNEL_DIR=$KERNEL_DIR"
+            echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR"
+            echo "GCC=$GCC"
+            echo "CROSS_COMPILE=$CROSS_COMPILE"
+            echo "KVER=$KVER"
+            echo "KREL=$KREL"
+          } | tee results/environment.txt
+
+          "$GCC" --version | tee results/kernel/compiler-version.txt
+          cat "$KERNEL_DIR/include/generated/utsrelease.h" \
+            | tee results/kernel/utsrelease.txt
+
+          # Match the known-good firmware baseline as tightly as possible.
+          test "$KVER" = "6.6.116"
+          "$GCC" -dumpfullversion | tee results/kernel/gcc-full-version.txt
+
+      - name: Export real qca-nss-phy headers
+        id: phy_headers
+        if: steps.kernel_env.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          PHY="$GITHUB_WORKSPACE/qsdk-src/qca-nss-phy"
+          DEST="$GITHUB_WORKSPACE/qsdk-include/qca-nss-phy"
+
+          mkdir -p "$DEST"
+
+          cp "$PHY"/nss_ext/*.h "$DEST"/
+          cp "$PHY/linux_std/qcom_phy_lib.h" "$DEST"/
+          cp "$PHY/linux_std/clock/qca8k_clk.h" "$DEST"/
+          cp "$PHY/linux_std/mdio_ahb/mdio-ahb.h" "$DEST"/
+
+          find "$DEST" -type f -maxdepth 1 -printf '%f\n' \
+            | sort > results/phy/exported-headers.txt
+
+      - name: Build genuine qca8k-cc
+        id: qca8k
+        if: steps.phy_headers.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source results/environment.txt
+
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          export STAGING_DIR="$GITHUB_WORKSPACE/reference-work/openwrt/staging_dir"
+
+          PHY="$GITHUB_WORKSPACE/qsdk-src/qca-nss-phy"
+          CLOCK="$PHY/linux_std/clock"
+
+          test -f "$CLOCK/Makefile"
+          test -f "$CLOCK/qca8k_clk.c"
+
+          make -C "$KERNEL_DIR" \
+            M="$CLOCK" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            KCFLAGS="-I$PHY/linux_std/clock -I$PHY/linux_std -I$PHY/nss_ext -I$GITHUB_WORKSPACE/qsdk-include" \
+            -j"$(nproc)" modules V=1 \
+            2>&1 | tee results/phy/qca8k-build.log
+
+          test -s "$CLOCK/Module.symvers"
+
+          QCA8K_KO="$(
+            find "$CLOCK" -maxdepth 1 -type f \
+              \( -name 'qca8k-cc.ko' -o -name 'qca8k_cc.ko' \) \
+              -print -quit
+          )"
+          test -n "$QCA8K_KO"
+          test -s "$QCA8K_KO"
+
+          modinfo "$QCA8K_KO" | tee results/phy/qca8k-modinfo.txt
+          cp "$CLOCK/Module.symvers" results/phy/qca8k-Module.symvers
+          cp "$QCA8K_KO" results/modules/
+
+      - name: Build genuine qca8084-phy
+        id: qca8084
+        if: steps.qca8k.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source results/environment.txt
+
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          export STAGING_DIR="$GITHUB_WORKSPACE/reference-work/openwrt/staging_dir"
+
+          PHY="$GITHUB_WORKSPACE/qsdk-src/qca-nss-phy"
+          CLOCK="$PHY/linux_std/clock"
+          QCA8084="$PHY/linux_std/qca8084"
+
+          test -f "$QCA8084/Makefile"
+          test -f "$QCA8084/qca8084.c"
+          test -s "$CLOCK/Module.symvers"
+
+          make -C "$KERNEL_DIR" \
+            M="$QCA8084" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            KCFLAGS="-I$PHY/linux_std -I$PHY/linux_std/clock -I$PHY/linux_std/qca8084 -I$PHY/nss_ext -I$GITHUB_WORKSPACE/qsdk-include" \
+            KBUILD_EXTRA_SYMBOLS="$CLOCK/Module.symvers" \
+            -j"$(nproc)" modules V=1 \
+            2>&1 | tee results/phy/qca8084-build.log
+
+          test -s "$QCA8084/Module.symvers"
+
+          QCA8084_KO="$(
+            find "$QCA8084" -maxdepth 1 -type f \
+              \( -name 'qca8084-phy.ko' -o -name 'qca8084_phy.ko' \) \
+              -print -quit
+          )"
+          test -n "$QCA8084_KO"
+          test -s "$QCA8084_KO"
+
+          modinfo "$QCA8084_KO" | tee results/phy/qca8084-modinfo.txt
+
+          for s in \
+            qcom_phy_pcs_interface_set \
+            qcom_phy_pcs_mode_check \
+            qcom_phy_pcs_speed_clock_set
+          do
+            grep -qw "$s" "$QCA8084/Module.symvers"
+          done
+
+          cp "$QCA8084/Module.symvers" results/phy/qca8084-Module.symvers
+          cp "$QCA8084_KO" results/modules/
+
+      - name: Build genuine qca-nss-phy base module
+        id: nss_phy
+        if: steps.qca8084.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source results/environment.txt
+
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          export STAGING_DIR="$GITHUB_WORKSPACE/reference-work/openwrt/staging_dir"
+
+          PHY="$GITHUB_WORKSPACE/qsdk-src/qca-nss-phy"
+          CLOCK_SYM="$PHY/linux_std/clock/Module.symvers"
+          QCA8084_SYM="$PHY/linux_std/qca8084/Module.symvers"
+
+          mapfile -t entries < <(
+            grep -RIlE \
+              'qca[-_]nss[-_]phy(\.o|-objs|_objs)|qca-nss-phy\.ko' \
+              "$PHY" \
+              --include=Makefile --include=Kbuild --include='*.mk' 2>/dev/null \
+              | sort -u
+          )
+
+          printf '%s\n' "${entries[@]}" > results/phy/nss-phy-build-entry-candidates.txt
+          test "${#entries[@]}" -ge 1
+
+          BUILD_DIR="$(dirname "${entries[0]}")"
+
+          echo "$BUILD_DIR" > results/phy/nss-phy-build-dir.txt
+
+          make -C "$KERNEL_DIR" \
+            M="$BUILD_DIR" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            KCFLAGS="-I$PHY/linux_std -I$PHY/linux_std/clock -I$PHY/nss_ext -I$GITHUB_WORKSPACE/qsdk-include" \
+            KBUILD_EXTRA_SYMBOLS="$CLOCK_SYM $QCA8084_SYM" \
+            -j"$(nproc)" modules V=1 \
+            2>&1 | tee results/phy/nss-phy-build.log
+
+          NSSPHY_KO="$(
+            find "$PHY" -type f \
+              \( -name 'qca-nss-phy.ko' -o -name 'qca_nss_phy.ko' \) \
+              -print -quit
+          )"
+          test -n "$NSSPHY_KO"
+          test -s "$NSSPHY_KO"
+
+          NSSPHY_SYM="$(
+            find "$(dirname "$NSSPHY_KO")" -maxdepth 1 -type f -name Module.symvers \
+              -print -quit
+          )"
+          test -n "$NSSPHY_SYM"
+          test -s "$NSSPHY_SYM"
+
+          modinfo "$NSSPHY_KO" | tee results/phy/nss-phy-modinfo.txt
+          cp "$NSSPHY_SYM" results/phy/nss-phy-Module.symvers
+          cp "$NSSPHY_KO" results/modules/
+
+      - name: Validate exact PHY provider chain
+        id: phy_gate
+        if: steps.nss_phy.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat \
+            results/phy/qca8k-Module.symvers \
+            results/phy/qca8084-Module.symvers \
+            results/phy/nss-phy-Module.symvers \
+            | awk '!seen[$2]++' \
+            > results/phy/aggregate-Module.symvers
+
+          cat > results/phy/required-provider-symbols.txt <<'EOF'
+          qca8k_clk_assert
+          qca8k_clk_deassert
+          qca8k_clk_disable
+          qca8k_clk_enable
+          qca8k_clk_is_asserted
+          qca8k_clk_parent_set
+          qca8k_clk_rate_set
+          qca8k_clk_reset
+          qca8k_gcc_clock_init
+          qca8k_gcc_port_clk_parent_set
+          qca8k_port_clk_en_set
+          qca8k_port_clk_reset
+          qcom_phy_pcs_interface_set
+          qcom_phy_pcs_mode_check
+          qcom_phy_pcs_speed_clock_set
+          EOF
+
+          : > results/phy/missing-provider-symbols.txt
+
+          while read -r s; do
+            grep -qw "$s" results/phy/aggregate-Module.symvers \
+              || echo "$s" >> results/phy/missing-provider-symbols.txt
+          done < results/phy/required-provider-symbols.txt
+
+          test ! -s results/phy/missing-provider-symbols.txt
+
+          echo "15/15 provider symbols verified" \
+            > results/phy/PHY-GATE-PASS.txt
+
+      - name: Generate QSDK header include flags
+        id: headers
+        if: steps.phy_gate.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+          PPE="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe"
+
+          find "$SSDK" -type f -name '*.h' -printf '%h\n' \
+            | sort -u > results/ssdk/header-dirs.txt
+
+          : > results/qsdk-header-flags.txt
+          printf -- '-I%s ' "$GITHUB_WORKSPACE/qsdk-include" \
+            >> results/qsdk-header-flags.txt
+          printf -- '-I%s ' "$SSDK/include" \
+            >> results/qsdk-header-flags.txt
+
+          while IFS= read -r d; do
+            printf -- '-I%s ' "$d" >> results/qsdk-header-flags.txt
+          done < results/ssdk/header-dirs.txt
+
+          if [ -d "$PPE/nss_debug/exports" ]; then
+            printf -- '-I%s ' "$PPE/nss_debug/exports" \
+              >> results/qsdk-header-flags.txt
+          fi
+
+          echo >> results/qsdk-header-flags.txt
+
+      - name: Build exact SSDK g717b740 against real PHY providers
+        id: ssdk
+        if: steps.headers.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source results/environment.txt
+
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          export STAGING_DIR="$GITHUB_WORKSPACE/reference-work/openwrt/staging_dir"
+
+          SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+          MK="$SSDK/mk"
+          PHY_SYM="$GITHUB_WORKSPACE/results/phy/aggregate-Module.symvers"
+
+          test "$(git -C "$SSDK" rev-parse HEAD)" = "$SSDK_COMMIT"
+          test -f "$MK/Makefile"
+          test -s "$PHY_SYM"
+
+          FLAGS="$(cat results/qsdk-header-flags.txt)"
+
+          lnx_makeopts="ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE V=1 KBUILD_EXTRA_SYMBOLS=$PHY_SYM"
+
+          make -C "$MK" \
+            -j"$(nproc)" \
+            PRJ_PATH="$SSDK" \
+            MK_PATH="$MK" \
+            SYS_PATH="$KERNEL_DIR" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            TOOLPREFIX="$CROSS_COMPILE" \
+            TOOL_PATH="$TOOLCHAIN_DIR/bin" \
+            KVER="$KVER" \
+            TARGET_NAME=aarch64-openwrt-linux-musl \
+            TARGET_SUFFIX=musl \
+            GCC_VERSION="$("$GCC" -dumpfullversion)" \
+            SoC=ipq95xx \
+            CHIP_TYPE=APPE \
+            MODULE_TYPE=KSLIB \
+            MINI_SSDK=disable \
+            PTP_FEATURE=disable \
+            SWCONFIG_FEATURE=disable \
+            KCFLAGS="$FLAGS" \
+            LNX_MAKEOPTS="$lnx_makeopts" \
+            modules V=1 \
+            2>&1 | tee results/ssdk/compile.log
+
+          SSDK_KO="$SSDK/build/bin/qca-ssdk.ko"
+          test -s "$SSDK_KO"
+          test -s "$SSDK/Module.symvers"
+
+          modinfo "$SSDK_KO" | tee results/ssdk/modinfo.txt
+          cp "$SSDK/Module.symvers" results/ssdk/Module.symvers
+          cp "$SSDK_KO" results/modules/
+
+      - name: Build exact NSS debug
+        id: nss_debug
+        if: steps.ssdk.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source results/environment.txt
+
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+
+          PPE="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe"
+          DEBUG="$PPE/nss_debug"
+
+          test -d "$DEBUG"
+          test -f "$DEBUG/Makefile"
+
+          make -C "$KERNEL_DIR" \
+            M="$DEBUG" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            -j"$(nproc)" modules V=1 \
+            2>&1 | tee results/nss-debug/compile.log
+
+          test -s "$DEBUG/qca-nss-debug.ko"
+          test -s "$DEBUG/Module.symvers"
+
+          modinfo "$DEBUG/qca-nss-debug.ko" \
+            | tee results/nss-debug/modinfo.txt
+
+          cp "$DEBUG/Module.symvers" results/nss-debug/Module.symvers
+          cp "$DEBUG/qca-nss-debug.ko" results/modules/
+
+      - name: Build nat46 dependency if available
+        id: nat46
+        if: steps.nss_debug.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          O="$GITHUB_WORKSPACE/reference-work/openwrt"
+          cd "$O"
+
+          mapfile -t dirs < <(
+            find package feeds package/feeds -type f -name Makefile 2>/dev/null \
+              | while read -r mf; do
+                  grep -qiE 'KernelPackage/nat46|PKG_NAME.*nat46' "$mf" \
+                    && dirname "$mf"
+                done \
+              | sort -u
+          )
+
+          printf '%s\n' "${dirs[@]}" \
+            > "$GITHUB_WORKSPACE/results/ppe/nat46-package-candidates.txt"
+
+          if [ "${#dirs[@]}" -eq 0 ]; then
+            echo "No OpenWrt nat46 package found; PPE MODPOST will reveal whether kernel exports suffice." \
+              > "$GITHUB_WORKSPACE/results/ppe/nat46-status.txt"
+            exit 0
+          fi
+
+          rel="${dirs[0]#./}"
+
+          make -j"$(nproc)" "$rel/compile" V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/ppe/nat46-build.log"
+
+          find "$O/build_dir" -type f -name Module.symvers \
+            -path '*nat46*' -print \
+            > "$GITHUB_WORKSPACE/results/ppe/nat46-symvers-candidates.txt" || true
+
+      - name: Build exact PPE g87bb9b3
+        id: ppe
+        if: steps.nat46.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source results/environment.txt
+
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+
+          SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+          PPE_ROOT="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe"
+          DEBUG="$PPE_ROOT/nss_debug"
+          PPE="$PPE_ROOT/drv/ppe_drv"
+
+          test "$(git -C "$PPE_ROOT" rev-parse HEAD)" = "$PPE_COMMIT"
+          test -s "$SSDK/Module.symvers"
+          test -s "$DEBUG/Module.symvers"
+
+          extras=(
+            "$SSDK/Module.symvers"
+            "$DEBUG/Module.symvers"
+          )
+
+          while IFS= read -r f; do
+            [ -s "$f" ] && extras+=("$f")
+          done < results/ppe/nat46-symvers-candidates.txt 2>/dev/null || true
+
+          printf '%s\n' "${extras[@]}" > results/ppe/kbuild-extra-symbols.txt
+
+          FLAGS="$(cat results/qsdk-header-flags.txt)"
+
+          make -C "$KERNEL_DIR" \
+            M="$PPE" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            SoC=ipq95xx \
+            CONFIG_NET_DSA=y \
+            KCFLAGS="$FLAGS" \
+            KBUILD_EXTRA_SYMBOLS="${extras[*]}" \
+            -j"$(nproc)" modules V=1 \
+            2>&1 | tee results/ppe/compile.log
+
+          test -s "$PPE/qca-nss-ppe.ko"
+          test -s "$PPE/Module.symvers"
+
+          modinfo "$PPE/qca-nss-ppe.ko" | tee results/ppe/modinfo.txt
+          "$CROSS_COMPILE"nm -u "$PPE/qca-nss-ppe.ko" \
+            > results/ppe/nm-undefined.txt || true
+
+          cp "$PPE/Module.symvers" results/ppe/Module.symvers
+          cp "$PPE/qca-nss-ppe.ko" results/modules/
+
+      - name: Configure and build exact NSS-DP g22555a9
+        id: nss_dp
+        if: steps.ppe.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source results/environment.txt
+
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+
+          DP="$GITHUB_WORKSPACE/qsdk-src/qca-nss-dp"
+          SSDK="$GITHUB_WORKSPACE/qsdk-src/qca-ssdk"
+          PPE_ROOT="$GITHUB_WORKSPACE/qsdk-src/qca-nss-ppe"
+          PPE="$PPE_ROOT/drv/ppe_drv"
+          DEBUG="$PPE_ROOT/nss_debug"
+
+          [[ "$(git -C "$DP" rev-parse HEAD)" == "$DP_PREFIX"* ]]
+
+          ARCH_SRC="$DP/hal/soc_ops/ipq95xx/nss_ipq95xx.h"
+          ARCH_DST="$DP/exports/nss_dp_arch.h"
+
+          test -s "$ARCH_SRC"
+          cp -f "$ARCH_SRC" "$ARCH_DST"
+          cmp -s "$ARCH_SRC" "$ARCH_DST"
+
+          extras=(
+            "$SSDK/Module.symvers"
+            "$PPE/Module.symvers"
+            "$DEBUG/Module.symvers"
+          )
+
+          FLAGS="$(cat results/qsdk-header-flags.txt)"
+
+          for d in $(find "$PPE_ROOT" -type d -name exports -print 2>/dev/null); do
+            FLAGS="$FLAGS -I$d"
+          done
+
+          FLAGS="$FLAGS -I$DP/exports -I$DP/include -I$DP/hal/include -I$DP/hal/dp_ops/include -I$DP/hal/soc_ops/ipq95xx"
+
+          make -C "$KERNEL_DIR" \
+            M="$DP" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            SoC=ipq95xx \
+            CONFIG_NET_SWITCHDEV=y \
+            CONFIG_NET_DSA=y \
+            KCFLAGS="$FLAGS" \
+            KBUILD_EXTRA_SYMBOLS="${extras[*]}" \
+            -j"$(nproc)" modules V=1 \
+            2>&1 | tee results/nss-dp/compile.log
+
+          test -s "$DP/qca-nss-dp.ko"
+          test -s "$DP/Module.symvers"
+
+          modinfo "$DP/qca-nss-dp.ko" | tee results/nss-dp/modinfo.txt
+          "$CROSS_COMPILE"nm -u "$DP/qca-nss-dp.ko" \
+            > results/nss-dp/nm-undefined.txt || true
+
+          cp "$DP/Module.symvers" results/nss-dp/Module.symvers
+          cp "$DP/qca-nss-dp.ko" results/modules/
+
+      - name: Final module audit
+        id: audit
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "QSDK66 Reference v1"
+            echo "==================="
+            echo "tag=$QSDK_TAG"
+            echo "openwrt=$OPENWRT_COMMIT"
+            echo "linux_ipq=$LINUX_IPQ_COMMIT"
+            echo
+            echo "GitHub step outcomes:"
+            echo "baseline=${{ steps.baseline.outcome }}"
+            echo "sources=${{ steps.sources.outcome }}"
+            echo "preflight=${{ steps.preflight.outcome }}"
+            echo "configure=${{ steps.configure.outcome }}"
+            echo "kernel_build=${{ steps.kernel_build.outcome }}"
+            echo "kernel_env=${{ steps.kernel_env.outcome }}"
+            echo "qca8k=${{ steps.qca8k.outcome }}"
+            echo "qca8084=${{ steps.qca8084.outcome }}"
+            echo "nss_phy=${{ steps.nss_phy.outcome }}"
+            echo "phy_gate=${{ steps.phy_gate.outcome }}"
+            echo "ssdk=${{ steps.ssdk.outcome }}"
+            echo "nss_debug=${{ steps.nss_debug.outcome }}"
+            echo "nat46=${{ steps.nat46.outcome }}"
+            echo "ppe=${{ steps.ppe.outcome }}"
+            echo "nss_dp=${{ steps.nss_dp.outcome }}"
+            echo
+            echo "Built modules:"
+            find results/modules -maxdepth 1 -type f -name '*.ko' \
+              -printf '%f\t%s bytes\n' | sort
+          } | tee results/REFERENCE-V1-SUMMARY.txt
+
+          find results/modules -maxdepth 1 -type f -name '*.ko' \
+            -exec sha256sum {} \; \
+            > results/modules/SHA256SUMS.txt 2>/dev/null || true
+
+          for f in results/modules/*.ko; do
+            [ -f "$f" ] || continue
+            {
+              echo "===== $(basename "$f") ====="
+              modinfo "$f" 2>/dev/null || true
+              echo
+            } >> results/modules/MODINFO.txt
+          done
+
+      - name: Upload Reference v1 diagnostics and modules
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-QSDK66-Reference-v1
+          path: results/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Require complete core module chain
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "${{ steps.baseline.outcome }}" = "success"
+          test "${{ steps.sources.outcome }}" = "success"
+          test "${{ steps.preflight.outcome }}" = "success"
+          test "${{ steps.configure.outcome }}" = "success"
+          test "${{ steps.kernel_build.outcome }}" = "success"
+          test "${{ steps.kernel_env.outcome }}" = "success"
+          test "${{ steps.qca8k.outcome }}" = "success"
+          test "${{ steps.qca8084.outcome }}" = "success"
+          test "${{ steps.nss_phy.outcome }}" = "success"
+          test "${{ steps.phy_gate.outcome }}" = "success"
+          test "${{ steps.ssdk.outcome }}" = "success"
+          test "${{ steps.nss_debug.outcome }}" = "success"
+          test "${{ steps.nat46.outcome }}" = "success"
+          test "${{ steps.ppe.outcome }}" = "success"
+          test "${{ steps.nss_dp.outcome }}" = "success"
+
+          test -s results/phy/PHY-GATE-PASS.txt
+          test -s results/modules/qca-ssdk.ko
+          test -s results/modules/qca-nss-debug.ko
+          test -s results/modules/qca-nss-ppe.ko
+          test -s results/modules/qca-nss-dp.ko
+
+          echo "REFERENCE V1 CORE CHAIN PASS"
