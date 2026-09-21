@@ -1,0 +1,383 @@
+name: QSDK14 r9 Extended Fingerprint
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fingerprint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y git python3
+
+          rm -rf work results
+          mkdir -p work results/repos
+
+      - name: Compare nss-profiles 00032 vs 00034
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --filter=blob:none --no-checkout \
+            https://git.codelinaro.org/clo/qsdk/oss/system/feeds/nss-profiles.git \
+            work/nss-profiles
+
+          git -C work/nss-profiles fetch --tags --force
+
+          T32='NHSS.QSDK.14.0.r9-00032-O'
+          T34='NHSS.QSDK.14.0.r9-00034-O'
+
+          git -C work/nss-profiles rev-parse "$T32" \
+            > results/profile-32-head.txt
+
+          git -C work/nss-profiles rev-parse "$T34" \
+            > results/profile-34-head.txt
+
+          git -C work/nss-profiles log \
+            --date=iso \
+            --pretty='format:%H %ad %s' \
+            "$T32..$T34" \
+            > results/profile-32-to-34-commits.txt
+
+          git -C work/nss-profiles diff \
+            --stat \
+            "$T32" "$T34" \
+            > results/profile-32-vs-34.stat
+
+          git -C work/nss-profiles diff \
+            --name-status \
+            "$T32" "$T34" \
+            > results/profile-32-vs-34-files.txt
+
+          git -C work/nss-profiles diff \
+            "$T32" "$T34" \
+            > results/profile-32-vs-34.diff
+
+      - name: Match extended running-firmware fingerprints
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > results/reference-components.tsv <<'EOF'
+          component	short_commit	candidates
+          qca-nss-ecm	e978478	nss-ecm;qca-nss-ecm
+          qca-nss-netfn	07fbf1b	nss-netfn;qca-nss-netfn
+          qca-nss-ae-clients	b959456	nss-ae-clients;qca-nss-ae-clients
+          qca-nss-sfe	d0a7b9c	nss-sfe;qca-nss-sfe
+          qca-ovsmgr	6c1fafc	ovsmgr;qca-ovsmgr
+          qca-nss-nsm	9f54bac	nss-nsm;qca-nss-nsm
+          qca-nss-eip	10a89a9	nss-eip;qca-nss-eip
+          qca-nss-dscpstats	4108235	nss-dscpstats;qca-nss-dscpstats
+          EOF
+
+          TAGS=(
+            NHSS.QSDK.14.0.r9-00032-O
+            NHSS.QSDK.14.0.r9-00034-O
+            NHSS.QSDK.14.0.r9-00039-O
+            NHSS.QSDK.14.0.r9-00040-O
+          )
+
+          printf \
+            'component\tshort_commit\trepository\tresolved_commit\ttag\ttag_head\tstate\tdistance\n' \
+            > results/extended-fingerprint.tsv
+
+          tail -n +2 results/reference-components.tsv |
+          while IFS=$'\t' read -r component short candidates
+          do
+            echo
+            echo "========================================"
+            echo "$component / $short"
+            echo "========================================"
+
+            repo_dir="work/$component"
+            rm -rf "$repo_dir"
+
+            found_url=""
+
+            IFS=';' read -ra names <<< "$candidates"
+
+            for name in "${names[@]}"
+            do
+              url="https://git.codelinaro.org/clo/qsdk/oss/lklm/${name}.git"
+
+              echo "Trying: $url"
+
+              if git clone \
+                    --filter=blob:none \
+                    --no-checkout \
+                    "$url" "$repo_dir" \
+                    >"results/repos/${component}-${name}.clone.log" 2>&1
+              then
+                found_url="$url"
+                break
+              fi
+
+              rm -rf "$repo_dir"
+            done
+
+            if [ -z "$found_url" ]
+            then
+              for tag in "${TAGS[@]}"
+              do
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                  "$component" "$short" \
+                  "NOT_FOUND" "-" \
+                  "$tag" "-" \
+                  "REPOSITORY_NOT_FOUND" "-" \
+                  >> results/extended-fingerprint.tsv
+              done
+              continue
+            fi
+
+            echo "$found_url" \
+              > "results/repos/${component}.url.txt"
+
+            git -C "$repo_dir" fetch \
+              --tags --force \
+              '+refs/heads/*:refs/remotes/origin/*'
+
+            git -C "$repo_dir" tag -l 'NHSS.QSDK.14*' \
+              | sort -V \
+              > "results/repos/${component}.tags.txt"
+
+            if ! full="$(
+              git -C "$repo_dir" rev-parse "${short}^{commit}" 2>/dev/null
+            )"
+            then
+              echo "Could not resolve short commit: $short"
+
+              for tag in "${TAGS[@]}"
+              do
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                  "$component" "$short" \
+                  "$found_url" "-" \
+                  "$tag" "-" \
+                  "COMMIT_NOT_FOUND" "-" \
+                  >> results/extended-fingerprint.tsv
+              done
+
+              continue
+            fi
+
+            echo "$full" \
+              > "results/repos/${component}.reference-commit.txt"
+
+            git -C "$repo_dir" show \
+              --no-patch \
+              --format='commit=%H%ncommit_date=%cI%nsubject=%s' \
+              "$full" \
+              > "results/repos/${component}.reference-info.txt"
+
+            for tag in "${TAGS[@]}"
+            do
+              if ! tag_head="$(
+                git -C "$repo_dir" rev-list -n1 "$tag" 2>/dev/null
+              )"
+              then
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                  "$component" "$short" \
+                  "$found_url" "$full" \
+                  "$tag" "-" \
+                  "TAG_NOT_FOUND" "-" \
+                  >> results/extended-fingerprint.tsv
+
+                continue
+              fi
+
+              if [ "$full" = "$tag_head" ]
+              then
+                state="EXACT"
+                distance=0
+
+              elif git -C "$repo_dir" merge-base \
+                     --is-ancestor "$full" "$tag_head"
+              then
+                state="CONTAINED"
+
+                distance="$(
+                  git -C "$repo_dir" rev-list \
+                    --count "${full}..${tag_head}"
+                )"
+              else
+                state="NOT_CONTAINED"
+                distance="-"
+              fi
+
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$component" "$short" \
+                "$found_url" "$full" \
+                "$tag" "$tag_head" \
+                "$state" "$distance" \
+                >> results/extended-fingerprint.tsv
+            done
+          done
+
+      - name: Score candidate releases
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+
+          path = Path("results/extended-fingerprint.tsv")
+
+          rows = list(csv.DictReader(
+              path.open(),
+              delimiter="\t"
+          ))
+
+          tags = [
+              "NHSS.QSDK.14.0.r9-00032-O",
+              "NHSS.QSDK.14.0.r9-00034-O",
+              "NHSS.QSDK.14.0.r9-00039-O",
+              "NHSS.QSDK.14.0.r9-00040-O",
+          ]
+
+          report = []
+
+          for tag in tags:
+              selected = [
+                  r for r in rows
+                  if r["tag"] == tag
+              ]
+
+              exact = [
+                  r for r in selected
+                  if r["state"] == "EXACT"
+              ]
+
+              contained = [
+                  r for r in selected
+                  if r["state"] == "CONTAINED"
+              ]
+
+              bad = [
+                  r for r in selected
+                  if r["state"] not in {
+                      "EXACT",
+                      "CONTAINED"
+                  }
+              ]
+
+              distances = []
+
+              for r in selected:
+                  try:
+                      distances.append(
+                          int(r["distance"])
+                      )
+                  except Exception:
+                      pass
+
+              report.append({
+                  "tag": tag,
+                  "exact": len(exact),
+                  "contained": len(contained),
+                  "bad": len(bad),
+                  "total_distance": sum(distances),
+                  "states": {
+                      r["component"]: {
+                          "state": r["state"],
+                          "distance": r["distance"],
+                          "commit": r["resolved_commit"],
+                          "tag_head": r["tag_head"],
+                      }
+                      for r in selected
+                  }
+              })
+
+          report.sort(
+              key=lambda x: (
+                  x["bad"],
+                  -x["exact"],
+                  x["total_distance"],
+                  x["tag"]
+              )
+          )
+
+          Path(
+              "results/release-score.json"
+          ).write_text(
+              json.dumps(
+                  report,
+                  indent=2
+              ) + "\n"
+          )
+
+          lines = []
+
+          for x in report:
+              lines.append(
+                  f'{x["tag"]}: '
+                  f'exact={x["exact"]} '
+                  f'contained={x["contained"]} '
+                  f'bad={x["bad"]} '
+                  f'total_distance={x["total_distance"]}'
+              )
+
+              for component, state in x["states"].items():
+                  lines.append(
+                      f'  {component}: '
+                      f'{state["state"]} '
+                      f'distance={state["distance"]}'
+                  )
+
+          Path(
+              "results/RELEASE-SCORE.txt"
+          ).write_text(
+              "\n".join(lines) + "\n"
+          )
+
+          print("\n".join(lines))
+          PY
+
+      - name: Final report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "======================================"
+            echo " QSDK14 r9 EXTENDED FINGERPRINT"
+            echo "======================================"
+            echo
+
+            echo "===== RELEASE SCORE ====="
+            cat results/RELEASE-SCORE.txt 2>/dev/null || true
+
+            echo
+            echo "===== PROFILE 00032 -> 00034 COMMITS ====="
+            cat results/profile-32-to-34-commits.txt 2>/dev/null || true
+
+            echo
+            echo "===== PROFILE FILE CHANGES ====="
+            cat results/profile-32-vs-34-files.txt 2>/dev/null || true
+
+            echo
+            echo "===== PROFILE DIFF STAT ====="
+            cat results/profile-32-vs-34.stat 2>/dev/null || true
+          } | tee results/FINAL-REPORT.txt
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: QSDK14-r9-Extended-Fingerprint
+          path: results/
+          retention-days: 14
+          if-no-files-found: error
