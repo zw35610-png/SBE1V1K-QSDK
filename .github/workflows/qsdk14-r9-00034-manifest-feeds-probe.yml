@@ -1,0 +1,362 @@
+name: QSDK14 r9-00034 Manifest Feeds Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  QSDK_TAG: NHSS.QSDK.14.0.r9-00034-O
+  OPENWRT_COMMIT: 00d52ae93de98724af4ba89e2b9f19aa4a416f36
+  QSDK_CONFIG_COMMIT: 190a2e4176da8b981e465c9c5b65e7846c0c041a
+
+jobs:
+  manifest-feeds:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y git python3 jq curl
+
+      - name: Clone exact OpenWrt and QSDK config
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euxo pipefail
+
+          rm -rf work results
+          mkdir -p work results/{openwrt,config,manifest,feeds,discovery}
+
+          git clone --depth=1 --branch "$QSDK_TAG" \
+            https://git.codelinaro.org/clo/qsdk/oss/system/openwrt_repo.git \
+            work/openwrt
+
+          test "$(git -C work/openwrt rev-parse HEAD)" = "$OPENWRT_COMMIT"
+
+          git clone --depth=1 --branch "$QSDK_TAG" \
+            https://git.codelinaro.org/clo/qsdk/oss/releases/configs/qsdk.git \
+            work/qsdk-config
+
+          test "$(git -C work/qsdk-config rev-parse HEAD)" = "$QSDK_CONFIG_COMMIT"
+
+      - name: Inspect OpenWrt feed and target-feed mechanism
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          O="$GITHUB_WORKSPACE/work/openwrt"
+
+          {
+            echo "===== feeds.conf.default ====="
+            cat "$O/feeds.conf.default" 2>/dev/null || true
+
+            echo
+            echo "===== feeds.conf ====="
+            cat "$O/feeds.conf" 2>/dev/null || true
+
+            echo
+            echo "===== target/linux listing ====="
+            ls -la "$O/target/linux" 2>/dev/null || true
+
+            echo
+            echo "===== tracked target/linux entries ====="
+            git -C "$O" ls-tree HEAD target/linux 2>/dev/null || true
+            git -C "$O" ls-tree -r HEAD target/linux 2>/dev/null | head -n 3000 || true
+
+          } > results/openwrt/feed-target-layout.txt
+
+          {
+            echo "===== target feed functions ====="
+            grep -n -A100 -B40 \
+              -E 'sub do_install_target|sub install_target|target/linux/feeds|update.*-b|opts\{b\}' \
+              "$O/scripts/feeds" 2>/dev/null || true
+
+            echo
+            echo "===== feeds usage/options ====="
+            grep -n -A120 -B30 \
+              -E 'Usage:|getopts|update.*feed|install.*target' \
+              "$O/scripts/feeds" 2>/dev/null | head -n 4000 || true
+
+          } > results/openwrt/scripts-feeds-target-support.txt
+
+          grep -RInE \
+            'target/linux/feeds|install_target|do_install_target|opts\{b\}|package/symlinks' \
+            "$O/scripts" "$O/include" \
+            2>/dev/null \
+            > results/openwrt/target-feed-hits.txt || true
+
+      - name: Capture full QSDK setup-environment assembly logic
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          C="$GITHUB_WORKSPACE/work/qsdk-config"
+          S="$C/setup-environment"
+
+          test -f "$S"
+
+          cp "$S" results/config/setup-environment.txt
+
+          {
+            echo "===== setup-environment lines 1-420 ====="
+            nl -ba "$S" | sed -n '1,420p'
+
+            echo
+            echo "===== target/linux/feeds references ====="
+            grep -n -A60 -B60 \
+              -E 'target/linux/feeds|qsdk_target|scripts/feeds|package/symlinks|feeds update|feeds install|rsync' \
+              "$S" || true
+
+          } > results/config/setup-environment-focus.txt
+
+          grep -RInE \
+            'target/linux/feeds|feeds\.conf|src-git|src-link|ipq95xx|linux-ipq-6\.6|openwrt_repo|manifest|repo init|repo sync' \
+            "$C" 2>/dev/null \
+            > results/config/all-assembly-hits.txt || true
+
+      - name: Probe likely QSDK manifest repositories
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euxo pipefail
+
+          cat > results/manifest/candidates.txt <<'EOF'
+          https://git.codelinaro.org/clo/qsdk/releases/manifest/qstak.git
+          https://git.codelinaro.org/clo/qsdk/oss/releases/manifest/qstak.git
+          https://git.codelinaro.org/clo/qsdk/releases/manifest/qsdk.git
+          https://git.codelinaro.org/clo/qsdk/oss/releases/manifest/qsdk.git
+          https://git.codelinaro.org/clo/qsdk/releases/manifest.git
+          https://git.codelinaro.org/clo/qsdk/oss/releases/manifest.git
+          EOF
+
+          printf 'url\treachable\tmatching_refs\n' \
+            > results/manifest/probe.tsv
+
+          while IFS= read -r url; do
+            refs="$(
+              git ls-remote "$url" 2>/dev/null || true
+            )"
+
+            if [ -z "$refs" ]; then
+              printf '%s\tNO\t-\n' "$url" \
+                >> results/manifest/probe.tsv
+              continue
+            fi
+
+            matches="$(
+              printf '%s\n' "$refs" \
+                | grep -Ei 'NHSS\.QSDK\.14\.0\.r9|00034|14\.0.*r9' \
+                | tr '\n' ';' \
+                | sed 's/;$//' || true
+            )"
+
+            printf '%s\tYES\t%s\n' \
+              "$url" "${matches:--}" \
+              >> results/manifest/probe.tsv
+
+            name="$(
+              echo "$url" \
+                | sed 's#https://git.codelinaro.org/##; s#/#_#g; s#\.git$##'
+            )"
+
+            printf '%s\n' "$refs" \
+              > "results/manifest/${name}.ls-remote.txt"
+          done < results/manifest/candidates.txt
+
+      - name: Clone first reachable manifest and inspect r9 data
+        id: manifest
+        continue-on-error: true
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euxo pipefail
+
+          reachable="$(
+            awk -F'\t' 'NR>1 && $2=="YES"{print $1; exit}' \
+              results/manifest/probe.tsv
+          )"
+
+          if [ -z "$reachable" ]; then
+            echo "NO_REACHABLE_MANIFEST" \
+              > results/manifest/status.txt
+            exit 0
+          fi
+
+          echo "$reachable" > results/manifest/selected-url.txt
+
+          git clone --filter=blob:none --no-checkout \
+            "$reachable" work/manifest
+
+          git -C work/manifest fetch --tags --force || true
+
+          git -C work/manifest branch -a \
+            > results/manifest/branches.txt || true
+
+          git -C work/manifest tag -l \
+            > results/manifest/tags.txt || true
+
+          git -C work/manifest for-each-ref \
+            --format='%(refname) %(objectname)' \
+            | grep -Ei 'NHSS\.QSDK\.14\.0\.r9|00034|14\.0.*r9' \
+            > results/manifest/r9-refs.txt || true
+
+          # Try exact tag first. If absent, inspect matching refs from ls-remote.
+          ref=""
+
+          if git -C work/manifest rev-parse \
+               "refs/tags/$QSDK_TAG^{commit}" >/dev/null 2>&1; then
+            ref="refs/tags/$QSDK_TAG"
+          else
+            ref="$(
+              git -C work/manifest for-each-ref \
+                --format='%(refname)' \
+                | grep -Ei '00034|14\.0.*r9' \
+                | head -n1 || true
+            )"
+          fi
+
+          echo "selected_ref=$ref" \
+            > results/manifest/status.txt
+
+          if [ -z "$ref" ]; then
+            exit 0
+          fi
+
+          git -C work/manifest checkout -q --detach "$ref"
+
+          find work/manifest -maxdepth 4 -type f \
+            | sed 's#^work/manifest/##' \
+            | sort \
+            > results/manifest/files.txt
+
+          grep -RInEi \
+            'ipq95xx|ipq9574|target/linux|openwrt_repo|openwrt-ipq-patches|linux-ipq-6\.6|feeds|nss-host|ssdk|nss-profiles' \
+            work/manifest \
+            --exclude-dir=.git \
+            2>/dev/null \
+            > results/manifest/r9-assembly-hits.txt || true
+
+          while IFS= read -r f; do
+            case "$f" in
+              *.xml|*.json|*.yml|*.yaml|*.conf|*.txt|default.xml|manifest.xml)
+                {
+                  echo
+                  echo "============================================================"
+                  echo "$f"
+                  echo "============================================================"
+                  sed -n '1,700p' "work/manifest/$f"
+                } >> results/manifest/key-files-content.txt
+                ;;
+            esac
+          done < results/manifest/files.txt
+
+      - name: Discover feed URLs from OpenWrt and config
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          O="$GITHUB_WORKSPACE/work/openwrt"
+          C="$GITHUB_WORKSPACE/work/qsdk-config"
+
+          {
+            cat "$O/feeds.conf.default" 2>/dev/null || true
+            cat "$O/feeds.conf" 2>/dev/null || true
+
+            grep -RhoE \
+              'https?://[^"'"'"'[:space:]<>]+' \
+              "$C" 2>/dev/null || true
+
+            cat results/manifest/key-files-content.txt 2>/dev/null || true
+
+          } > results/feeds/raw-source-text.txt
+
+          grep -Eo \
+            'https?://[^"'"'"'[:space:]<>]+' \
+            results/feeds/raw-source-text.txt \
+            | sed 's/[),;]$//' \
+            | sort -u \
+            > results/feeds/urls.txt || true
+
+          printf 'url\treachable\tr9_tag\n' \
+            > results/feeds/probe.tsv
+
+          while IFS= read -r url; do
+            case "$url" in
+              *.git|*git.codelinaro.org*)
+                ;;
+              *)
+                continue
+                ;;
+            esac
+
+            if git ls-remote "$url" HEAD >/dev/null 2>&1; then
+              tag="$(
+                git ls-remote "$url" \
+                  "refs/tags/$QSDK_TAG" \
+                  "refs/tags/$QSDK_TAG^{}" \
+                  2>/dev/null || true
+              )"
+
+              printf '%s\tYES\t%s\n' \
+                "$url" \
+                "$(printf '%s' "$tag" | tr '\n' ';')" \
+                >> results/feeds/probe.tsv
+            else
+              printf '%s\tNO\t-\n' "$url" \
+                >> results/feeds/probe.tsv
+            fi
+          done < results/feeds/urls.txt
+
+      - name: Final summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "QSDK14 r9-00034 Manifest/Feeds Probe"
+            echo "===================================="
+            echo
+
+            echo "===== MANIFEST REPOSITORIES ====="
+            cat results/manifest/probe.tsv 2>/dev/null || true
+
+            echo
+            echo "===== SELECTED MANIFEST ====="
+            cat results/manifest/status.txt 2>/dev/null || true
+            cat results/manifest/selected-url.txt 2>/dev/null || true
+
+            echo
+            echo "===== R9 MANIFEST HITS ====="
+            head -n 500 results/manifest/r9-assembly-hits.txt 2>/dev/null || true
+
+            echo
+            echo "===== FEED URL PROBE ====="
+            cat results/feeds/probe.tsv 2>/dev/null || true
+
+            echo
+            echo "===== SETUP TARGET FEED LOGIC ====="
+            grep -n -A40 -B40 \
+              -E 'target/linux/feeds|qsdk_target|scripts/feeds|rsync' \
+              results/config/setup-environment.txt 2>/dev/null || true
+
+          } | tee results/MANIFEST-FEEDS-SUMMARY.txt
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: QSDK14-r9-00034-Manifest-Feeds-Probe
+          path: results/
+          retention-days: 14
+          if-no-files-found: error
