@@ -1,0 +1,87 @@
+name: QSDK14 r9 Baseline Lock
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lock:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Resolve QSDK 14 r9-00034 baseline
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+
+          mkdir -p results
+
+          TAG='NHSS.QSDK.14.0.r9-00034-O'
+
+          cat > results/repos.tsv <<'EOF'
+          linux-ipq-6.6	https://git.codelinaro.org/clo/qsdk/oss/kernel/linux-ipq-6.6.git
+          openwrt_repo	https://git.codelinaro.org/clo/qsdk/oss/system/openwrt_repo.git
+          openwrt-ipq-patches	https://git.codelinaro.org/clo/qsdk/oss/system/openwrt-ipq-patches.git
+          qsdk-config	https://git.codelinaro.org/clo/qsdk/oss/releases/configs/qsdk.git
+          nss-profiles	https://git.codelinaro.org/clo/qsdk/oss/system/feeds/nss-profiles.git
+          EOF
+
+          printf 'repository\ttag\tcommit\tstate\n' \
+            > results/baseline.tsv
+
+          while IFS=$'\t' read -r name url
+          do
+              echo
+              echo "===== $name ====="
+              echo "$url"
+
+              ref="refs/tags/$TAG"
+
+              raw="$(
+                git ls-remote \
+                  "$url" \
+                  "$ref" \
+                  "${ref}^{}" \
+                  2>/dev/null || true
+              )"
+
+              if [ -z "$raw" ]; then
+                  printf '%s\t%s\t-\tTAG_NOT_FOUND\n' \
+                    "$name" "$TAG" \
+                    >> results/baseline.tsv
+                  continue
+              fi
+
+              commit="$(
+                printf '%s\n' "$raw" |
+                awk '/\^\{\}$/ {print $1}' |
+                tail -n1
+              )"
+
+              if [ -z "$commit" ]; then
+                  commit="$(
+                    printf '%s\n' "$raw" |
+                    awk 'NR==1 {print $1}'
+                  )"
+              fi
+
+              printf '%s\t%s\t%s\tFOUND\n' \
+                "$name" "$TAG" "$commit" \
+                >> results/baseline.tsv
+
+          done < results/repos.tsv
+
+          cat results/baseline.tsv
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: QSDK14-r9-Baseline-Lock
+          path: results/
+          retention-days: 14
