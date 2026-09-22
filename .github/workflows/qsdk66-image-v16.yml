@@ -1,0 +1,1922 @@
+name: SBE1V1K QSDK66 Image v16 - PCIe DTS Adaptation and DTB Gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Exact projects/revisions from:
+  # NHSS.QSDK.14.0.r9-00034-O.xml
+  OPENWRT_COMMIT: 00d52ae93de98724af4ba89e2b9f19aa4a416f36
+  TARGET_IPQ_COMMIT: 13f34533ffeb47c5a29ff018342bb90693ef64b1
+  LINUX_COMMIT: 16f31b0750888769b5418c1f32f2cd385b09972d
+  LINUX_FILES_COMMIT: e313f14614d5be6f7ee23251b45cb8944f11a03d
+  LINUX_PATCHES_COMMIT: 0977e9ae7e323cbe7664d328fe43a68193f0e2bb
+  QSDK_CONFIG_COMMIT: 190a2e4176da8b981e465c9c5b65e7846c0c041a
+  OPENWRT_PATCHES_COMMIT: 65856fd4da03a610ee75176f043e6638afeb5d42
+  IPQ_SCRIPTS_COMMIT: 5b5a0d0a9443f51191f922617c1f5e6bd1190700
+  WLAN_IW_COMMIT: eda68e3028b3fe30328521e3ab4d84c85cc2efbb
+
+  NSS_BASE_FEED_COMMIT: f557293cde959955cd32f2f2ffe1c5cc10251667
+  PHY_COMMIT: 16eec6ac35820cb67af59223e8b4c2dba7179655
+  SSDK_COMMIT: 717b74016b0c131575bcd81b9e039d3f7974b02a
+  PPE_COMMIT: 87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+  DP_COMMIT: 22555a9fce967f21f4772495844a5c2e0d501a95
+
+  # Exact NHSS.QSDK.14.0.r9-00034-O NSS extension feed/source revisions.
+  NSS_CLIENTS_FEED_COMMIT: f83c2711fe39b5f6a36650e232db72f8e44e7430
+  NSS_DRV_COMMIT: d7ef98b1d3d31346981d3a1abff5152a206374af
+  NSS_ECM_COMMIT: e978478f5dba749d412e144b8f3e7b152687d893
+  NSS_NETFN_COMMIT: 07fbf1beaa91902af99a0f302b6b6465e1916a4d
+  NSS_AE_CLIENTS_COMMIT: b95945692ac4a4126489433f704deea3f6ae1960
+  NSS_SFE_COMMIT: d0a7b9ca3a4c37cb67299de10278a0f7a009d8cb
+  NSS_OVSMGR_COMMIT: 6c1fafc4fbdc28474d2199fa2bef6e10c89d2118
+  NSS_NSM_COMMIT: 9f54bacffad8a6fde8535977ccef700ec2a2ef0d
+  NSS_EIP_COMMIT: 10a89a95f814cd325e23105f102428644f45014f
+  NSS_DSCP_COMMIT: 4108235ef472b081b13bf7c4d16a689ca479676b
+  NSS_SXC_COMMIT: 8c1c5f6f175b4f78a22cc074ea0e941d0380d3fb
+  NSS_MMAP_TELEMETRY_COMMIT: 4a6fa633afa309274422bce8686f52201776e34e
+  NSS_MACSEC_COMMIT: f45b2bf97ebda336a81510b070237b018d27e205
+  NSS_WIFI_PLUGINS_COMMIT: 0de0e5a9f9fd07cc7a161c33d2c97bf180370746
+
+  QSTAK_URL: https://git.codelinaro.org/clo/qsdk/releases/manifest/qstak.git
+  QSDK_RELEASE_TAG: NHSS.QSDK.14.0.r9-00034-O
+  BOARD_REPO: https://github.com/luckkyboy/SBE1V1K.git
+  BOARD_COMMIT: 02fb9517c9aefac9f3825a15ae46e7998bae7edd
+
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+jobs:
+  image-v16:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Free runner disk
+        shell: bash
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git \
+            libncurses-dev libssl-dev python3 python3-setuptools \
+            rsync swig unzip zlib1g-dev file wget curl \
+            xsltproc libxml-parser-perl python3-dev time jq \
+            patch quilt ccache zstd libelf-dev bc \
+            device-tree-compiler kmod
+
+      - name: Initialize official QSDK layout
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf qsdk results
+          mkdir -p \
+            qsdk \
+            results/{manifest,assembly,feeds,kernel,phy,ssdk,nss-debug,ppe,nss-dp,extended,board,image,modules}
+
+          {
+            echo "release=NHSS.QSDK.14.0.r9-00034-O"
+            echo "mode=official-manifest-layout"
+            echo "purpose=full NSS acceleration stack + SBE1V1K board integration preflight"
+            echo "image_attempt=yes"
+            echo "flash_safe=NO_NOT_YET_AUDITED"
+            echo "date_utc=$(date -u +%FT%TZ)"
+          } > results/run-info.txt
+
+      - name: Clone exact manifest projects into official paths
+        id: assembly
+        continue-on-error: true
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euxo pipefail
+
+          fetch_exact() {
+            local name="$1"
+            local url="$2"
+            local commit="$3"
+            local dst="$4"
+
+            rm -rf "$dst"
+            mkdir -p "$(dirname "$dst")"
+
+            git init -q "$dst"
+            git -C "$dst" remote add origin "$url"
+
+            for attempt in 1 2 3; do
+              if git -C "$dst" fetch \
+                   --depth=1 origin "$commit"
+              then
+                break
+              fi
+
+              if [ "$attempt" -eq 3 ]; then
+                echo "Failed to fetch $name $commit" >&2
+                exit 20
+              fi
+
+              sleep $((attempt * 5))
+            done
+
+            git -C "$dst" checkout -q --detach FETCH_HEAD
+
+            actual="$(git -C "$dst" rev-parse HEAD)"
+
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$name" "$commit" "$actual" "$url" "$dst" \
+              >> results/manifest/projects.tsv
+
+            test "$actual" = "$commit"
+          }
+
+          printf 'project\texpected\tactual\turl\tpath\n' \
+            > results/manifest/projects.tsv
+
+          # openwrt_repo: path="qsdk"
+          fetch_exact \
+            openwrt_repo \
+            https://git.codelinaro.org/clo/qsdk/oss/system/openwrt_repo.git \
+            "$OPENWRT_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk"
+
+          # target feed: path="qsdk/target/linux/feeds"
+          fetch_exact \
+            target-ipq \
+            https://git.codelinaro.org/clo/qsdk/oss/system/feeds/target/ipq.git \
+            "$TARGET_IPQ_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/target/linux/feeds"
+
+          # kernel extra files / patches are separate manifest projects.
+          fetch_exact \
+            linux-ipq-files \
+            https://git.codelinaro.org/clo/qsdk/oss/kernel/linux-ipq-files.git \
+            "$LINUX_FILES_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/target/linux/feeds/files-6.6"
+
+          fetch_exact \
+            linux-ipq-patches-6.6 \
+            https://git.codelinaro.org/clo/qsdk/oss/kernel/linux-ipq-patches-6.6.git \
+            "$LINUX_PATCHES_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/target/linux/feeds/patches-6.6"
+
+          # Linux source: path="qsdk/qca/src/linux-6.6"
+          fetch_exact \
+            linux-ipq-6.6 \
+            https://git.codelinaro.org/clo/qsdk/oss/kernel/linux-ipq-6.6.git \
+            "$LINUX_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/linux-6.6"
+
+          # QSDK setup/configs.
+          fetch_exact \
+            qsdk-config \
+            https://git.codelinaro.org/clo/qsdk/oss/releases/configs/qsdk.git \
+            "$QSDK_CONFIG_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/configs/qsdk"
+
+          # OpenWrt QSDK overlay required by Config-build.in.
+          fetch_exact \
+            openwrt-patches \
+            https://git.codelinaro.org/clo/qsdk/oss/system/openwrt-patches.git \
+            "$OPENWRT_PATCHES_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/openwrt-patches"
+
+          # IPQ helper scripts from the same release.
+          fetch_exact \
+            ipq-scripts \
+            https://git.codelinaro.org/clo/qsdk/oss/system/openwrt/ipq-scripts.git \
+            "$IPQ_SCRIPTS_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/ipq-scripts"
+
+          # Manifest overlay nested inside openwrt-patches.
+          fetch_exact \
+            wlan-iw \
+            https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-iw.git \
+            "$WLAN_IW_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/openwrt-patches/package/network/utils/iw"
+
+          # Exact NSS package feed.
+          fetch_exact \
+            nss-base-feed \
+            https://git.codelinaro.org/clo/qsdk/oss/system/feeds/nss-base.git \
+            "$NSS_BASE_FEED_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/feeds/nss/base"
+
+          # Exact NSS source repositories at official manifest paths.
+          fetch_exact \
+            qca-nss-phy \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-nss-phy.git \
+            "$PHY_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/base/qca-nss-phy"
+
+          fetch_exact \
+            qca-ssdk \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-ssdk.git \
+            "$SSDK_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/base/qca-ssdk"
+
+          fetch_exact \
+            qca-nss-ppe \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe.git \
+            "$PPE_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/base/qca-nss-ppe"
+
+          fetch_exact \
+            qca-nss-dp \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-dp.git \
+            "$DP_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/base/qca-nss-dp"
+
+          # Exact extension package feed from r9-00034.
+          fetch_exact \
+            nss-clients-feed \
+            https://git.codelinaro.org/clo/qsdk/oss/system/feeds/nss-clients.git \
+            "$NSS_CLIENTS_FEED_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/feeds/nss/clients"
+
+          # Exact source trees used by the known-good firmware.
+          fetch_exact \
+            qca-nss-drv \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-drv.git \
+            "$NSS_DRV_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/base/qca-nss-drv"
+
+          fetch_exact \
+            qca-nss-ecm \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-nss-ecm.git \
+            "$NSS_ECM_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/clients/qca-nss-ecm"
+
+          fetch_exact \
+            qca-nss-netfn \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-netfn.git \
+            "$NSS_NETFN_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/clients/qca-nss-netfn"
+
+          fetch_exact \
+            qca-nss-ae-clients \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ae-clients.git \
+            "$NSS_AE_CLIENTS_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/clients/qca-nss-ae-clients"
+
+          fetch_exact \
+            qca-nss-sfe \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/shortcut-fe.git \
+            "$NSS_SFE_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/clients/qca-nss-sfe"
+
+          fetch_exact \
+            qca-ovsmgr \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-ovsmgr.git \
+            "$NSS_OVSMGR_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/clients/qca-ovsmgr"
+
+          fetch_exact \
+            qca-nss-nsm \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-nsm.git \
+            "$NSS_NSM_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/clients/qca-nss-nsm"
+
+          fetch_exact \
+            qca-nss-eip \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip.git \
+            "$NSS_EIP_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/base/qca-nss-eip"
+
+          fetch_exact \
+            qca-nss-dscpstats \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-dscpstats.git \
+            "$NSS_DSCP_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/clients/qca-nss-dscpstats"
+
+          # V8 proved this exact manifest project was missing.  The package
+          # recipe existed, but its src/ tree did not, so the kernel module
+          # build directory had no Makefile.
+          fetch_exact \
+            qca-mmap-telemetry \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-mmap-telemetry.git \
+            "$NSS_MMAP_TELEMETRY_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/base/qca-mmap-telemetry"
+
+          fetch_exact \
+            qca-sxc-drv \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-sxc.git \
+            "$NSS_SXC_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/base/qca-sxc-drv"
+
+          fetch_exact \
+            qca-nss-macsec \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-macsec.git \
+            "$NSS_MACSEC_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/base/qca-nss-macsec"
+
+          fetch_exact \
+            qca-nss-wifi-plugins \
+            https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-plugins.git \
+            "$NSS_WIFI_PLUGINS_COMMIT" \
+            "$GITHUB_WORKSPACE/qsdk/qca/src/nss/clients/qca-nss-wifi-plugins"
+
+      - name: Validate extension revisions against exact r9-00034 manifest
+        id: manifest_gate
+        if: steps.assembly.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euxo pipefail
+
+          M="$GITHUB_WORKSPACE/release-manifest"
+          rm -rf "$M"
+          git init -q "$M"
+          git -C "$M" remote add origin "$QSTAK_URL"
+          git -C "$M" fetch --depth=1 origin "refs/tags/$QSDK_RELEASE_TAG"
+          git -C "$M" checkout -q --detach FETCH_HEAD
+
+          XML="$M/$QSDK_RELEASE_TAG.xml"
+          test -s "$XML"
+          cp "$XML" "$GITHUB_WORKSPACE/results/manifest/$QSDK_RELEASE_TAG.xml"
+
+          python3 - "$XML" <<'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          xml = Path(sys.argv[1])
+          root = ET.parse(xml).getroot()
+
+          expected = {
+              "oss/system/openwrt_repo": ("qsdk", os.environ["OPENWRT_COMMIT"]),
+              "oss/system/feeds/nss-base": ("qsdk/qca/feeds/nss/base", os.environ["NSS_BASE_FEED_COMMIT"]),
+              "oss/system/feeds/nss-clients": ("qsdk/qca/feeds/nss/clients", os.environ["NSS_CLIENTS_FEED_COMMIT"]),
+              "oss/lklm/nss-drv": ("qsdk/qca/src/nss/base/qca-nss-drv", os.environ["NSS_DRV_COMMIT"]),
+              "oss/lklm/qca-nss-ecm": ("qsdk/qca/src/nss/clients/qca-nss-ecm", os.environ["NSS_ECM_COMMIT"]),
+              "oss/lklm/nss-netfn": ("qsdk/qca/src/nss/clients/qca-nss-netfn", os.environ["NSS_NETFN_COMMIT"]),
+              "oss/lklm/nss-ae-clients": ("qsdk/qca/src/nss/clients/qca-nss-ae-clients", os.environ["NSS_AE_CLIENTS_COMMIT"]),
+              "oss/lklm/shortcut-fe": ("qsdk/qca/src/nss/clients/qca-nss-sfe", os.environ["NSS_SFE_COMMIT"]),
+              "oss/lklm/qca-ovsmgr": ("qsdk/qca/src/nss/clients/qca-ovsmgr", os.environ["NSS_OVSMGR_COMMIT"]),
+              "oss/lklm/nss-nsm": ("qsdk/qca/src/nss/clients/qca-nss-nsm", os.environ["NSS_NSM_COMMIT"]),
+              "oss/lklm/nss-eip": ("qsdk/qca/src/nss/base/qca-nss-eip", os.environ["NSS_EIP_COMMIT"]),
+              "oss/lklm/nss-dscpstats": ("qsdk/qca/src/nss/clients/qca-nss-dscpstats", os.environ["NSS_DSCP_COMMIT"]),
+              "oss/lklm/qca-mmap-telemetry": ("qsdk/qca/src/nss/base/qca-mmap-telemetry", os.environ["NSS_MMAP_TELEMETRY_COMMIT"]),
+              "oss/lklm/qca-sxc": ("qsdk/qca/src/nss/base/qca-sxc-drv", os.environ["NSS_SXC_COMMIT"]),
+              "oss/lklm/nss-macsec": ("qsdk/qca/src/nss/base/qca-nss-macsec", os.environ["NSS_MACSEC_COMMIT"]),
+              "oss/lklm/nss-plugins": ("qsdk/qca/src/nss/clients/qca-nss-wifi-plugins", os.environ["NSS_WIFI_PLUGINS_COMMIT"]),
+          }
+
+          got = {p.get("name"): (p.get("path"), p.get("revision")) for p in root.findall("project")}
+          rows = ["project\tpath\trevision\tstatus"]
+          bad = []
+          for name, want in expected.items():
+              actual = got.get(name)
+              status = "PASS" if actual == want else "FAIL"
+              rows.append(f"{name}\t{actual[0] if actual else '-'}\t{actual[1] if actual else '-'}\t{status}")
+              if status != "PASS":
+                  bad.append((name, want, actual))
+
+          out = Path(os.environ["GITHUB_WORKSPACE"]) / "results/manifest/extension-manifest-gate.tsv"
+          out.write_text("\n".join(rows) + "\n", encoding="utf-8")
+          if bad:
+              raise SystemExit(f"Manifest mismatch: {bad}")
+          PY
+
+          cat "$GITHUB_WORKSPACE/results/manifest/extension-manifest-gate.tsv"
+
+      - name: Verify official target feed and QSDK source layout
+        id: layout
+        if: steps.assembly.outcome == 'success' && steps.manifest_gate.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          O="$GITHUB_WORKSPACE/qsdk"
+          T="$O/target/linux/feeds"
+
+          test -d "$T/ipq95xx"
+          test -f "$T/ipq95xx/Makefile"
+
+          test -d "$T/files-6.6"
+          test -d "$T/patches-6.6"
+
+          test -d "$O/qca/src/linux-6.6"
+          test -f "$O/qca/configs/qsdk/setup-environment"
+
+          # These are direct manifest projects, not optional patches.
+          test -f "$O/openwrt-patches/config/Config-build.in"
+          test -d "$O/openwrt-patches/package"
+          test -d "$O/ipq-scripts"
+          test -d "$O/openwrt-patches/package/network/utils/iw"
+
+          {
+            echo "openwrt_patches_commit=$(git -C "$O/openwrt-patches" rev-parse HEAD)"
+            echo "ipq_scripts_commit=$(git -C "$O/ipq-scripts" rev-parse HEAD)"
+            echo "wlan_iw_commit=$(git -C "$O/openwrt-patches/package/network/utils/iw" rev-parse HEAD)"
+            echo "config_build_in=$(realpath "$O/openwrt-patches/config/Config-build.in")"
+          } > results/assembly/openwrt-overlay.txt
+
+          test -d "$O/qca/feeds/nss/base"
+          test -d "$O/qca/feeds/nss/clients"
+          test -d "$O/qca/src/nss/base/qca-nss-drv"
+          test -d "$O/qca/src/nss/clients/qca-nss-ecm"
+          test -d "$O/qca/src/nss/clients/qca-nss-netfn"
+          test -d "$O/qca/src/nss/clients/qca-nss-ae-clients"
+          test -d "$O/qca/src/nss/clients/qca-nss-sfe"
+          test -d "$O/qca/src/nss/clients/qca-ovsmgr"
+          test -d "$O/qca/src/nss/clients/qca-nss-nsm"
+          test -d "$O/qca/src/nss/base/qca-nss-eip"
+          test -d "$O/qca/src/nss/clients/qca-nss-dscpstats"
+          test -d "$O/qca/src/nss/base/qca-mmap-telemetry"
+          test -s "$O/qca/src/nss/base/qca-mmap-telemetry/Makefile"
+          test -d "$O/qca/src/nss/base/qca-sxc-drv"
+          test -d "$O/qca/src/nss/base/qca-nss-macsec"
+          test -d "$O/qca/src/nss/clients/qca-nss-wifi-plugins"
+          test -d "$O/qca/src/nss/base/qca-nss-phy"
+          test -d "$O/qca/src/nss/base/qca-ssdk"
+          test -d "$O/qca/src/nss/base/qca-nss-ppe"
+          test -d "$O/qca/src/nss/base/qca-nss-dp"
+
+          {
+            echo "===== target feed ====="
+            find "$T" -maxdepth 2 -type f \
+              \( -name Makefile -o -name target.mk -o -name '*.mk' \) \
+              -print | sort
+
+            echo
+            echo "===== ipq95xx Makefile ====="
+            sed -n '1,320p' "$T/ipq95xx/Makefile"
+
+            echo
+            echo "===== generic target.mk ====="
+            sed -n '1,320p' "$T/ipq95xx/generic/target.mk" 2>/dev/null || true
+
+            echo
+            echo "===== kernel source references ====="
+            grep -RInE \
+              '6\.6\.116|KERNEL_PATCHVER|KERNEL_SOURCE|KERNEL_GIT|qca/src/linux-6\.6|LINUX_VERSION' \
+              "$T/ipq95xx" "$O/include" \
+              2>/dev/null | head -n 3000 || true
+
+          } > results/assembly/target-layout.txt
+
+          {
+            echo "===== NSS base feed ====="
+            find "$O/qca/feeds/nss/base" \
+              -maxdepth 3 -type f -name Makefile \
+              -print | sort
+
+            echo
+            echo "===== source names / kernel packages ====="
+            grep -RInE \
+              'PKG_NAME|KernelPackage/(qca-nss-phy|qca8084|qca8k-cc|qca-ssdk-nohnat|qca-nss-debug|qca-nss-ppe|qca-nss-dp)' \
+              "$O/qca/feeds/nss/base" \
+              --include=Makefile \
+              2>/dev/null | head -n 5000 || true
+
+          } > results/feeds/nss-base-inventory.txt
+
+          {
+            echo "===== NSS clients feed ====="
+            find "$O/qca/feeds/nss/clients"               -maxdepth 3 -type f -name Makefile               -print | sort
+            echo
+            echo "===== exact release fingerprints in recipes ====="
+            grep -RInE               'e978478|07fbf1b|b959456|d0a7b9c|6c1fafc|9f54bac|10a89a9|4108235|8c1c5f6|f45b2bf|0de0e5a'               "$O/qca/feeds/nss/base" "$O/qca/feeds/nss/clients"               --include=Makefile 2>/dev/null || true
+          } > results/feeds/nss-clients-inventory.txt
+
+      - name: Apply QSDK patch-based target assembly exactly as setup-environment
+        id: target_assembly
+        if: steps.layout.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          O="$GITHUB_WORKSPACE/qsdk"
+          T="$O/target/linux/feeds"
+
+          # Exact operations from qca/configs/qsdk/setup-environment -e true.
+          rsync -a --exclude='.git' \
+            "$T/files-6.6" \
+            "$T/ipq95xx/"
+
+          rsync -a --exclude='.git' \
+            "$T/patches-6.6" \
+            "$T/ipq95xx/"
+
+          rm -rf \
+            "$O/target/linux/generic/files/" \
+            "$O/target/linux/generic/backport-6.6" \
+            "$O/target/linux/generic/hack-6.6" \
+            "$O/target/linux/generic/pending-6.6"
+
+          {
+            echo "files6_count=$(find "$T/ipq95xx/files-6.6" -type f 2>/dev/null | wc -l)"
+            echo "patches6_count=$(find "$T/ipq95xx/patches-6.6" -type f 2>/dev/null | wc -l)"
+            echo "target=$(realpath "$T/ipq95xx")"
+          } | tee results/assembly/patch-based-assembly.txt
+
+          test -d "$T/ipq95xx/files-6.6"
+          test -d "$T/ipq95xx/patches-6.6"
+
+      - name: Create exact NSS base and NSS clients feed configuration
+        id: feeds
+        if: steps.target_assembly.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          O="$GITHUB_WORKSPACE/qsdk"
+          cd "$O"
+
+          cp feeds.conf results-feeds-conf-before.txt 2>/dev/null || true
+
+          cat > feeds.conf <<'EOF'
+          src-link nss_base ../qca/feeds/nss/base
+          src-link nss_clients ../qca/feeds/nss/clients
+          EOF
+
+          cat feeds.conf | tee "$GITHUB_WORKSPACE/results/feeds/feeds.conf"
+
+          ./scripts/feeds update nss_base \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/feeds/update-nss-base.log"
+          ./scripts/feeds update nss_clients \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/feeds/update-nss-clients.log"
+
+          ./scripts/feeds install -a -p nss_base -f \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/feeds/install-nss-base.log"
+          ./scripts/feeds install -a -p nss_clients -f \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/feeds/install-nss-clients.log"
+
+          {
+            find -L package/feeds/nss_base -maxdepth 3 -type f -name Makefile -print
+            find -L package/feeds/nss_clients -maxdepth 3 -type f -name Makefile -print
+          } | sort > "$GITHUB_WORKSPACE/results/feeds/installed-package-makefiles.txt"
+
+          test -d package/feeds/nss_clients
+
+          for src in qca-nss-phy qca-ssdk qca-nss-ppe qca-nss-dp; do
+            test -e "package/feeds/nss_base/$src"
+          done
+
+          {
+            echo "===== installed nss_clients package dirs ====="
+            find -L package/feeds/nss_clients -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+            echo
+            echo "===== package release fingerprints ====="
+            grep -RInE \
+              'e978478|07fbf1b|b959456|d0a7b9c|6c1fafc|9f54bac|10a89a9|4108235|8c1c5f6|f45b2bf|0de0e5a' \
+              package/feeds/nss_base package/feeds/nss_clients \
+              --include=Makefile 2>/dev/null || true
+          } > "$GITHUB_WORKSPACE/results/feeds/installed-nss-map.txt"
+
+      - name: Prepare official OpenWrt package overlay and config
+        id: package_overlay
+        if: steps.feeds.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$GITHUB_WORKSPACE/qsdk"
+
+          test -f openwrt-patches/config/Config-build.in
+          test -d openwrt-patches/package
+          test -d ipq-scripts
+
+          # setup-environment creates .config before package/symlinks.
+          cat > .config <<'EOF'
+          CONFIG_TARGET_ipq95xx=y
+          CONFIG_TARGET_ipq95xx_generic=y
+          CONFIG_DEVEL=y
+          CONFIG_BUILD_LOG=y
+          CONFIG_CCACHE=y
+          CONFIG_PACKAGE_kmod-qca-nss-phy=y
+          CONFIG_PACKAGE_kmod-qca8084=y
+          CONFIG_PACKAGE_kmod-qca8k-cc=y
+          CONFIG_PACKAGE_kmod-qca-ssdk-nohnat=y
+          CONFIG_PACKAGE_kmod-qca-nss-debug=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe=y
+          CONFIG_PACKAGE_kmod-qca-nss-dp=y
+
+          # Mirror the known-good firmware's acceleration stack where these
+          # package symbols exist in the exact r9-00034 feeds.
+          CONFIG_PACKAGE_kmod-qca-nss-dscpstats=y
+          CONFIG_PACKAGE_kmod-qca-nss-ecm-premium=y
+          CONFIG_PACKAGE_kmod-qca-nss-eip=y
+          CONFIG_PACKAGE_kmod-qca-nss-eip-crypto=y
+          CONFIG_PACKAGE_kmod-qca-nss-eip-ipsec=y
+          CONFIG_PACKAGE_kmod-qca-nss-flowmgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-fls=y
+          CONFIG_PACKAGE_kmod-qca-nss-fls-lite=y
+          CONFIG_PACKAGE_kmod-qca-nss-macsec=y
+          CONFIG_PACKAGE_kmod-qca-nss-netfn-pkt-steer=y
+          CONFIG_PACKAGE_kmod-qca-nss-netfn-sk-offload=y
+          CONFIG_PACKAGE_kmod-qca-nss-netfn-tcpst=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-ath-clients=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-bridge-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-dsa-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-gre-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-l2tp=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-lag-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-mapt=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-pppoe-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-tunipip6=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-vlan-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-vxlanmgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-sfe=y
+          CONFIG_PACKAGE_kmod-qca-nss-wifi-plugins=y
+          CONFIG_PACKAGE_kmod-qca-ovsmgr=y
+          CONFIG_PACKAGE_kmod-qca-sac-drv=y
+          CONFIG_PACKAGE_kmod-qca-sdc-drv=y
+
+          # CONFIG_LINUX_IS_FLATTENED_TREE is not set
+          EOF
+
+          make package/symlinks V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/assembly/package-symlinks.log"
+
+          {
+            echo "===== openwrt-patches config ====="
+            find openwrt-patches/config -maxdepth 2 -type f -print | sort
+            echo
+            echo "===== package symlinks / overrides ====="
+            find package -maxdepth 4 -type l -printf '%p -> %l\n' | sort | head -n 3000
+          } > "$GITHUB_WORKSPACE/results/assembly/package-overlay-inventory.txt"
+
+          test -f openwrt-patches/config/Config-build.in
+
+      - name: Configure IPQ95xx generic core-module reference build
+        id: configure
+        if: steps.package_overlay.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$GITHUB_WORKSPACE/qsdk"
+
+          make defconfig V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/kernel/defconfig.log"
+
+          cp .config "$GITHUB_WORKSPACE/results/kernel/openwrt.config"
+
+          {
+            echo "CONFIG_BUILD_IN_PRESENT=$(test -f openwrt-patches/config/Config-build.in && echo yes || echo no)"
+            echo "TARGET_IPQ95XX=$(grep '^CONFIG_TARGET_ipq95xx=y' .config || true)"
+            echo "TARGET_SUBTARGET=$(grep '^CONFIG_TARGET_SUBTARGET=' .config || true)"
+            echo "TARGET_ARCH=$(grep '^CONFIG_ARCH=' .config || true)"
+          } > "$GITHUB_WORKSPACE/results/kernel/config-gate.txt"
+
+          grep -q '^CONFIG_TARGET_ipq95xx=y' .config
+
+          grep -E \
+            '^(CONFIG_TARGET_ipq95xx|CONFIG_PACKAGE_kmod-qca|CONFIG_KERNEL_|CONFIG_GCC_VERSION)' \
+            .config \
+            > "$GITHUB_WORKSPACE/results/kernel/selected-config.txt" || true
+
+
+          cat > "$GITHUB_WORKSPACE/results/extended/requested-package-symbols.txt" <<'EOF'
+          CONFIG_PACKAGE_kmod-qca-nss-dscpstats=y
+          CONFIG_PACKAGE_kmod-qca-nss-ecm-premium=y
+          CONFIG_PACKAGE_kmod-qca-nss-eip=y
+          CONFIG_PACKAGE_kmod-qca-nss-eip-crypto=y
+          CONFIG_PACKAGE_kmod-qca-nss-eip-ipsec=y
+          CONFIG_PACKAGE_kmod-qca-nss-flowmgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-fls=y
+          CONFIG_PACKAGE_kmod-qca-nss-fls-lite=y
+          CONFIG_PACKAGE_kmod-qca-nss-macsec=y
+          CONFIG_PACKAGE_kmod-qca-nss-netfn-pkt-steer=y
+          CONFIG_PACKAGE_kmod-qca-nss-netfn-sk-offload=y
+          CONFIG_PACKAGE_kmod-qca-nss-netfn-tcpst=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-ath-clients=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-bridge-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-dsa-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-gre-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-l2tp=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-lag-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-mapt=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-pppoe-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-tunipip6=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-vlan-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe-vxlanmgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-sfe=y
+          CONFIG_PACKAGE_kmod-qca-nss-wifi-plugins=y
+          CONFIG_PACKAGE_kmod-qca-ovsmgr=y
+          CONFIG_PACKAGE_kmod-qca-sac-drv=y
+          CONFIG_PACKAGE_kmod-qca-sdc-drv=y
+          EOF
+
+          : > "$GITHUB_WORKSPACE/results/extended/retained-package-symbols.txt"
+          : > "$GITHUB_WORKSPACE/results/extended/dropped-package-symbols.txt"
+          while IFS= read -r sym; do
+            if grep -qx "$sym" .config; then
+              echo "$sym" >> "$GITHUB_WORKSPACE/results/extended/retained-package-symbols.txt"
+            else
+              echo "$sym" >> "$GITHUB_WORKSPACE/results/extended/dropped-package-symbols.txt"
+            fi
+          done < "$GITHUB_WORKSPACE/results/extended/requested-package-symbols.txt"
+
+          # Hard gate: selected QSDK packages must survive defconfig.
+          for sym in \
+            CONFIG_PACKAGE_kmod-qca-nss-phy=y \
+            CONFIG_PACKAGE_kmod-qca8084=y \
+            CONFIG_PACKAGE_kmod-qca8k-cc=y \
+            CONFIG_PACKAGE_kmod-qca-ssdk-nohnat=y \
+            CONFIG_PACKAGE_kmod-qca-nss-debug=y \
+            CONFIG_PACKAGE_kmod-qca-nss-ppe=y \
+            CONFIG_PACKAGE_kmod-qca-nss-dp=y
+          do
+            grep -qx "$sym" .config
+          done
+
+      - name: Audit pinned SBE1V1K board support for QSDK transplant
+        id: board_audit
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euxo pipefail
+
+          B="$GITHUB_WORKSPACE/board-reference"
+          rm -rf "$B"
+          git init -q "$B"
+          git -C "$B" remote add origin "$BOARD_REPO"
+          git -C "$B" fetch --depth=1 origin "$BOARD_COMMIT"
+          git -C "$B" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$B" rev-parse HEAD)" = "$BOARD_COMMIT"
+
+          OUT="$GITHUB_WORKSPACE/results/board"
+          mkdir -p "$OUT/reference"
+
+          for f in \
+            README-SBE1V1K.md \
+            SBE1V1K-OpenWrt-Guide.md \
+            SBE1V1K-UBOOT.md \
+            configs/sbe1v1k.config \
+            package/firmware/ipq-wifi/src/board-askey_sbe1v1k.qcn9274 \
+            target/linux/qualcommbe/dts/ipq9570-sbe1v1k.dts
+          do
+            test -s "$B/$f"
+            mkdir -p "$OUT/reference/$(dirname "$f")"
+            cp "$B/$f" "$OUT/reference/$f"
+          done
+
+          grep -RIlE 'askey[_,-]sbe1v1k|Askey SBE1V1K|sbe1v1k' \
+            "$B/target/linux/qualcommbe" "$B/package" \
+            2>/dev/null | sort > "$OUT/reference-hit-files.txt" || true
+
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            rel="${f#$B/}"
+            mkdir -p "$OUT/hits/$(dirname "$rel")"
+            cp "$f" "$OUT/hits/$rel"
+          done < "$OUT/reference-hit-files.txt"
+
+          {
+            echo "===== board commit ====="
+            git -C "$B" show -s --format='%H%n%ci%n%s' HEAD
+            echo
+            echo "===== SBE1V1K references ====="
+            grep -RInE 'askey[_,-]sbe1v1k|Askey SBE1V1K|sbe1v1k' \
+              "$B/target/linux/qualcommbe" "$B/package" \
+              2>/dev/null | head -n 3000 || true
+            echo
+            echo "===== QSDK IPQ9574 DTS/DTSI candidates ====="
+            find "$GITHUB_WORKSPACE/qsdk/target/linux/feeds/ipq95xx" \
+              -type f \( -iname '*ipq9574*.dts' -o -iname '*ipq9574*.dtsi' -o -iname '*ipq9570*.dts' \) \
+              -print | sort
+            echo
+            echo "===== QSDK image definitions ====="
+            grep -RInE 'Device/|DEVICE_DTS|sysupgrade|emmc|mmc|ipq9574' \
+              "$GITHUB_WORKSPACE/qsdk/target/linux/feeds/ipq95xx/image" \
+              2>/dev/null | head -n 5000 || true
+          } > "$OUT/BOARD-INTEGRATION-AUDIT.txt"
+
+      - name: Transplant pinned SBE1V1K board support into QSDK IPQ95xx
+        id: board_transplant
+        if: steps.board_audit.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          O="$GITHUB_WORKSPACE/qsdk"
+          B="$GITHUB_WORKSPACE/board-reference"
+          T="$O/target/linux/feeds/ipq95xx"
+          R="$GITHUB_WORKSPACE/results/board"
+          mkdir -p "$R/transplanted"
+
+          test -s "$B/target/linux/qualcommbe/dts/ipq9570-sbe1v1k.dts"
+          cp "$B/target/linux/qualcommbe/dts/ipq9570-sbe1v1k.dts" \
+             "$T/files-6.6/arch/arm64/boot/dts/qcom/ipq9570-sbe1v1k.dts"
+          if [ -d "$T/files-6.6/arch/arm/boot/dts/qcom" ]; then
+            cp "$B/target/linux/qualcommbe/dts/ipq9570-sbe1v1k.dts" \
+               "$T/files-6.6/arch/arm/boot/dts/qcom/ipq9570-sbe1v1k.dts"
+          fi
+
+          mkdir -p "$T/base-files/etc/board.d" "$T/base-files/etc/hotplug.d/firmware" "$T/base-files/lib/upgrade"
+          cp "$B/target/linux/qualcommbe/ipq95xx/base-files/etc/board.d/02_network" "$T/base-files/etc/board.d/02_network"
+          cp "$B/target/linux/qualcommbe/ipq95xx/base-files/etc/hotplug.d/firmware/11-ath12k-caldata" "$T/base-files/etc/hotplug.d/firmware/11-ath12k-caldata"
+          cp "$B/target/linux/qualcommbe/ipq95xx/base-files/lib/upgrade/platform.sh" "$T/base-files/lib/upgrade/platform.sh"
+
+          IPQW="$O/package/firmware/ipq-wifi"
+          test -f "$B/package/firmware/ipq-wifi/Makefile"
+          test -s "$B/package/firmware/ipq-wifi/src/board-askey_sbe1v1k.qcn9274"
+
+          # V7 proved that editing the QSDK ipq-wifi Makefile with sed can
+          # corrupt generated Kconfig.  Use the pinned board-reference package
+          # definition verbatim instead; it already contains the SBE1V1K board
+          # in ALLWIFIBOARDS and the matching generate-ipq-wifi-package call.
+          rm -rf "$IPQW"
+          mkdir -p "$IPQW"
+          cp -a "$B/package/firmware/ipq-wifi/." "$IPQW/"
+
+          test -f "$IPQW/Makefile"
+          test -s "$IPQW/src/board-askey_sbe1v1k.qcn9274"
+          grep -q '^[[:space:]]*askey_sbe1v1k[[:space:]]*\\' "$IPQW/Makefile"
+          grep -q 'generate-ipq-wifi-package,askey_sbe1v1k,Askey SBE1V1K' "$IPQW/Makefile"
+
+          GMK="$T/image/generic.mk"
+          test -f "$GMK"
+          if ! grep -q '^define Device/askey_sbe1v1k$' "$GMK"; then
+            cat >> "$GMK" <<'EOF'
+
+          define Device/askey_sbe1v1k
+          	$(call Device/FitImage)
+          	DEVICE_VENDOR := Askey
+          	DEVICE_MODEL := SBE1V1K
+          	DEVICE_ALT0_VENDOR := Askey
+          	DEVICE_ALT0_MODEL := RTQ7300T
+          	DEVICE_ALT1_VENDOR := Spectrum
+          	DEVICE_ALT1_MODEL := SBE1V1K
+          	DEVICE_DTS := ipq9570-sbe1v1k
+          	DEVICE_DTS_CONFIG := config@rtq7300t-rev0
+          	KERNEL_LOADADDR := 0x42080000
+          	SOC := ipq9570
+          	DEVICE_PACKAGES := ath12k-firmware-qcn9274 f2fsck ipq-wifi-askey_sbe1v1k \
+          		kmod-ath12k kmod-hwmon-pwmfan kmod-phy-realtek mkf2fs rtl826x-firmware
+          endef
+          TARGET_DEVICES += askey_sbe1v1k
+          EOF
+          fi
+
+          cp "$T/files-6.6/arch/arm64/boot/dts/qcom/ipq9570-sbe1v1k.dts" "$R/transplanted/"
+          cp "$GMK" "$R/transplanted/generic.mk"
+          {
+            echo "dts=$(grep -c 'compatible = \"askey,sbe1v1k\"' "$T/files-6.6/arch/arm64/boot/dts/qcom/ipq9570-sbe1v1k.dts")"
+            echo "image=$(grep -c '^define Device/askey_sbe1v1k$' "$GMK")"
+            echo "network=$(grep -c 'askey,sbe1v1k' "$T/base-files/etc/board.d/02_network")"
+            echo "caldata=$(grep -c 'askey,sbe1v1k' "$T/base-files/etc/hotplug.d/firmware/11-ath12k-caldata")"
+            echo "upgrade=$(grep -c 'askey,sbe1v1k' "$T/base-files/lib/upgrade/platform.sh")"
+            echo "bdf=$(test -s "$IPQW/src/board-askey_sbe1v1k.qcn9274" && echo yes || echo no)"
+          } | tee "$R/TRANSPLANT-GATE.txt"
+          grep -qx 'dts=1' "$R/TRANSPLANT-GATE.txt"
+          grep -qx 'image=1' "$R/TRANSPLANT-GATE.txt"
+          grep -q '^network=[1-9]' "$R/TRANSPLANT-GATE.txt"
+          grep -q '^caldata=[1-9]' "$R/TRANSPLANT-GATE.txt"
+          grep -q '^upgrade=[1-9]' "$R/TRANSPLANT-GATE.txt"
+          grep -qx 'bdf=yes' "$R/TRANSPLANT-GATE.txt"
+
+      - name: Cache downloads
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: qsdk/dl
+          key: qsdk-r9-00034-dl-${{ runner.os }}-${{ env.OPENWRT_COMMIT }}
+          restore-keys: |
+            qsdk-r9-00034-dl-${{ runner.os }}-
+
+      - name: Cache ccache
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: qsdk-r9-00034-ccache-${{ runner.os }}-${{ env.LINUX_COMMIT }}
+          restore-keys: |
+            qsdk-r9-00034-ccache-${{ runner.os }}-
+
+      - name: Download selected sources
+        id: download
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/qsdk"
+
+          make -j"$(nproc)" download V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/kernel/download.log"
+
+      - name: Build host tools and toolchain
+        id: toolchain
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$GITHUB_WORKSPACE/qsdk"
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+          make -j"$(nproc)" tools/install V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/kernel/tools.log"
+
+          make -j"$(nproc)" toolchain/install V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/kernel/toolchain.log"
+
+      - name: Build exact Linux IPQ 6.6 kernel
+        id: kernel
+        if: steps.toolchain.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$GITHUB_WORKSPACE/qsdk"
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+          make -j"$(nproc)" target/linux/compile V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/kernel/compile.log"
+
+      - name: Verify kernel and toolchain identity
+        id: kernel_gate
+        if: steps.kernel.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          O="$GITHUB_WORKSPACE/qsdk"
+
+          mapfile -t symvers < <(
+            find "$O/build_dir" \
+              -type f -name Module.symvers \
+              -path '*ipq95xx*' \
+              -print 2>/dev/null | sort
+          )
+
+          printf '%s\n' "${symvers[@]}" \
+            > results/kernel/symvers-candidates.txt
+
+          test "${#symvers[@]}" -ge 1
+
+          KERNEL_DIR=""
+
+          for s in "${symvers[@]}"; do
+            d="$(dirname "$s")"
+
+            if [ -f "$d/include/generated/utsrelease.h" ]; then
+              if grep -q '6\.6\.116' "$d/include/generated/utsrelease.h"; then
+                KERNEL_DIR="$d"
+                break
+              fi
+            fi
+          done
+
+          test -n "$KERNEL_DIR"
+          test -s "$KERNEL_DIR/Module.symvers"
+
+          mapfile -t gccs < <(
+            find -L "$O/staging_dir" \
+              -type f \
+              -path '*/toolchain-aarch64*/bin/aarch64-openwrt-linux-musl-gcc' \
+              -print 2>/dev/null | sort
+          )
+
+          test "${#gccs[@]}" -ge 1
+
+          GCC="${gccs[0]}"
+          TOOLCHAIN_DIR="$(dirname "$(dirname "$GCC")")"
+          CROSS_COMPILE="${GCC%gcc}"
+
+          KVER="$(make -s -C "$KERNEL_DIR" kernelversion)"
+          KREL="$(make -s -C "$KERNEL_DIR" kernelrelease)"
+
+          {
+            echo "KERNEL_DIR=$KERNEL_DIR"
+            echo "GCC=$GCC"
+            echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR"
+            echo "CROSS_COMPILE=$CROSS_COMPILE"
+            echo "KVER=$KVER"
+            echo "KREL=$KREL"
+          } | tee results/environment.txt
+
+          cat "$KERNEL_DIR/include/generated/utsrelease.h" \
+            | tee results/kernel/utsrelease.txt
+
+          "$GCC" --version \
+            | tee results/kernel/compiler-version.txt
+
+          "$GCC" -dumpfullversion \
+            | tee results/kernel/gcc-full-version.txt
+
+          test "$KVER" = "6.6.116"
+
+      - name: Compile genuine qca-nss-phy package
+        id: phy
+        if: steps.kernel_gate.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$GITHUB_WORKSPACE/qsdk"
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+          make -j"$(nproc)" \
+            package/feeds/nss_base/qca-nss-phy/compile V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/phy/compile.log"
+
+          BUILD_ROOT="$(
+            find build_dir -maxdepth 4 -type d \
+              -name 'qca-nss-phy-*' -print \
+              | head -n1
+          )"
+
+          test -n "$BUILD_ROOT"
+
+          echo "$BUILD_ROOT" \
+            > "$GITHUB_WORKSPACE/results/phy/build-root.txt"
+
+          find "$BUILD_ROOT" \
+            -type f \
+            \( -name '*.ko' -o -name Module.symvers \) \
+            -printf '%p\t%s bytes\n' \
+            | sort \
+            > "$GITHUB_WORKSPACE/results/phy/products.txt"
+
+          for ko in \
+            qca8k-cc.ko \
+            qca8084-phy.ko \
+            qca-nss-phy.ko
+          do
+            path="$(
+              find "$BUILD_ROOT" -type f -name "$ko" \
+                -print -quit
+            )"
+
+            test -n "$path"
+            test -s "$path"
+
+            cp "$path" "$GITHUB_WORKSPACE/results/modules/$ko"
+            modinfo "$path" \
+              > "$GITHUB_WORKSPACE/results/phy/${ko}.modinfo.txt"
+          done
+
+          # Build an aggregate of genuine vendor symvers only.
+          find "$BUILD_ROOT" \
+            -type f -name Module.symvers -print \
+            | sort \
+            > "$GITHUB_WORKSPACE/results/phy/symvers-list.txt"
+
+          : > "$GITHUB_WORKSPACE/results/phy/aggregate-Module.symvers"
+
+          while IFS= read -r f; do
+            [ -s "$f" ] && cat "$f"
+          done < "$GITHUB_WORKSPACE/results/phy/symvers-list.txt" \
+            | awk 'NF >= 4 && !seen[$2]++' \
+            > "$GITHUB_WORKSPACE/results/phy/aggregate-Module.symvers"
+
+      - name: Require all 15 genuine PHY exported provider symbols
+        id: phy_gate
+        if: steps.phy.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          QCA8K="$GITHUB_WORKSPACE/results/modules/qca8k-cc.ko"
+          QCA8084="$GITHUB_WORKSPACE/results/modules/qca8084-phy.ko"
+
+          test -s "$QCA8K"
+          test -s "$QCA8084"
+
+          # OpenWrt's package build may clean temporary Module.symvers files.
+          # Check the finished ELF modules directly.  __ksymtab_<name> proves
+          # that a global function is actually EXPORT_SYMBOL'ed for consumers.
+          nm "$QCA8K" \
+            > results/phy/qca8k-cc.nm.txt
+
+          nm "$QCA8084" \
+            > results/phy/qca8084-phy.nm.txt
+
+          cat > results/phy/provider-map.tsv <<'EOF'
+          qca8k-cc.ko	qca8k_clk_assert
+          qca8k-cc.ko	qca8k_clk_deassert
+          qca8k-cc.ko	qca8k_clk_disable
+          qca8k-cc.ko	qca8k_clk_enable
+          qca8k-cc.ko	qca8k_clk_is_asserted
+          qca8k-cc.ko	qca8k_clk_parent_set
+          qca8k-cc.ko	qca8k_clk_rate_set
+          qca8k-cc.ko	qca8k_clk_reset
+          qca8k-cc.ko	qca8k_gcc_clock_init
+          qca8k-cc.ko	qca8k_gcc_port_clk_parent_set
+          qca8k-cc.ko	qca8k_port_clk_en_set
+          qca8k-cc.ko	qca8k_port_clk_reset
+          qca8084-phy.ko	qcom_phy_pcs_interface_set
+          qca8084-phy.ko	qcom_phy_pcs_mode_check
+          qca8084-phy.ko	qcom_phy_pcs_speed_clock_set
+          EOF
+
+          : > results/phy/provider-gate.tsv
+          : > results/phy/missing-symbols.txt
+
+          while IFS=$'\t' read -r module symbol; do
+            case "$module" in
+              qca8k-cc.ko)
+                nmfile="results/phy/qca8k-cc.nm.txt"
+                ;;
+              qca8084-phy.ko)
+                nmfile="results/phy/qca8084-phy.nm.txt"
+                ;;
+              *)
+                echo "Unknown provider module: $module" >&2
+                exit 61
+                ;;
+            esac
+
+            if grep -Eq "[[:space:]]__ksymtab_${symbol}$" "$nmfile" \
+               && grep -Eq "[[:space:]][TtWw][[:space:]]${symbol}$" "$nmfile"; then
+              printf '%s\t%s\tPASS\n' "$module" "$symbol" \
+                >> results/phy/provider-gate.tsv
+            else
+              printf '%s\t%s\tFAIL\n' "$module" "$symbol" \
+                >> results/phy/provider-gate.tsv
+              echo "$symbol" >> results/phy/missing-symbols.txt
+            fi
+          done < results/phy/provider-map.tsv
+
+          test "$(wc -l < results/phy/provider-gate.tsv)" -eq 15
+          test ! -s results/phy/missing-symbols.txt
+          test "$(grep -c $'\tPASS$' results/phy/provider-gate.tsv)" -eq 15
+
+          {
+            echo "15/15 PASS"
+            echo "gate=finished-module-ELF-__ksymtab"
+          } | tee results/phy/PROVIDER-GATE.txt
+
+      - name: Compile genuine qca-ssdk package
+        id: ssdk
+        if: steps.phy_gate.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$GITHUB_WORKSPACE/qsdk"
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+          make -j"$(nproc)" \
+            package/feeds/nss_base/qca-ssdk/compile V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/ssdk/compile.log"
+
+          SSDK_KO="$(
+            find build_dir \
+              -type f -name 'qca-ssdk.ko' \
+              -print -quit
+          )"
+
+          test -n "$SSDK_KO"
+          test -s "$SSDK_KO"
+
+          cp "$SSDK_KO" \
+            "$GITHUB_WORKSPACE/results/modules/qca-ssdk.ko"
+
+          modinfo "$SSDK_KO" \
+            > "$GITHUB_WORKSPACE/results/ssdk/modinfo.txt"
+
+          SSDK_ROOT="$(
+            dirname "$(
+              find build_dir \
+                -type f -name Module.symvers \
+                -path '*qca-ssdk*' \
+                -print -quit
+            )"
+          )"
+
+          find build_dir \
+            -type f -name Module.symvers \
+            -path '*qca-ssdk*' \
+            -print \
+            > "$GITHUB_WORKSPACE/results/ssdk/symvers-list.txt" || true
+
+      - name: Compile genuine qca-nss-ppe package
+        id: ppe
+        if: steps.ssdk.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$GITHUB_WORKSPACE/qsdk"
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+          make -j"$(nproc)" \
+            package/feeds/nss_base/qca-nss-ppe/compile V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/ppe/compile.log"
+
+          PPE_KO="$(
+            find build_dir \
+              -type f -name 'qca-nss-ppe.ko' \
+              -print -quit
+          )"
+
+          DEBUG_KO="$(
+            find build_dir \
+              -type f -name 'qca-nss-debug.ko' \
+              -print -quit
+          )"
+
+          test -n "$PPE_KO"
+          test -s "$PPE_KO"
+          test -n "$DEBUG_KO"
+          test -s "$DEBUG_KO"
+
+          cp "$PPE_KO" \
+            "$GITHUB_WORKSPACE/results/modules/qca-nss-ppe.ko"
+
+          cp "$DEBUG_KO" \
+            "$GITHUB_WORKSPACE/results/modules/qca-nss-debug.ko"
+
+          modinfo "$PPE_KO" \
+            > "$GITHUB_WORKSPACE/results/ppe/modinfo.txt"
+
+          modinfo "$DEBUG_KO" \
+            > "$GITHUB_WORKSPACE/results/nss-debug/modinfo.txt"
+
+      - name: Compile genuine qca-nss-dp package
+        id: nss_dp
+        if: steps.ppe.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$GITHUB_WORKSPACE/qsdk"
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+          make -j"$(nproc)" \
+            package/feeds/nss_base/qca-nss-dp/compile V=s \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/nss-dp/compile.log"
+
+          DP_KO="$(
+            find build_dir \
+              -type f -name 'qca-nss-dp.ko' \
+              -print -quit
+          )"
+
+          test -n "$DP_KO"
+          test -s "$DP_KO"
+
+          cp "$DP_KO" \
+            "$GITHUB_WORKSPACE/results/modules/qca-nss-dp.ko"
+
+          modinfo "$DP_KO" \
+            > "$GITHUB_WORKSPACE/results/nss-dp/modinfo.txt"
+
+      - name: Select exact NSS recipes from installed r9-00034 feeds
+        id: extended_map
+        if: steps.nss_dp.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/qsdk"
+          OUT="$GITHUB_WORKSPACE/results/extended"
+          : > "$OUT/packages-to-compile.txt"
+          : > "$OUT/missing-components.txt"
+          cat > "$OUT/required-recipes.txt" <<'EOF'
+          package/feeds/nss_clients/qca-nss-ecm
+          package/feeds/nss_clients/qca-nss-netfn
+          package/feeds/nss_clients/qca-nss-ae-clients
+          package/feeds/nss_clients/qca-nss-sfe
+          package/feeds/nss_clients/qca-ovsmgr
+          package/feeds/nss_clients/qca-nss-nsm
+          package/feeds/nss_clients/qca-nss-fls
+          package/feeds/nss_clients/qca-nss-fls-lite
+          package/feeds/nss_clients/qca-nss-dscpstats
+          package/feeds/nss_clients/qca-nss-wifi-plugins
+          package/feeds/nss_base/qca-nss-eip
+          package/feeds/nss_base/qca-nss-macsec
+          package/feeds/nss_base/qca-sxc-drv
+          EOF
+          while IFS= read -r pkg; do
+            [ -n "$pkg" ] || continue
+            if [ -f "$pkg/Makefile" ]; then
+              echo "$pkg" >> "$OUT/packages-to-compile.txt"
+            else
+              echo "$pkg" >> "$OUT/missing-components.txt"
+            fi
+          done < "$OUT/required-recipes.txt"
+          sort -u -o "$OUT/packages-to-compile.txt" "$OUT/packages-to-compile.txt"
+          {
+            echo "===== selected ====="
+            cat "$OUT/packages-to-compile.txt"
+            echo "===== missing ====="
+            cat "$OUT/missing-components.txt"
+          } | tee "$OUT/component-package-map.txt"
+          test ! -s "$OUT/missing-components.txt"
+          test "$(wc -l < "$OUT/packages-to-compile.txt")" -ge 10
+
+      - name: Compile every resolved NSS extension recipe before deciding pass/fail
+        id: extended_compile
+        if: steps.extended_map.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          cd "$GITHUB_WORKSPACE/qsdk"
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+          STATUS="$GITHUB_WORKSPACE/results/extended/compile-status.tsv"
+          printf 'package\trc\tseconds\n' > "$STATUS"
+          failed=0
+
+          while IFS= read -r pkg; do
+            [ -n "$pkg" ] || continue
+            safe="$(printf '%s' "$pkg" | tr '/:' '__')"
+            d="$GITHUB_WORKSPACE/results/extended/logs/$safe"
+            mkdir -p "$d"
+            echo "========== $pkg =========="
+            start="$(date +%s)"
+
+            set +e
+            make -j"$(nproc)" "$pkg/compile" V=s 2>&1 | tee "$d/compile.log"
+            rc="${PIPESTATUS[0]}"
+            set -e
+
+            end="$(date +%s)"
+            printf '%s\t%s\t%s\n' "$pkg" "$rc" "$((end-start))" >> "$STATUS"
+            grep -nEi 'fatal error:|error:|undefined!|No rule to make target|No such file|hash mismatch|recursive dependency|failed' \
+              "$d/compile.log" | head -n 500 > "$d/errors.txt" || true
+            if [ "$rc" -ne 0 ]; then failed=1; fi
+          done < "$GITHUB_WORKSPACE/results/extended/packages-to-compile.txt"
+
+          cat "$STATUS"
+          exit "$failed"
+
+      - name: Audit extended acceleration modules against known-good firmware
+        id: extended_audit
+        if: always() && steps.nss_dp.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$GITHUB_WORKSPACE/qsdk"
+          OUT="$GITHUB_WORKSPACE/results/extended/modules"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          find build_dir -type f -name '*.ko' \
+            | grep -Ei '/(ecm|qca-nss|qca-ovs|qca-s[ad]c|qca-sxc|.*ppe.*|.*netfn.*|.*flowmgr.*|.*fls.*|.*sfe.*)' \
+            | sort > "$GITHUB_WORKSPACE/results/extended/ko-paths.txt" || true
+
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            base="$(basename "$f")"
+            if [ ! -e "$OUT/$base" ]; then
+              cp "$f" "$OUT/$base"
+            else
+              safe="$(printf '%s' "${f#build_dir/}" | tr '/' '_')"
+              cp "$f" "$OUT/$safe"
+            fi
+          done < "$GITHUB_WORKSPACE/results/extended/ko-paths.txt"
+
+          cat > "$GITHUB_WORKSPACE/results/extended/expected-major-modules.txt" <<'EOF'
+          ecm.ko
+          qca-nss-dscpstats.ko
+          qca-nss-eip.ko
+          qca-nss-flowmgr.ko
+          qca-nss-fls.ko
+          qca-nss-fls-lite.ko
+          qca-nss-netfn-pkt-steer.ko
+          qca-nss-netfn-sk-offload.ko
+          qca-nss-netfn-tcpst.ko
+          qca-nss-ppe-bridge-mgr.ko
+          qca-nss-ppe-dsa-mgr.ko
+          qca-nss-ppe-gre.ko
+          qca-nss-ppe-l2tp.ko
+          qca-nss-ppe-lag.ko
+          qca-nss-ppe-mapt.ko
+          qca-nss-ppe-pppoe-mgr.ko
+          qca-nss-ppe-tunipip6.ko
+          qca-nss-ppe-vlan.ko
+          qca-nss-ppe-vxlanmgr.ko
+          qca-nss-sfe.ko
+          qca-ovsmgr.ko
+          qca-sac-drv.ko
+          qca-sdc-drv.ko
+          qca-nss-macsec.ko
+          qca-nss-wifi-plugins.ko
+          EOF
+
+          : > "$GITHUB_WORKSPACE/results/extended/missing-major-modules.txt"
+          : > "$GITHUB_WORKSPACE/results/extended/VERMAGIC-FAIL.txt"
+          : > "$GITHUB_WORKSPACE/results/extended/MODINFO.txt"
+          : > "$GITHUB_WORKSPACE/results/extended/UNDEFINED-SYMBOLS.txt"
+
+          while IFS= read -r ko; do
+            [ -n "$ko" ] || continue
+            test -s "$OUT/$ko" || echo "$ko" >> "$GITHUB_WORKSPACE/results/extended/missing-major-modules.txt"
+          done < "$GITHUB_WORKSPACE/results/extended/expected-major-modules.txt"
+
+          count=0
+          for f in "$OUT"/*.ko; do
+            [ -f "$f" ] || continue
+            count=$((count + 1))
+            {
+              echo "===== $(basename "$f") ====="
+              modinfo "$f" 2>/dev/null || true
+              echo
+            } >> "$GITHUB_WORKSPACE/results/extended/MODINFO.txt"
+
+            vermagic="$(modinfo -F vermagic "$f" 2>/dev/null || true)"
+            if [[ -n "$vermagic" && "$vermagic" != 6.6.116* ]]; then
+              printf '%s\t%s\n' "$(basename "$f")" "$vermagic" >> "$GITHUB_WORKSPACE/results/extended/VERMAGIC-FAIL.txt"
+            fi
+
+            {
+              echo "===== $(basename "$f") ====="
+              nm -u "$f" 2>/dev/null || true
+              echo
+            } >> "$GITHUB_WORKSPACE/results/extended/UNDEFINED-SYMBOLS.txt"
+          done
+
+          echo "$count" > "$GITHUB_WORKSPACE/results/extended/module-count.txt"
+          {
+            echo "module_count=$count"
+            echo "missing_components=$(wc -l < "$GITHUB_WORKSPACE/results/extended/missing-components.txt")"
+            echo "missing_major_modules=$(wc -l < "$GITHUB_WORKSPACE/results/extended/missing-major-modules.txt")"
+            echo "vermagic_fail=$(wc -l < "$GITHUB_WORKSPACE/results/extended/VERMAGIC-FAIL.txt")"
+          } | tee "$GITHUB_WORKSPACE/results/extended/AUDIT-SUMMARY.txt"
+
+          test "$count" -gt 0
+          test ! -s "$GITHUB_WORKSPACE/results/extended/VERMAGIC-FAIL.txt"
+
+      - name: Configure transplanted SBE1V1K image target
+        id: image_config
+        if: steps.board_transplant.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/qsdk"
+
+          # V10 board-image profile: remove optional NSS extension selections
+          # that V9 proved can abort the global image build before the board
+          # reaches DTS/FIT/rootfs.  Keep the already-proven PHY/SSDK/PPE/NSS-DP
+          # core packages selected below.
+          sed -i -E '/^CONFIG_PACKAGE_(kmod-)?qca-(nss-(ecm|eip|flowmgr|fls|fls-lite|dscpstats|netfn|ovsmgr)|ovsmgr|sac-drv|sdc-drv|sxc-drv)=y$/d' .config || true
+          sed -i -E '/^CONFIG_PACKAGE_kmod-qca-nss-(ecm|eip|flowmgr|fls|fls-lite|dscpstats|netfn|ppe-ath-clients|ppe-bridge-mgr|ppe-dsa-mgr|ppe-gre-mgr|ppe-l2tp|ppe-lag-mgr|ppe-mapt|ppe-pppoe-mgr|ppe-tunipip6|ppe-vlan-mgr|ppe-vxlanmgr|sfe|wifi-plugins)=y$/d' .config || true
+
+          cat >> .config <<'EOF'
+          CONFIG_TARGET_ipq95xx=y
+          CONFIG_TARGET_ipq95xx_generic=y
+          CONFIG_TARGET_ipq95xx_generic_DEVICE_askey_sbe1v1k=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          CONFIG_PACKAGE_kmod-qca-nss-phy=y
+          CONFIG_PACKAGE_kmod-qca8084=y
+          CONFIG_PACKAGE_kmod-qca8k-cc=y
+          CONFIG_PACKAGE_kmod-qca-ssdk-nohnat=y
+          CONFIG_PACKAGE_kmod-qca-nss-debug=y
+          CONFIG_PACKAGE_kmod-qca-nss-ppe=y
+          CONFIG_PACKAGE_kmod-qca-nss-dp=y
+          EOF
+          make defconfig V=s 2>&1 | tee "$GITHUB_WORKSPACE/results/board/image-defconfig.log"
+
+          # Fail-fast diagnostic: the minimal image profile must not select the
+          # V9 blocker. If it is selected by dependency propagation, turn it off
+          # explicitly and normalize the config once more.
+          if grep -qE '^CONFIG_PACKAGE_(kmod-)?qca-ovsmgr=y$' .config; then
+            sed -i -E 's/^CONFIG_PACKAGE_(kmod-)?qca-ovsmgr=y$/# CONFIG_PACKAGE_\1qca-ovsmgr is not set/' .config
+            make defconfig V=s 2>&1 | tee -a "$GITHUB_WORKSPACE/results/board/image-defconfig.log"
+          fi
+
+          cp .config "$GITHUB_WORKSPACE/results/board/image-openwrt.config"
+          grep -E 'CONFIG_TARGET_ipq95xx|askey_sbe1v1k|CONFIG_TARGET_ROOTFS' .config \
+            | tee "$GITHUB_WORKSPACE/results/board/image-selected-config.txt"
+          grep -q '^CONFIG_TARGET_ipq95xx=y' .config
+          grep -q '^CONFIG_TARGET_ipq95xx_generic=y' .config
+          grep -q '^CONFIG_TARGET_ipq95xx_generic_DEVICE_askey_sbe1v1k=y' .config
+          ! grep -qE '^CONFIG_PACKAGE_(kmod-)?qca-ovsmgr=y$' .config
+          grep -E '^CONFIG_PACKAGE_(kmod-)?qca-(nss|ovsmgr)|^# CONFIG_PACKAGE_(kmod-)?qca-(nss|ovsmgr)' .config             > "$GITHUB_WORKSPACE/results/board/minimal-image-nss-config.txt" || true
+
+      - name: Preflight exact qca-mmap-telemetry source before image build
+        id: mmap_gate
+        if: steps.image_config.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          O="$GITHUB_WORKSPACE/qsdk"
+          SRC="$O/qca/src/nss/base/qca-mmap-telemetry"
+          test -d "$SRC"
+          test -s "$SRC/Makefile"
+          test "$(git -C "$SRC" rev-parse HEAD)" = "$NSS_MMAP_TELEMETRY_COMMIT"
+          {
+            echo "source=$SRC"
+            echo "commit=$(git -C "$SRC" rev-parse HEAD)"
+            echo "makefile=yes"
+          } | tee "$GITHUB_WORKSPACE/results/image/MMAP-SOURCE-GATE.txt"
+
+      - name: Directed SBE1V1K target/image pipeline
+        id: image_build
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd qsdk
+          mkdir -p "$GITHUB_WORKSPACE/results/image"
+
+          # Never use the global `world` target here. V10/V11 proved that it
+          # traverses unrelated nss_clients (ovsmgr/emesh-sp) even though they
+          # are not selected in the SBE1V1K image config.
+          {
+            echo "=== selected target ==="
+            grep -E '^CONFIG_TARGET_ipq95xx|^CONFIG_TARGET_PROFILE|^CONFIG_TARGET_ROOTFS' .config || true
+            echo
+            echo "=== selected core NSS packages ==="
+            grep -E '^CONFIG_PACKAGE_(kmod-)?qca-(nss|ssdk|8084|8k)' .config || true
+            echo
+            echo "=== forbidden optional blockers ==="
+            grep -E '^CONFIG_PACKAGE_(kmod-)?(emesh-sp|qca-ovsmgr)=y$' .config || true
+          } | tee "$GITHUB_WORKSPACE/results/image/V12-PREBUILD-CONFIG.txt"
+
+          if grep -Eq '^CONFIG_PACKAGE_(kmod-)?(emesh-sp|qca-ovsmgr)=y$' .config; then
+            echo "FAIL: optional blocker unexpectedly selected"
+            exit 31
+          fi
+
+          run_stage() {
+            local name="$1"; shift
+            echo "::group::V12 $name"
+            set +e
+            "$@" 2>&1 | tee "$GITHUB_WORKSPACE/results/image/${name}.log"
+            local rc=${PIPESTATUS[0]}
+            set -e
+            echo "$rc" > "$GITHUB_WORKSPACE/results/image/${name}.rc"
+            echo "::endgroup::"
+            return "$rc"
+          }
+
+          set -e
+          # Toolchain/kernel/core packages are already proven by earlier gates.
+          # These targets deliberately avoid `make world`.
+          run_stage target-compile make -j"$(nproc)" target/compile V=s
+
+          # V12 reached package/install but failed because the host-side opkg
+          # executable had never been built. Build exactly that host tool and
+          # hard-gate its presence before touching rootfs assembly.
+          run_stage opkg-host make -j"$(nproc)" package/system/opkg/host/compile V=s
+
+          OPKG_HOST="$PWD/staging_dir/host/bin/opkg"
+          {
+            echo "expected=$OPKG_HOST"
+            if [ -e "$OPKG_HOST" ]; then
+              ls -l "$OPKG_HOST"
+              file "$OPKG_HOST" || true
+            else
+              echo "MISSING"
+            fi
+          } | tee "$GITHUB_WORKSPACE/results/image/V13-OPKG-HOST-GATE.txt"
+
+          if [ ! -x "$OPKG_HOST" ]; then
+            echo "FAIL: host opkg was not produced at staging_dir/host/bin/opkg"
+            find staging_dir -maxdepth 5 -type f -name 'opkg*' -print 2>/dev/null \
+              | tee "$GITHUB_WORKSPACE/results/image/opkg-search.txt" || true
+            exit 32
+          fi
+
+          # Build only packages selected by the final SBE1V1K .config.
+          # package/install assembles the rootfs staging tree; it does not use
+          # the global world target.
+          run_stage package-install make -j"$(nproc)" package/install V=s
+
+          # V14: audit all transplanted DTS phandle references against
+          # the exact QSDK 6.6 IPQ95xx DTS tree before target/install.
+          DTS="$(find target/linux/feeds/ipq95xx -type f -name 'ipq9570-sbe1v1k.dts' -print -quit)"
+          test -n "$DTS" || { echo "FAIL: SBE1V1K DTS not found"; exit 41; }
+
+          grep -oE '&[A-Za-z_][A-Za-z0-9_]*' "$DTS" | sed 's/^&//' | sort -u \
+            > "$GITHUB_WORKSPACE/results/image/V14-DTS-ALL-REFS.txt"
+
+          : > "$GITHUB_WORKSPACE/results/image/V14-DTS-MISSING-LABELS.txt"
+          while read -r label; do
+            if ! grep -RqsE "^[[:space:]]*${label}[[:space:]]*:" \
+              target/linux/feeds/ipq95xx/files-6.6/arch/arm64/boot/dts/qcom; then
+              echo "$label" >> "$GITHUB_WORKSPACE/results/image/V14-DTS-MISSING-LABELS.txt"
+            fi
+          done < "$GITHUB_WORKSPACE/results/image/V14-DTS-ALL-REFS.txt"
+
+          find target/linux/feeds/ipq95xx/files-6.6/arch/arm64/boot/dts/qcom -type f \
+            \( -name '*ipq9574*.dts' -o -name '*ipq9574*.dtsi' -o -name '*ipq95*.dts' -o -name '*ipq95*.dtsi' \) \
+            -print | sort > "$GITHUB_WORKSPACE/results/image/V14-IPQ95XX-DTS-INVENTORY.txt"
+
+          grep -RniE 'pcie[0-9]?|ref_48mhz_clk|xo_board_clk|xo_clk|gcc_pcie|pcie_phy' \
+            target/linux/feeds/ipq95xx/files-6.6/arch/arm64/boot/dts/qcom \
+            > "$GITHUB_WORKSPACE/results/image/V14-DTS-EQUIVALENT-EVIDENCE.txt" || true
+
+          {
+            echo "DTS=$DTS"
+            echo "all_refs=$(wc -l < "$GITHUB_WORKSPACE/results/image/V14-DTS-ALL-REFS.txt")"
+            echo "missing_refs=$(wc -l < "$GITHUB_WORKSPACE/results/image/V14-DTS-MISSING-LABELS.txt")"
+            echo "=== missing labels ==="
+            cat "$GITHUB_WORKSPACE/results/image/V14-DTS-MISSING-LABELS.txt"
+          } | tee "$GITHUB_WORKSPACE/results/image/V14-DTS-AUDIT-SUMMARY.txt"
+
+          # V15: capture exact native QSDK 6.6 contexts for every
+          # incompatible SBE1V1K label before any rewrite. This gives the next
+          # patch round enough evidence to modify the DTS in one batch.
+          QCOM_DTS="target/linux/feeds/ipq95xx/files-6.6/arch/arm64/boot/dts/qcom"
+          {
+            echo "=== exact IPQ9574 include/label context ==="
+            grep -RniE 'pcie[0-3](_x[12])?|pcie[0-3]_phy|qcom_ppe|ppe|pcs[0-2]_ch[0-3]|uniphy|ref_48mhz_clk|xo_board_clk|xo_clk' "$QCOM_DTS" || true
+          } > "$GITHUB_WORKSPACE/results/image/V15-QSDK-NATIVE-CONTEXT.txt"
+
+          # Capture complete blocks around representative official IPQ9574
+          # boards so PCIe/PPE/PCS wiring can be compared without guessing.
+          for f in "$QCOM_DTS"/ipq9574*.dts "$QCOM_DTS"/ipq9574*.dtsi; do
+            [ -f "$f" ] || continue
+            if grep -qE 'pcie1_x1|pcie2_x2|pcie3_x2|pcs0_ch|qcom_ppe|&ppe|ethernet-port' "$f"; then
+              echo "===== $f ====="
+              cat "$f"
+            fi
+          done > "$GITHUB_WORKSPACE/results/image/V15-IPQ9574-REFERENCE-DTS.txt"
+
+          # Record old SBE1V1K contexts for side-by-side mapping.
+          grep -nE -C 8 '&(pcie[123]|qcom_ppe|pcs[0-2]_ch[0-3]|ref_48mhz_clk|xo_board_clk|xo_clk)|pcs-handle|phy-mode|phy-handle' "$DTS" \
+            > "$GITHUB_WORKSPACE/results/image/V15-SBE1V1K-OLD-CONTEXT.txt" || true
+
+          {
+            echo "pcie1_x1_defs=$(grep -RhcE '^[[:space:]]*pcie1_x1[[:space:]]*:' "$QCOM_DTS" | awk '{s+=$1} END{print s+0}')"
+            echo "pcie2_x2_defs=$(grep -RhcE '^[[:space:]]*pcie2_x2[[:space:]]*:' "$QCOM_DTS" | awk '{s+=$1} END{print s+0}')"
+            echo "pcie3_x2_defs=$(grep -RhcE '^[[:space:]]*pcie3_x2[[:space:]]*:' "$QCOM_DTS" | awk '{s+=$1} END{print s+0}')"
+            echo "native_context_lines=$(wc -l < "$GITHUB_WORKSPACE/results/image/V15-QSDK-NATIVE-CONTEXT.txt")"
+          } | tee "$GITHUB_WORKSPACE/results/image/V15-MAPPING-GATE.txt"
+
+          # V16 applies only mappings proven by V15's exact QSDK tree.
+          # PCIe mappings are unambiguous in the native IPQ9574 DTS:
+          # pcie1 -> pcie1_x1, pcie2 -> pcie2_x2, pcie3 -> pcie3_x2.
+          cp "$DTS" "$GITHUB_WORKSPACE/results/image/ipq9570-sbe1v1k.pre-v16.dts"
+          sed -i -E 's/&pcie1([^A-Za-z0-9_]|$)/\&pcie1_x1\1/g; s/&pcie2([^A-Za-z0-9_]|$)/\&pcie2_x2\1/g; s/&pcie3([^A-Za-z0-9_]|$)/\&pcie3_x2\1/g' "$DTS"
+
+          {
+            echo "=== V16 PCIe rewrite diff ==="
+            diff -u "$GITHUB_WORKSPACE/results/image/ipq9570-sbe1v1k.pre-v16.dts" "$DTS" || true
+          } | tee "$GITHUB_WORKSPACE/results/image/V16-DTS-DIFF.txt"
+
+          # Do not guess PPE/PCS/clock rewrites. Compile immediately so DTC
+          # reports the reduced, exact remaining incompatibility set.
+          set +e
+          run_stage target-install make -j"$(nproc)" target/install V=s
+          TI_RC=$?
+          set -e
+
+          # Capture every remaining DTC label error in one file.
+          grep -E 'Label or path .* not found|ERROR \(phandle_references\)|FATAL ERROR' \
+            "$GITHUB_WORKSPACE/results/image/target-install.log" \
+            | sort -u > "$GITHUB_WORKSPACE/results/image/V16-REMAINING-DTC-ERRORS.txt" || true
+
+          # Search for any DTB/image produced even when later image assembly fails.
+          find build_dir bin -type f \( -name '*sbe1v1k*.dtb' -o -name '*sbe1v1k*.itb' -o -name '*sbe1v1k*.bin' -o -name '*sbe1v1k*.img' \) \
+            -printf '%p\t%s\n' 2>/dev/null | sort \
+            > "$GITHUB_WORKSPACE/results/image/V16-SBE1V1K-OUTPUTS.txt" || true
+
+          {
+            echo "target_install_rc=$TI_RC"
+            echo "remaining_dtc_errors=$(wc -l < "$GITHUB_WORKSPACE/results/image/V16-REMAINING-DTC-ERRORS.txt")"
+            echo "sbe_outputs=$(wc -l < "$GITHUB_WORKSPACE/results/image/V16-SBE1V1K-OUTPUTS.txt")"
+          } | tee "$GITHUB_WORKSPACE/results/image/V16-DTB-GATE.txt"
+
+          exit "$TI_RC"
+
+          # Some QSDK trees expose target/linux/install separately. Run it only
+          # if make -n confirms that target exists; otherwise target/install is
+          # the authoritative image assembly target.
+          if make -n target/linux/install >/dev/null 2>&1; then
+            run_stage target-linux-install make -j"$(nproc)" target/linux/install V=s
+          else
+            echo "target/linux/install not exposed; target/install used" \
+              | tee "$GITHUB_WORKSPACE/results/image/target-linux-install.skipped"
+          fi
+
+          find bin/targets/ipq95xx -type f -printf '%p\t%s\n' 2>/dev/null | sort \
+            | tee "$GITHUB_WORKSPACE/results/image/bin-inventory.txt" || true
+
+          {
+            echo "target_compile_rc=$(cat "$GITHUB_WORKSPACE/results/image/target-compile.rc" 2>/dev/null || echo NA)"
+            echo "opkg_host_rc=$(cat "$GITHUB_WORKSPACE/results/image/opkg-host.rc" 2>/dev/null || echo NA)"
+            echo "opkg_host_present=$([ -x staging_dir/host/bin/opkg ] && echo yes || echo no)"
+            echo "package_install_rc=$(cat "$GITHUB_WORKSPACE/results/image/package-install.rc" 2>/dev/null || echo NA)"
+            echo "target_install_rc=$(cat "$GITHUB_WORKSPACE/results/image/target-install.rc" 2>/dev/null || echo NA)"
+            echo "sbe_hits=$(grep -RciE 'ipq9570-sbe1v1k|askey_sbe1v1k' "$GITHUB_WORKSPACE/results/image" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')"
+            echo "dtb_hits=$(find build_dir bin -type f \( -name '*sbe1v1k*.dtb' -o -name '*sbe1v1k*.itb' \) 2>/dev/null | wc -l)"
+            echo "candidate_images=$(find bin/targets/ipq95xx -type f \( -name '*sbe1v1k*.bin' -o -name '*sbe1v1k*.itb' -o -name '*sbe1v1k*.img' \) 2>/dev/null | wc -l)"
+          } | tee "$GITHUB_WORKSPACE/results/image/V12-PROGRESS-GATE.txt"
+
+
+      - name: Collect and quarantine first image candidates for offline audit
+        id: image_audit
+        if: always() && steps.image_config.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/qsdk"
+          OUT="$GITHUB_WORKSPACE/results/image"
+          mkdir -p "$OUT/artifacts"
+          find bin/targets/ipq95xx -type f \
+            \( -iname '*sbe1v1k*' -o -iname '*askey*' -o -iname '*rtq7300*' \) \
+            -print | sort > "$OUT/sbe1v1k-products.txt" || true
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            cp "$f" "$OUT/artifacts/"
+          done < "$OUT/sbe1v1k-products.txt"
+          find "$OUT/artifacts" -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort \
+            | tee "$OUT/IMAGE-CANDIDATES.txt"
+          find "$OUT/artifacts" -maxdepth 1 -type f -exec sha256sum {} \; \
+            > "$OUT/SHA256SUMS.txt" || true
+          find build_dir -type f \
+            \( -iname '*sbe1v1k*.dtb' -o -iname '*sbe1v1k*.its' -o -iname '*sbe1v1k*.itb' \) \
+            -print | sort > "$OUT/dtb-fit-products.txt" || true
+          count="$(find "$OUT/artifacts" -maxdepth 1 -type f | wc -l)"
+          {
+            echo "candidate_count=$count"
+            echo "flash_safe=NO_NOT_YET_AUDITED"
+          } | tee "$OUT/IMAGE-AUDIT.txt"
+          test "$count" -gt 0
+
+      - name: Audit final core module chain
+        id: audit
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "SBE1V1K QSDK66 Image v16"
+            echo "==========================="
+            echo "release=NHSS.QSDK.14.0.r9-00034-O"
+            echo "official_manifest_layout=yes"
+            echo "image_attempt=yes"
+            echo "flash_safe=NO_NOT_YET_AUDITED"
+            echo
+            echo "assembly=${{ steps.assembly.outcome }}"
+            echo "layout=${{ steps.layout.outcome }}"
+            echo "target_assembly=${{ steps.target_assembly.outcome }}"
+            echo "feeds=${{ steps.feeds.outcome }}"
+            echo "package_overlay=${{ steps.package_overlay.outcome }}"
+            echo "configure=${{ steps.configure.outcome }}"
+            echo "toolchain=${{ steps.toolchain.outcome }}"
+            echo "kernel=${{ steps.kernel.outcome }}"
+            echo "kernel_gate=${{ steps.kernel_gate.outcome }}"
+            echo "phy=${{ steps.phy.outcome }}"
+            echo "phy_gate=${{ steps.phy_gate.outcome }}"
+            echo "ssdk=${{ steps.ssdk.outcome }}"
+            echo "ppe=${{ steps.ppe.outcome }}"
+            echo "nss_dp=${{ steps.nss_dp.outcome }}"
+            echo "manifest_gate=${{ steps.manifest_gate.outcome }}"
+            echo "board_audit=${{ steps.board_audit.outcome }}"
+            echo "extended_map=${{ steps.extended_map.outcome }}"
+            echo "extended_compile=${{ steps.extended_compile.outcome }}"
+            echo "extended_audit=${{ steps.extended_audit.outcome }}"
+            echo "board_transplant=${{ steps.board_transplant.outcome }}"
+            echo "image_config=${{ steps.image_config.outcome }}"
+            echo "mmap_gate=${{ steps.mmap_gate.outcome }}"
+            echo "image_build=${{ steps.image_build.outcome }}"
+            echo "image_audit=${{ steps.image_audit.outcome }}"
+            echo
+
+            echo "===== MODULES ====="
+            find results/modules \
+              -maxdepth 1 -type f -name '*.ko' \
+              -printf '%f\t%s bytes\n' \
+              | sort
+
+            echo
+            echo "===== EXTENDED NSS ====="
+            cat results/extended/compile-status.tsv 2>/dev/null || true
+            cat results/extended/AUDIT-SUMMARY.txt 2>/dev/null || true
+            echo
+            echo "===== MISSING EXTENSION COMPONENTS ====="
+            cat results/extended/missing-components.txt 2>/dev/null || true
+            echo
+            echo "===== MISSING MAJOR MODULES ====="
+            cat results/extended/missing-major-modules.txt 2>/dev/null || true
+            echo
+            echo "===== BOARD AUDIT ====="
+            sed -n '1,300p' results/board/BOARD-INTEGRATION-AUDIT.txt 2>/dev/null || true
+
+            echo
+            echo "===== PROVIDER GATE ====="
+            cat results/phy/PROVIDER-GATE.txt 2>/dev/null || true
+
+            echo
+            echo "===== KERNEL ====="
+            cat results/kernel/utsrelease.txt 2>/dev/null || true
+            cat results/kernel/compiler-version.txt 2>/dev/null | head -n3 || true
+
+          } | tee results/IMAGE-V7-SUMMARY.txt
+
+          find results/modules \
+            -maxdepth 1 -type f -name '*.ko' \
+            -exec sha256sum {} \; \
+            > results/modules/SHA256SUMS.txt 2>/dev/null || true
+
+          : > results/modules/MODINFO.txt
+
+          for f in results/modules/*.ko; do
+            [ -f "$f" ] || continue
+
+            {
+              echo "===== $(basename "$f") ====="
+              modinfo "$f" 2>/dev/null || true
+              echo
+            } >> results/modules/MODINFO.txt
+          done
+
+          # Preserve first useful error lines from every compile stage.
+          for stage in kernel phy ssdk ppe nss-dp; do
+            log="results/$stage/compile.log"
+            [ -f "$log" ] || continue
+
+            grep -nEi \
+              'fatal error:|error:|undefined!|No rule to make target|No such file|hash mismatch|failed' \
+              "$log" \
+              | head -n 300 \
+              > "results/$stage/errors.txt" || true
+          done
+
+      - name: Upload Image v7 diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-QSDK66-Image-v16
+          path: results/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Require V7 build evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "${{ steps.assembly.outcome }}" = "success"
+          test "${{ steps.layout.outcome }}" = "success"
+          test "${{ steps.target_assembly.outcome }}" = "success"
+          test "${{ steps.feeds.outcome }}" = "success"
+          test "${{ steps.package_overlay.outcome }}" = "success"
+          test "${{ steps.configure.outcome }}" = "success"
+          test "${{ steps.toolchain.outcome }}" = "success"
+          test "${{ steps.kernel.outcome }}" = "success"
+          test "${{ steps.kernel_gate.outcome }}" = "success"
+          test "${{ steps.phy.outcome }}" = "success"
+          test "${{ steps.phy_gate.outcome }}" = "success"
+          test "${{ steps.ssdk.outcome }}" = "success"
+          test "${{ steps.ppe.outcome }}" = "success"
+          test "${{ steps.nss_dp.outcome }}" = "success"
+          test "${{ steps.manifest_gate.outcome }}" = "success"
+          test "${{ steps.board_audit.outcome }}" = "success"
+          test "${{ steps.board_transplant.outcome }}" = "success"
+
+
+          test -s results/phy/PROVIDER-GATE.txt
+          grep -qx '15/15 PASS' results/phy/PROVIDER-GATE.txt
+
+          for ko in \
+            qca8k-cc.ko \
+            qca8084-phy.ko \
+            qca-nss-phy.ko \
+            qca-ssdk.ko \
+            qca-nss-debug.ko \
+            qca-nss-ppe.ko \
+            qca-nss-dp.ko
+          do
+            test -s "results/modules/$ko"
+          done
+
+          echo "V16 PCIE DTS ADAPTATION COMPLETE - IMAGE RESULT IS IN ARTIFACT; DO NOT FLASH BEFORE OFFLINE AUDIT"
