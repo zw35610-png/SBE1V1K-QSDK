@@ -1,0 +1,119 @@
+name: SBE1V1K NSS 6.18 Stage1 Native qca-nss-phy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  stage1-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Install host dependencies
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev \
+            file wget bc bzip2 libelf-dev liblzma-dev python3-dev time xxd zstd
+
+      - name: Checkout proven SBE1V1K baseline
+        run: |
+          set -e
+          git clone --filter=blob:none https://github.com/luckkyboy/SBE1V1K.git openwrt
+          cd openwrt
+          git checkout 02fb9517c9aefac9f3825a15ae46e7998bae7edd
+          test "$(git rev-parse HEAD)" = "02fb9517c9aefac9f3825a15ae46e7998bae7edd"
+
+      - name: Add IPQ native package feed
+        run: |
+          set -e
+          git clone --depth=1 https://github.com/zilogic-systems/feed-ipq.git feed-ipq
+          echo "feed-ipq commit: $(git -C feed-ipq rev-parse HEAD)" | tee feed-ipq-revision.txt
+          test -d feed-ipq/feeds/nss-host/qca-nss-phy
+          printf '\nsrc-link ipq_nss_host %s/feed-ipq/feeds/nss-host\n' "$GITHUB_WORKSPACE" >> openwrt/feeds.conf.default
+
+      - name: Configure only qca-nss-phy family
+        working-directory: openwrt
+        run: |
+          set -e
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          ./scripts/feeds install -p ipq_nss_host qca-nss-phy
+
+          cp configs/sbe1v1k.config .config
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_kmod-qca-nss-phy=m
+          CONFIG_PACKAGE_kmod-qca8084=m
+          CONFIG_PACKAGE_kmod-qca81xx=m
+          CONFIG_PACKAGE_kmod-qca8xxx-phc=m
+          EOF
+          make defconfig
+
+          mkdir -p ../results
+          cp .config ../results/final.config
+          cp package/feeds/ipq_nss_host/qca-nss-phy/Makefile ../results/qca-nss-phy-package-Makefile.txt
+          grep -E '^(PKG_SOURCE|PKG_SOURCE_URL|PKG_SOURCE_PROTO|PKG_SOURCE_DATE|PKG_SOURCE_VERSION|PKG_MIRROR_HASH)' \
+            package/feeds/ipq_nss_host/qca-nss-phy/Makefile | tee ../results/source-pin.txt || true
+
+      - name: Force Stage17 proven source pin
+        working-directory: openwrt
+        run: |
+          set -e
+          MF=package/feeds/ipq_nss_host/qca-nss-phy/Makefile
+          cp "$MF" ../results/qca-nss-phy-package-Makefile.before-pin.txt
+          sed -i -E 's/^(PKG_SOURCE_VERSION):=.*/\1:=5a70c334200fe4728be20a0f0aebf9c09519377c/' "$MF"
+          sed -i -E 's/^(PKG_MIRROR_HASH):=.*/\1:=skip/' "$MF"
+          grep -q 'PKG_SOURCE_VERSION:=5a70c334200fe4728be20a0f0aebf9c09519377c' "$MF"
+          cp "$MF" ../results/qca-nss-phy-package-Makefile.after-pin.txt
+
+      - name: Native OpenWrt package compile
+        working-directory: openwrt
+        run: |
+          set +e
+          mkdir -p ../results
+          echo "=== OpenWrt-native qca-nss-phy package compile ===" | tee ../results/compile.log
+          echo "Baseline: $(git rev-parse HEAD)" | tee -a ../results/compile.log
+          make -j"$(nproc)" package/feeds/ipq_nss_host/qca-nss-phy/compile V=s 2>&1 | tee -a ../results/compile.log
+          RC=${PIPESTATUS[0]}
+          echo "COMPILE_EXIT_CODE=$RC" | tee -a ../results/compile.log
+
+          find build_dir -type f \( -name 'qca-nss-phy.ko' -o -name 'qca8084-phy.ko' \
+            -o -name 'qca81xx-phy.ko' -o -name 'qca8xxx-phc.ko' \) \
+            -printf '%p %s bytes\n' | sort | tee ../results/outputs.txt
+
+          grep -nEi '(^|[ :])(error:|fatal error:|undefined reference|implicit declaration|incompatible|too few arguments|too many arguments|no such file)' \
+            ../results/compile.log | head -300 > ../results/errors.txt || true
+          exit 0
+
+      - name: Verdict
+        if: always()
+        run: |
+          mkdir -p results
+          cp feed-ipq-revision.txt results/ 2>/dev/null || true
+          {
+            echo "Stage 1 native target: qca-nss-phy family"
+            echo "SBE1V1K baseline: 02fb9517c9aefac9f3825a15ae46e7998bae7edd"
+            echo "Stage17 proven qca-nss-phy source pin: 5a70c334200fe4728be20a0f0aebf9c09519377c"
+            echo "Build path: OpenWrt package/feeds/ipq_nss_host/qca-nss-phy/compile"
+            echo "No manual kernel modules_prepare."
+            echo "No firmware image and no board/eMMC/DTS changes."
+            echo
+            if grep -q 'COMPILE_EXIT_CODE=0' results/compile.log 2>/dev/null; then
+              echo "VERDICT=PASS"
+            elif test -f results/compile.log; then
+              echo "VERDICT=NEEDS_PORTING"
+              echo "Use errors.txt + compile.log to patch the first Linux 6.18 incompatibility."
+            else
+              echo "VERDICT=INFRA_FAILURE"
+              echo "The native package compile step was not reached."
+            fi
+          } | tee results/README.txt
+
+      - name: Upload Stage1 native report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-NSS-6.18-Stage1-Native-qca-nss-phy
+          path: results/
+          if-no-files-found: warn
+          retention-days: 14
