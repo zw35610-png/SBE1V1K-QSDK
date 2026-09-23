@@ -1,0 +1,124 @@
+name: SBE1V1K NSS 6.18 Stage1 qca-nss-phy Compile Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  stage1:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Install dependencies
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev \
+            file wget bc bzip2 libelf-dev liblzma-dev python3-dev time xxd zstd
+
+      - name: Checkout proven SBE1V1K baseline
+        run: |
+          set -e
+          git clone https://github.com/luckkyboy/SBE1V1K.git openwrt
+          cd openwrt
+          git checkout 02fb9517c9aefac9f3825a15ae46e7998bae7edd
+          test "$(git rev-parse HEAD)" = "02fb9517c9aefac9f3825a15ae46e7998bae7edd"
+
+      - name: Configure baseline
+        working-directory: openwrt
+        run: |
+          set -e
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          cp configs/sbe1v1k.config .config
+          make defconfig
+          make download -j"$(nproc)"
+
+      - name: Prepare exact OpenWrt 6.18 build environment
+        working-directory: openwrt
+        run: |
+          set -e
+          make -j"$(nproc)" tools/install
+          make -j"$(nproc)" toolchain/install
+          make -j"$(nproc)" target/linux/prepare
+
+          GCC="$(find "$PWD/staging_dir"/toolchain-* -type f -name 'aarch64-openwrt-linux-musl-gcc' -print -quit)"
+          KERNEL="$(find "$PWD/build_dir" -path '*linux-qualcommbe_ipq95xx/linux-6.18*' -type d -print -quit)"
+          test -n "$GCC"
+          test -n "$KERNEL"
+
+          echo "GCC=$GCC" | tee ../env.txt
+          echo "KERNEL=$KERNEL" | tee -a ../env.txt
+          "$GCC" --version | head -1 | tee -a ../env.txt
+
+          CROSS="${GCC%gcc}"
+          make -C "$KERNEL" ARCH=arm64 CROSS_COMPILE="$CROSS" modules_prepare
+
+      - name: Fetch exact qca-nss-phy source
+        run: |
+          set -e
+          git clone https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-nss-phy.git qsdk-src/qca-nss-phy
+          git -C qsdk-src/qca-nss-phy checkout 16eec6ac35820cb67af59223e8b4c2dba7179655
+          test "$(git -C qsdk-src/qca-nss-phy rev-parse HEAD)" = "16eec6ac35820cb67af59223e8b4c2dba7179655"
+
+      - name: Stage1 compile qca-nss-phy against Linux 6.18
+        run: |
+          set +e
+          mkdir -p results
+          cp env.txt results/
+          git -C qsdk-src/qca-nss-phy rev-parse HEAD > results/qca-nss-phy-revision.txt
+
+          GCC="$(find "$PWD/openwrt/staging_dir"/toolchain-* -type f -name 'aarch64-openwrt-linux-musl-gcc' -print -quit)"
+          KERNEL="$(find "$PWD/openwrt/build_dir" -path '*linux-qualcommbe_ipq95xx/linux-6.18*' -type d -print -quit)"
+          CROSS="${GCC%gcc}"
+
+          echo "=== qca-nss-phy top-level Makefile ===" > results/makefile.txt
+          sed -n '1,260p' qsdk-src/qca-nss-phy/Makefile >> results/makefile.txt
+          echo "=== linux_std Makefile ===" >> results/makefile.txt
+          sed -n '1,320p' qsdk-src/qca-nss-phy/linux_std/Makefile >> results/makefile.txt
+
+          echo "=== COMPILE ATTEMPT: linux_std as external Kbuild module ===" | tee results/compile.log
+          make -C "$KERNEL" \
+            ARCH=arm64 CROSS_COMPILE="$CROSS" \
+            M="$PWD/qsdk-src/qca-nss-phy/linux_std" \
+            V=1 modules 2>&1 | tee -a results/compile.log
+          RC=${PIPESTATUS[0]}
+          echo "COMPILE_EXIT_CODE=$RC" | tee -a results/compile.log
+
+          echo "=== produced kernel objects/modules ===" > results/outputs.txt
+          find qsdk-src/qca-nss-phy -type f \( -name '*.ko' -o -name '*.o' -o -name '*.mod' \) \
+            -printf '%p %s bytes\n' | sort >> results/outputs.txt
+
+          echo "=== first compiler/error diagnostics ===" > results/errors.txt
+          grep -nEi '(^|[ :])(error:|fatal error:|undefined|no such file|implicit declaration|incompatible|too few arguments|too many arguments)' \
+            results/compile.log | head -250 >> results/errors.txt || true
+
+          exit 0
+
+      - name: Stage1 verdict
+        run: |
+          set -e
+          mkdir -p results
+          {
+            echo "Stage 1 target: qca-nss-phy only"
+            echo "Target: proven SBE1V1K OpenWrt baseline + Linux 6.18"
+            echo "No firmware image is generated."
+            echo "No DTS, eMMC layout, sysupgrade or board files are modified."
+            echo
+            if grep -q 'COMPILE_EXIT_CODE=0' results/compile.log; then
+              echo "VERDICT=PASS"
+              echo "qca-nss-phy linux_std completed the external-module compile attempt."
+            else
+              echo "VERDICT=NEEDS_PORTING"
+              echo "Review errors.txt and compile.log for the first real incompatibility."
+            fi
+          } | tee results/README.txt
+
+      - name: Upload Stage1 report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-NSS-6.18-Stage1-qca-nss-phy
+          path: results/
+          if-no-files-found: warn
+          retention-days: 14
