@@ -1,0 +1,87 @@
+name: SBE1V1K OpenWrt Clean Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          df -h
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget bc bzip2 libelf-dev liblzma-dev \
+            python3-dev time xxd zstd
+
+      - name: Checkout exact SBE1V1K source
+        run: |
+          git clone https://github.com/luckkyboy/SBE1V1K.git openwrt
+          cd openwrt
+          git checkout 02fb9517c9aefac9f3825a15ae46e7998bae7edd
+          test "$(git rev-parse HEAD)" = "02fb9517c9aefac9f3825a15ae46e7998bae7edd"
+
+      - name: Update and install feeds
+        working-directory: openwrt
+        run: |
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Load proven SBE1V1K config
+        working-directory: openwrt
+        run: |
+          cp configs/sbe1v1k.config .config
+          make defconfig
+          grep -E 'CONFIG_TARGET_qualcommbe|CONFIG_TARGET.*askey_sbe1v1k' .config
+
+      - name: Download sources
+        working-directory: openwrt
+        run: |
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          make download -j"$(nproc)"
+
+      - name: Build firmware
+        working-directory: openwrt
+        run: |
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          set +e
+          make -j"$(nproc)" world 2>&1 | tee ../build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "Parallel build failed; retrying single-threaded for the real error..."
+            make -j1 V=s world 2>&1 | tee ../build-single.log
+            exit ${PIPESTATUS[0]}
+          fi
+
+      - name: Audit outputs
+        if: always()
+        run: |
+          mkdir -p artifact
+          cp build.log artifact/ 2>/dev/null || true
+          cp build-single.log artifact/ 2>/dev/null || true
+          OUT=openwrt/bin/targets/qualcommbe/ipq95xx
+          if [ -d "$OUT" ]; then
+            find "$OUT" -maxdepth 1 -type f -printf '%f %s bytes\n' | sort | tee artifact/output-list.txt
+            cp "$OUT"/*askey_sbe1v1k* artifact/ 2>/dev/null || true
+            cp "$OUT"/sha256sums "$OUT"/profiles.json "$OUT"/config.buildinfo \
+               "$OUT"/feeds.buildinfo "$OUT"/version.buildinfo artifact/ 2>/dev/null || true
+            (cd artifact && sha256sum *askey_sbe1v1k* 2>/dev/null || true) | tee artifact/local-sha256.txt
+          fi
+
+      - name: Upload firmware artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-OpenWrt-Clean-Build
+          path: artifact/
+          if-no-files-found: warn
+          retention-days: 14
