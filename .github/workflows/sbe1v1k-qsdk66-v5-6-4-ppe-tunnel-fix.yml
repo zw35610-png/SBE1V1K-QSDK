@@ -1,0 +1,2041 @@
+name: SBE1V1K QSDK 6.6 V5.6.4 PPE Tunnel Compile Fix
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+env:
+  OPENWRT_TAG: v24.10.2
+  FEED_IPQ_BRANCH: ath.13.0
+  DEVICE_BASE_COMMIT: 02fb9517c9aefac9f3825a15ae46e7998bae7edd
+  STAGE: QSDK-6.6-Stage17
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+jobs:
+  transplant-cascade:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 210
+    steps:
+    - name: Checkout current project
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+    - name: Install OpenWrt build dependencies
+      shell: bash
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses-dev libssl-dev python3 python3-setuptools \
+          rsync swig unzip zlib1g-dev file wget curl xsltproc libxml-parser-perl \
+          python3-dev time jq patch quilt ccache zstd libelf-dev bc device-tree-compiler
+    - name: Initialize Stage 17 workspace
+      shell: bash
+      run: |
+        set -euxo pipefail
+        rm -rf stage17-work stage17-results
+        mkdir -p stage17-work stage17-results/{sources,integration,device,config,bootstrap,kernel,packages,image,discovery}
+        {
+          echo "stage=${STAGE}"
+          echo "date_utc=$(date -u +%FT%TZ)"
+          echo "runner=$(uname -a)"
+          echo "repo=${GITHUB_REPOSITORY}"
+          echo "ref=${GITHUB_REF}"
+          echo "sha=${GITHUB_SHA}"
+          echo "openwrt_tag=${OPENWRT_TAG}"
+          echo "feed_ipq_branch=${FEED_IPQ_BRANCH}"
+        } | tee stage17-results/environment.txt
+    - name: Cache downloads and ccache
+      uses: actions/cache@v4
+      with:
+        path: |
+          stage17-work/openwrt/dl
+          .ccache
+        key: qsdk66-stage5-${{ runner.os }}-${{ env.OPENWRT_TAG }}-${{ env.FEED_IPQ_BRANCH }}
+        restore-keys: |
+          qsdk66-stage5-${{ runner.os }}-
+          qsdk66-${{ runner.os }}-
+    - name: Restore prepared host and toolchain cache from Stage 16
+      id: bootstrap-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          stage16-work/openwrt/staging_dir/host
+          stage16-work/openwrt/staging_dir/toolchain-*
+        key: qsdk66-bootstrap-${{ runner.os }}-${{ env.OPENWRT_TAG }}-${{ env.FEED_IPQ_BRANCH }}-v10
+    - name: Fetch OpenWrt, feed-ipq and SBE1V1K source
+      id: sources
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        F="$GITHUB_WORKSPACE/stage17-work/feed-ipq"
+        D="$GITHUB_WORKSPACE/stage17-work/sbe1v1k"
+        OUT="$GITHUB_WORKSPACE/stage17-results/sources"
+
+        clone_retry() {
+          local name="$1" url="$2" ref="$3" dst="$4" log="$OUT/${name}-clone.log"
+          rm -rf "$dst"
+          local rc=1
+          for n in 1 2 3; do
+            echo "[$name] attempt=$n url=$url ref=$ref" | tee -a "$log"
+            git clone --depth=1 --branch "$ref" "$url" "$dst" >>"$log" 2>&1
+            rc=$?
+            [ "$rc" -eq 0 ] && break
+            rm -rf "$dst"
+            sleep $((n * 6))
+          done
+          echo "$rc" > "$OUT/${name}-clone-exit.txt"
+          if [ "$rc" -eq 0 ]; then
+            git -C "$dst" rev-parse HEAD | tee "$OUT/${name}-commit.txt"
+            git -C "$dst" log -1 --format=fuller > "$OUT/${name}-commit-log.txt"
+          fi
+        }
+
+        clone_retry openwrt https://github.com/openwrt/openwrt.git "$OPENWRT_TAG" "$O"
+        clone_retry feed-ipq https://github.com/zilogic-systems/feed-ipq.git "$FEED_IPQ_BRANCH" "$F"
+
+        rm -rf "$D"
+        git init -q "$D"
+        git -C "$D" remote add origin https://github.com/luckkyboy/SBE1V1K.git
+        rc=1
+        for n in 1 2 3; do
+          git -C "$D" fetch --depth=1 origin "$DEVICE_BASE_COMMIT" >"$OUT/device-fetch.log" 2>&1
+          rc=$?
+          [ "$rc" -eq 0 ] && break
+          sleep $((n * 6))
+        done
+        echo "$rc" > "$OUT/device-fetch-exit.txt"
+        if [ "$rc" -eq 0 ]; then
+          git -C "$D" checkout -q --detach FETCH_HEAD
+          git -C "$D" rev-parse HEAD | tee "$OUT/device-commit.txt"
+        fi
+        exit 0
+    - name: Integrate native QSDK13 IPQ95xx target and feeds
+      id: integrate
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        F="$GITHUB_WORKSPACE/stage17-work/feed-ipq"
+        OUT="$GITHUB_WORKSPACE/stage17-results/integration"
+        rc=0
+        exec > >(tee "$OUT/integration.log") 2>&1
+
+        if [ ! -d "$O" ] || [ ! -d "$F" ]; then
+          echo 90 > "$OUT/integration-exit.txt"
+          exit 0
+        fi
+
+        echo "=== selectively apply feed-ipq OpenWrt 24.10 patches ==="
+        : > "$OUT/patch-status.tsv"
+        shopt -s nullglob
+        mapfile -t patches < <(find "$F/patches/openwrt/24.10" -type f -name '*.patch' 2>/dev/null | sort)
+        for p in "${patches[@]}"; do
+          name="$(basename "$p")"
+          if git -C "$O" apply --check "$p" >/dev/null 2>&1; then
+            git -C "$O" apply "$p"
+            prc=$?
+            echo -e "$name\tAPPLIED\t$prc" >> "$OUT/patch-status.tsv"
+          elif (cd "$O" && patch --dry-run -p1 --forward --batch < "$p" >/dev/null 2>&1); then
+            (cd "$O" && patch -p1 --forward --batch < "$p")
+            prc=$?
+            echo -e "$name\tPATCHED\t$prc" >> "$OUT/patch-status.tsv"
+          else
+            # Stage 3 proved the baseline builds without the non-applicable bbfdm/xmppc patches.
+            echo -e "$name\tSKIPPED_NOT_APPLICABLE\t0" >> "$OUT/patch-status.tsv"
+          fi
+        done
+
+        echo "=== install IPQ95xx target ==="
+        rm -rf "$O/target/linux/ipq95xx"
+        cp -a "$F/targets/ipq95xx" "$O/target/linux/ipq95xx" || rc=2
+
+        echo "=== add feed-ipq feed roots ==="
+        cp "$O/feeds.conf.default" "$OUT/feeds.conf.default.before"
+        : > "$OUT/local-feeds-added.txt"
+        for d in "$F"/feeds/*; do
+          [ -d "$d" ] || continue
+          name="ipq_$(basename "$d" | tr '.-' '__')"
+          echo "src-link $name $d" >> "$O/feeds.conf.default"
+          echo "$name $d" >> "$OUT/local-feeds-added.txt"
+        done
+        if [ -d "$F/ipq-ext" ]; then
+          echo "src-link ipq_ext $F/ipq-ext" >> "$O/feeds.conf.default"
+          echo "ipq_ext $F/ipq-ext" >> "$OUT/local-feeds-added.txt"
+        fi
+
+        (cd "$O" && ./scripts/feeds update -a) > "$OUT/feeds-update.log" 2>&1
+        furc=$?
+        (cd "$O" && ./scripts/feeds install -a) > "$OUT/feeds-install.log" 2>&1
+        firc=$?
+        echo "feeds_update_exit=$furc" >> "$OUT/integration.log"
+        echo "feeds_install_exit=$firc" >> "$OUT/integration.log"
+        [ "$furc" -ne 0 ] && rc=3
+        [ "$firc" -ne 0 ] && rc=4
+        echo "$rc" > "$OUT/integration-exit.txt"
+        exit 0
+    - name: Transplant SBE1V1K DTS and engineering device profile
+      id: transplant
+      continue-on-error: true
+      shell: bash
+      run: "set +e\nO=\"$GITHUB_WORKSPACE/stage17-work/openwrt\"\nD=\"$GITHUB_WORKSPACE/stage17-work/sbe1v1k\"\n\
+        OUT=\"$GITHUB_WORKSPACE/stage17-results/device\"\nrc=0\n\nSRC_DTS=\"$D/target/linux/qualcommbe/dts/ipq9570-sbe1v1k.dts\"\
+        \nif [ ! -f \"$SRC_DTS\" ]; then\n  echo \"missing source DTS: $SRC_DTS\" | tee \"$OUT/transplant.log\"\n\
+        \  echo 90 > \"$OUT/transplant-exit.txt\"\n  exit 0\nfi\n\ncp \"$SRC_DTS\" \"$OUT/ipq9570-sbe1v1k.source.dts\"\
+        \nsha256sum \"$SRC_DTS\" > \"$OUT/source-dts.sha256\"\n\nfor arch in arm64 arm; do\n  QDIR=\"$O/target/linux/ipq95xx/files-6.6/arch/$arch/boot/dts/qcom\"\
+        \n  [ -d \"$QDIR\" ] || continue\n  cp \"$SRC_DTS\" \"$QDIR/ipq9574-sbe1v1k.dts\" || rc=1\n  MF=\"$QDIR/Makefile\"\
+        \n  if [ -f \"$MF\" ] && ! grep -q 'ipq9574-sbe1v1k.dtb' \"$MF\"; then\n    printf '\\n# SBE1V1K engineering\
+        \ transplant\\ndtb-$(CONFIG_ARCH_QCOM) += ipq9574-sbe1v1k.dtb\\n' >> \"$MF\"\n  fi\ndone\n\nIMG=\"$O/target/linux/ipq95xx/image/generic.mk\"\
+        \nif [ -f \"$IMG\" ] && ! grep -q '^define Device/askey_sbe1v1k' \"$IMG\"; then\n  printf '%s\\n' \\\n \
+        \   '' \\\n    '# SBE1V1K engineering-only profile. DO NOT FLASH.' \\\n    '# DEVICE_DTS_CONFIG temporarily\
+        \ reuses the closest eMMC IPQ9574 reference' \\\n    '# only so Stage 17 can exercise the QSDK image pipeline;\
+        \ board-config parity' \\\n    '# must be verified before any flashable release.' \\\n    'define Device/askey_sbe1v1k'\
+        \ \\\n    '\t$(call Device/FitImage)' \\\n    '\t$(call Device/EmmcImage)' \\\n    '\tDEVICE_VENDOR := Askey'\
+        \ \\\n    '\tDEVICE_MODEL := SBE1V1K' \\\n    '\tDEVICE_DTS := ipq9574-sbe1v1k' \\\n    '\tDEVICE_DTS_CONFIG\
+        \ := config-rdp433-mht-phy' \\\n    '\tDEVICE_FLASH_TYPE := emmc' \\\n    '\tDEVICE_BOARD_CONFIG := board-cfg-ipq9574'\
+        \ \\\n    '\tSOC := ipq9574' \\\n    '\tDEVICE_PACKAGES += uboot-ipq9574-mmc board-cfg-ipq95xx' \\\n   \
+        \ 'endef' \\\n    'TARGET_DEVICES += askey_sbe1v1k' >> \"$IMG\"\nfi\n\n# Bring the standalone RTL826x firmware\
+        \ package into the tree if present.\nif [ -d \"$D/package/firmware/rtl826x-firmware\" ]; then\n  rm -rf\
+        \ \"$O/package/firmware/rtl826x-firmware\"\n  cp -a \"$D/package/firmware/rtl826x-firmware\" \"$O/package/firmware/rtl826x-firmware\"\
+        \n  echo \"rtl826x_firmware_package=COPIED\" > \"$OUT/rtl826x-status.txt\"\nelse\n  echo \"rtl826x_firmware_package=NOT_FOUND\"\
+        \ > \"$OUT/rtl826x-status.txt\"\nfi\n\n# Inventory remaining runtime-only device support without blindly\
+        \ applying 6.18 patches to 6.6.\n{\n  echo \"=== SBE1V1K relevant source files ===\"\n  find \"$D\" -type\
+        \ f | grep -Ei 'sbe1v1k|rtl8261|rtl826x' | sed \"s#^$D/##\" | sort || true\n  echo\n  echo \"=== SBE1V1K\
+        \ references ===\"\n  grep -RInE 'askey,sbe1v1k|askey_sbe1v1k|SBE1V1K|rtl8261n' \"$D/target\" \"$D/package\"\
+        \ 2>/dev/null | head -n 5000 || true\n  echo\n  echo \"=== 6.18 patches touching SBE1V1K/RTL ===\"\n  grep\
+        \ -RIlE 'SBE1V1K|rtl8261n|RTL8261' \"$D/target/linux/qualcommbe/patches-6.18\" 2>/dev/null | sort || true\n\
+        } > \"$OUT/remaining-runtime-support.txt\"\n\necho \"$rc\" > \"$OUT/transplant-exit.txt\"\ngrep -nE 'askey_sbe1v1k|ipq9574-sbe1v1k'\
+        \ \"$IMG\" > \"$OUT/profile-lines.txt\" 2>/dev/null || true\nfind \"$O/target/linux/ipq95xx/files-6.6\"\
+        \ -type f -name '*sbe1v1k*' -o -name '*SBE1V1K*' 2>/dev/null | sort > \"$OUT/transplanted-files.txt\" ||\
+        \ true\nexit 0\n"
+    - name: Adapt SBE1V1K DTS to QSDK 6.6 label model
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/device"
+        QDIR="$O/target/linux/ipq95xx/files-6.6/arch/arm64/boot/dts/qcom"
+        DTS="$QDIR/ipq9574-sbe1v1k.dts"
+        mkdir -p "$OUT"
+
+        if [ ! -f "$DTS" ]; then
+          echo "missing transplanted DTS: $DTS" | tee "$OUT/dts-adapt.log"
+          echo 90 > "$OUT/dts-adapt-exit.txt"
+          exit 0
+        fi
+
+        # Inventory the actual QSDK 6.6 label model before touching the board DTS.
+        {
+          echo '=== QSDK IPQ9574 DTS/DTSI files ==='
+          find "$QDIR" -maxdepth 1 -type f \( -name 'ipq9574*.dts' -o -name 'ipq9574*.dtsi' \) -printf '%f\n' | sort
+          echo
+          echo '=== PCIe controller labels ==='
+          grep -RInE '^[[:space:]]*[A-Za-z0-9_]+:[[:space:]]*(pci|pcie)@' "$QDIR"/ipq9574*.dts* 2>/dev/null || true
+          echo
+          echo '=== PPE-like labels/nodes ==='
+          grep -RInEi '^[[:space:]]*[A-Za-z0-9_]+:.*(ppe|ethernet)|compatible.*(ppe|ess)|ethernet-ports' "$QDIR"/ipq9574*.dts* 2>/dev/null | head -n 1200 || true
+          echo
+          echo '=== clock labels ==='
+          grep -RInE '^[[:space:]]*(ref_48mhz_clk|xo_board_clk|xo_clk):' "$QDIR"/ipq9574*.dts* 2>/dev/null || true
+        } > "$OUT/qsdk-dts-label-inventory.txt"
+
+        python3 - "$DTS" "$QDIR" "$OUT" <<'PY'
+        import re, sys, pathlib, json
+        p=pathlib.Path(sys.argv[1]); qdir=pathlib.Path(sys.argv[2]); out=pathlib.Path(sys.argv[3])
+        text=p.read_text(errors='replace')
+        orig=text
+
+        # Labels provided by ipq9574 base DTSI files in this QSDK target.
+        base_files=sorted(qdir.glob('ipq9574*.dtsi'))
+        base='\n'.join(x.read_text(errors='replace') for x in base_files)
+        labels=set(re.findall(r'(?m)^\s*([A-Za-z_][A-Za-z0-9_]*):\s*[^;\n{]+\{', base))
+
+        # Find controller labels by node-name, preserving source order.
+        pcie_labels=[]
+        for m in re.finditer(r'(?m)^\s*([A-Za-z_][A-Za-z0-9_]*):\s*pcie@[0-9a-fA-Fx]+\s*\{', base):
+            if m.group(1) not in pcie_labels:
+                pcie_labels.append(m.group(1))
+
+        # Helper: find and remove a top-level '&label { ... };' override block.
+        def find_override(s,label):
+            m=re.search(r'(?m)^\s*&'+re.escape(label)+r'\s*\{',s)
+            if not m: return None
+            start=m.start(); brace=s.find('{',m.start()); depth=0; i=brace
+            in_str=False; esc=False
+            while i < len(s):
+                c=s[i]
+                if in_str:
+                    if esc: esc=False
+                    elif c=='\\': esc=True
+                    elif c=='"': in_str=False
+                else:
+                    if c=='"': in_str=True
+                    elif c=='{': depth+=1
+                    elif c=='}':
+                        depth-=1
+                        if depth==0:
+                            j=i+1
+                            while j<len(s) and s[j].isspace(): j+=1
+                            if j<len(s) and s[j]==';': j+=1
+                            while j<len(s) and s[j] in ' \t\r': j+=1
+                            if j<len(s) and s[j]=='\n': j+=1
+                            return start,j,s[start:j]
+                i+=1
+            return None
+
+        actions=[]
+        removed=[]
+
+        # Stage 6 proved that QSDK13 does not use upstream pcie1/2/3 controller labels.
+        # Its native IPQ9574/RDP433 board DTS uses pcie1_x1, pcie2_x2 and pcie3_x2.
+        # Map the SBE1V1K upstream overrides onto those native QSDK labels while preserving
+        # all Wi-Fi child nodes for compile validation.
+        pcie_labels={'pcie1':'pcie1_x1','pcie2':'pcie2_x2','pcie3':'pcie3_x2'}
+        for old,newlab in pcie_labels.items():
+            if re.search(r'(?m)^\s*&'+re.escape(old)+r'\s*\{', text):
+                text=re.sub(r'(?m)^(\s*)&'+re.escape(old)+r'(\s*\{)', r'\1&'+newlab+r'\2', text, count=1)
+                actions.append({'type':'pcie-qsdk-label-map','from':old,'to':newlab})
+
+        # QSDK 6.6 may not expose the upstream fixed-clock labels. They are only board
+        # overrides, so drop them for compile validation and retain an audit record.
+        for lab in ['ref_48mhz_clk','xo_board_clk','xo_clk']:
+            if lab not in labels:
+                found=find_override(text,lab)
+                if found:
+                    a,b,blk=found; removed.append((lab,blk)); text=text[:a]+text[b:]
+                    actions.append({'type':'remove-missing-clock-override','label':lab})
+
+        # The upstream SBE1V1K DTS models wired ports under &qcom_ppe. QSDK13 often owns
+        # PPE/port topology through its board-config/SSDK path instead. If qcom_ppe is not
+        # present in the QSDK base DTSI, remove this override only for Stage 17 compile
+        # validation; save the whole block for later board-config parity work.
+        if 'qcom_ppe' not in labels:
+            found=find_override(text,'qcom_ppe')
+            if found:
+                a,b,blk=found; removed.append(('qcom_ppe',blk)); text=text[:a]+text[b:]
+                actions.append({'type':'remove-upstream-ppe-override','label':'qcom_ppe'})
+
+        p.write_text(text)
+        (out/'dts-adapt-actions.json').write_text(json.dumps(actions,indent=2))
+        (out/'dts-adapt-removed.txt').write_text('\n\n'.join('===== '+k+' =====\n'+v for k,v in removed))
+        (out/'dts-adapted.dts').write_text(text)
+        (out/'dts-adapt-before.sha256').write_text(__import__('hashlib').sha256(orig.encode()).hexdigest()+'\n')
+        (out/'dts-adapt-after.sha256').write_text(__import__('hashlib').sha256(text.encode()).hexdigest()+'\n')
+        print('base_labels',len(labels))
+        print('pcie_labels',pcie_labels)
+        print('actions',actions)
+        PY
+        rc=$?
+        echo "$rc" > "$OUT/dts-adapt-exit.txt"
+        cat "$OUT/dts-adapt-actions.json" 2>/dev/null || true
+        exit 0
+    - name: Resolve duplicate QSDK tzapp reserved-memory label
+      id: tzapp-fix
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/device"
+        DTS="$O/target/linux/ipq95xx/files-6.6/arch/arm64/boot/dts/qcom/ipq9574-sbe1v1k.dts"
+        mkdir -p "$OUT"
+        if [ ! -f "$DTS" ]; then
+          echo 90 > "$OUT/tzapp-fix-exit.txt"
+          exit 0
+        fi
+        python3 - "$DTS" "$OUT" <<'PY'
+        import pathlib, re, sys, json
+        p=pathlib.Path(sys.argv[1]); out=pathlib.Path(sys.argv[2])
+        text=p.read_text(errors='replace')
+        pat=re.compile(r'(?ms)^[ \t]*tzapp\s*:\s*tzapp@49[Bb]00000\s*\{.*?^[ \t]*\};\s*')
+        m=pat.search(text)
+        result={'found': bool(m), 'action': 'none'}
+        if m:
+            removed=m.group(0)
+            text=text[:m.start()]+text[m.end():]
+            p.write_text(text)
+            (out/'tzapp-removed.dtsfrag').write_text(removed)
+            result['action']='remove-board-local-duplicate-for-compile-validation'
+            result['board_node']='tzapp@49B00000'
+            result['conflicts_with']='QSDK base tzapp@49600000'
+        (out/'tzapp-fix.json').write_text(json.dumps(result,indent=2)+'\n')
+        print(json.dumps(result,indent=2))
+        PY
+        rc=$?
+        echo "$rc" > "$OUT/tzapp-fix-exit.txt"
+        cp "$DTS" "$OUT/dts-after-tzapp-fix.dts" 2>/dev/null || true
+        exit 0
+    - name: Restore native QSDK q6 reserved-memory regions
+      id: q6-memory
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/device"
+        DTS="$O/target/linux/ipq95xx/files-6.6/arch/arm64/boot/dts/qcom/ipq9574-sbe1v1k.dts"
+        QDIR="$O/target/linux/ipq95xx/files-6.6/arch/arm64/boot/dts/qcom"
+        mkdir -p "$OUT"
+        if [ ! -f "$DTS" ] || [ ! -d "$QDIR" ]; then
+          echo 90 > "$OUT/q6-memory-fix-exit.txt"
+          exit 0
+        fi
+        python3 - "$DTS" "$QDIR" "$OUT" <<'PY'
+        import pathlib, re, sys, json, hashlib
+        board = pathlib.Path(sys.argv[1])
+        qdir = pathlib.Path(sys.argv[2])
+        out = pathlib.Path(sys.argv[3])
+        text = board.read_text(errors='replace')
+
+        def brace_block(s, start):
+            i = s.find('{', start)
+            if i < 0:
+                return None
+            depth = 0
+            in_str = False
+            esc = False
+            line_comment = False
+            block_comment = False
+            j = i
+            while j < len(s):
+                c = s[j]
+                n = s[j+1] if j+1 < len(s) else ''
+                if line_comment:
+                    if c == '\n':
+                        line_comment = False
+                elif block_comment:
+                    if c == '*' and n == '/':
+                        block_comment = False
+                        j += 1
+                elif in_str:
+                    if esc:
+                        esc = False
+                    elif c == '\\':
+                        esc = True
+                    elif c == '"':
+                        in_str = False
+                else:
+                    if c == '/' and n == '/':
+                        line_comment = True
+                        j += 1
+                    elif c == '/' and n == '*':
+                        block_comment = True
+                        j += 1
+                    elif c == '"':
+                        in_str = True
+                    elif c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            k = j + 1
+                            while k < len(s) and s[k] in ' \t\r':
+                                k += 1
+                            if k < len(s) and s[k] == ';':
+                                k += 1
+                            while k < len(s) and s[k] in ' \t\r':
+                                k += 1
+                            if k < len(s) and s[k] == '\n':
+                                k += 1
+                            return start, k, s[start:k]
+                j += 1
+            return None
+
+        labels = ["q6_region", "q6_etr_region"]
+        found = {}
+        hits = []
+
+        candidates = sorted(
+            [p for p in qdir.rglob("ipq9574*.dts*") if p.resolve() != board.resolve()],
+            key=lambda p: (0 if "rdp433" in p.name.lower() else 1, str(p))
+        )
+        for p in candidates:
+            try:
+                s = p.read_text(errors='replace')
+            except Exception:
+                continue
+            for lab in labels:
+                if lab in found:
+                    continue
+                m = re.search(r'(?m)^[ \t]*' + re.escape(lab) + r'\s*:\s*[A-Za-z0-9,_@.+\-]+\s*\{', s)
+                if not m:
+                    continue
+                blk = brace_block(s, m.start())
+                if blk:
+                    found[lab] = {"source": str(p.relative_to(qdir)), "block": blk[2]}
+                    hits.append(f"{lab}\t{p.relative_to(qdir)}")
+
+        (out / "q6-memory-source-hits.txt").write_text("\n".join(hits) + ("\n" if hits else ""))
+
+        # Find the board root reserved-memory block and insert missing native regions.
+        rm = re.search(r'(?m)^[ \t]*reserved-memory\s*\{', text)
+        injected = []
+        if rm:
+            rb = brace_block(text, rm.start())
+            if rb:
+                a, b, block = rb
+                insert_at = block.rfind('}')
+                payload = ""
+                for lab in labels:
+                    if re.search(r'(?m)^[ \t]*' + re.escape(lab) + r'\s*:', block):
+                        continue
+                    if lab in found:
+                        native = found[lab]["block"]
+                        native = "\n".join("        " + ln if ln.strip() else ln for ln in native.strip().splitlines())
+                        payload += "\n" + native + "\n"
+                        injected.append(lab)
+                if payload:
+                    new_block = block[:insert_at] + payload + block[insert_at:]
+                    text = text[:a] + new_block + text[b:]
+                    board.write_text(text)
+
+        result = {
+            "required": labels,
+            "found": {k: v["source"] for k, v in found.items()},
+            "injected": injected,
+            "complete": all(x in injected or re.search(r'(?m)^[ \t]*'+re.escape(x)+r'\s*:', text) for x in labels),
+            "sha256": hashlib.sha256(text.encode()).hexdigest(),
+        }
+        (out / "q6-memory-fix.json").write_text(json.dumps(result, indent=2) + "\n")
+        (out / "dts-after-q6-memory-fix.dts").write_text(text)
+        print(json.dumps(result, indent=2))
+        sys.exit(0 if result["complete"] else 2)
+        PY
+        rc=$?
+        echo "$rc" > "$OUT/q6-memory-fix-exit.txt"
+        exit 0
+    - name: Apply Ethernet V4 - insert NSS-DP nodes inside DTS root
+      id: ethernet_v4
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/device"
+        QDIR="$O/target/linux/ipq95xx/files-6.6/arch/arm64/boot/dts/qcom"
+        DTS="$QDIR/ipq9574-sbe1v1k.dts"
+        REF="$QDIR/ipq9574-db-al02-c2.dts"
+        mkdir -p "$OUT"
+        exec > >(tee "$OUT/ethernet-v4.log") 2>&1
+        if [ ! -f "$DTS" ] || [ ! -f "$REF" ]; then echo 90 > "$OUT/ethernet-v4-exit.txt"; exit 0; fi
+        cp "$REF" "$OUT/ipq9574-db-al02-c2.reference.dts"
+
+        python3 - "$DTS" "$REF" "$OUT" <<'PY'
+        from pathlib import Path
+        import re,sys,json
+        dst,ref,out=Path(sys.argv[1]),Path(sys.argv[2]),Path(sys.argv[3])
+        rt=ref.read_text(errors="replace")
+        dt=dst.read_text(errors="replace")
+
+        def node_for_id(text,qid):
+            m=re.search(r'qcom,id\s*=\s*<\s*%d\s*>\s*;'%qid,text)
+            if not m: raise RuntimeError("reference qcom,id %d not found"%qid)
+            brace=text.rfind('{',0,m.start())
+            start=text.rfind('\n',0,brace)+1
+            depth=0
+            for i in range(brace,len(text)):
+                if text[i]=='{': depth+=1
+                elif text[i]=='}':
+                    depth-=1
+                    if depth==0:
+                        semi=text.find(';',i)
+                        block=text[start:(semi+1 if semi!=-1 else i+1)]
+                        if 'compatible = "qcom,nss-dp"' not in block:
+                            raise RuntimeError("id %d is not inside qcom,nss-dp"%qid)
+                        return block
+            raise RuntimeError("unterminated node")
+
+        targets={3:(18,"qsgmii"),4:(19,"qsgmii"),5:(28,"usxgmii"),6:(0,"usxgmii")}
+        orig=[]; derived=[]
+        for qid,(phy,mode) in targets.items():
+            b=node_for_id(rt,qid); orig.append(b)
+            b=re.sub(r'^(\s*)[A-Za-z_][A-Za-z0-9_]*:\s*',r'\1',b,count=1)
+            if re.search(r'qcom,phy-mdio-addr\s*=',b):
+                b=re.sub(r'qcom,phy-mdio-addr\s*=\s*<[^>]+>\s*;',f'qcom,phy-mdio-addr = <{phy}>;',b)
+            else: b=b.replace('{','{\n\tqcom,phy-mdio-addr = <%d>;' % phy,1)
+            if re.search(r'phy-mode\s*=',b):
+                b=re.sub(r'phy-mode\s*=\s*"[^"]+"\s*;',f'phy-mode = "{mode}";',b)
+            else: b=b.replace('{','{\n\tphy-mode = "%s";' % mode,1)
+            derived.append(b)
+
+        (out/"nss-dp-reference-original.txt").write_text("\n\n".join(orig))
+        (out/"nss-dp-v3-derived.txt").write_text("\n\n".join(derived))
+        allq="\n".join(p.read_text(errors="replace") for p in dst.parent.glob("ipq9574*.dts*"))
+        if not re.search(r'(?m)^\s*ess_switch\s*:',allq):
+            raise RuntimeError("native ess_switch label missing")
+
+        ess='''\n&ess_switch {
+                switch_mac_mode = <0x0b>;
+                switch_mac_mode1 = <0x0d>;
+                switch_mac_mode2 = <0x0d>;
+                qcom,port_phyinfo {
+                        port@2 { port_id = <3>; phy_address = <18>; };
+                        port@3 { port_id = <4>; phy_address = <19>; };
+                        port@4 { port_id = <5>; phy_address = <28>; ethernet-phy-ieee802.3-c45; };
+                        port@5 { port_id = <6>; phy_address = <0>; ethernet-phy-ieee802.3-c45; };
+                };
+        };
+        '''
+        dpfrag="\n\n\t/* Ethernet V4: native QSDK NSS-DP root children */\n"+"\n\n".join(derived)+"\n"
+        root_end=dt.rfind("\n};")
+        if root_end < 0: raise RuntimeError("target DTS final root closing not found")
+        patched=dt[:root_end]+dpfrag+dt[root_end:]+"\n"+ess+"\n"
+        (out/"ethernet-v4-dp-fragment.dtsi").write_text(dpfrag)
+        (out/"ethernet-v4-ess-overlay.dtsi").write_text(ess)
+        dst.write_text(patched)
+        (out/"ipq9574-sbe1v1k-ethernet-v4.dts").write_text(patched)
+        (out/"ethernet-v4-map.json").write_text(json.dumps({"modes":["0x0b","0x0d","0x0d"],"ports":targets},indent=2)+"\n")
+        PY
+        rc=$?
+        echo "$rc" > "$OUT/ethernet-v4-exit.txt"
+        if [ "$rc" -eq 0 ]; then
+         grep -nE 'switch_mac_mode|port_phyinfo|port_id|phy_address|qcom,nss-dp|qcom,id|qcom,phy-mdio-addr|phy-mode' "$DTS" > "$OUT/ethernet-v4-lines.txt" || true
+        fi
+        exit 0
+    - name: Fix Linux 6.6 Realtek PHY package path
+      id: realtek-path
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/device"
+        MK="$O/package/kernel/linux/modules/netdevices.mk"
+        mkdir -p "$OUT"
+
+        if [ ! -f "$MK" ]; then
+          echo 90 > "$OUT/realtek-path-fix-exit.txt"
+          exit 0
+        fi
+
+        cp "$MK" "$OUT/netdevices.mk.before"
+        python3 - "$MK" "$OUT" <<'PY'
+        import pathlib, sys, json, re
+        mk = pathlib.Path(sys.argv[1])
+        out = pathlib.Path(sys.argv[2])
+        s = mk.read_text(errors="replace")
+        before = s
+        s, n = re.subn(
+            r'drivers/net/phy/realtek/realtek\.ko',
+            'drivers/net/phy/realtek.ko',
+            s
+        )
+        mk.write_text(s)
+        result = {
+            "replacement_count": n,
+            "changed": s != before,
+            "new_path_present": "drivers/net/phy/realtek.ko" in s,
+            "old_path_present": "drivers/net/phy/realtek/realtek.ko" in s,
+        }
+        (out / "realtek-path-fix.json").write_text(json.dumps(result, indent=2) + "\n")
+        print(json.dumps(result, indent=2))
+        sys.exit(0 if result["new_path_present"] and not result["old_path_present"] else 2)
+        PY
+        rc=$?
+        cp "$MK" "$OUT/netdevices.mk.after"
+        echo "$rc" > "$OUT/realtek-path-fix-exit.txt"
+        grep -n -A14 -B4 'KernelPackage/phy-realtek' "$MK" > "$OUT/phy-realtek-package-block.txt" 2>/dev/null || true
+        exit 0
+    - name: Integrate exact QSDK13 NetFN and ECM client feed
+      id: nss-clients-feed
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        W="$GITHUB_WORKSPACE/stage17-work"
+        OUT="$GITHUB_WORKSPACE/stage17-results/integration"
+        SRC="$W/nss-clients-feed"
+        URL="https://git.codelinaro.org/clo/qsdk/oss/system/feeds/nss-clients.git"
+        COMMIT="0012113f650506cc9b350f67194caff19b03ad32"
+        mkdir -p "$OUT"
+
+        rm -rf "$SRC"
+        git clone --filter=blob:none --no-checkout "$URL" "$SRC" > "$OUT/nss-clients-clone.log" 2>&1
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+          echo "$rc" > "$OUT/nss-clients-feed-exit.txt"
+          exit 0
+        fi
+
+        git -C "$SRC" checkout "$COMMIT" >> "$OUT/nss-clients-clone.log" 2>&1
+        crc=$?
+        git -C "$SRC" rev-parse HEAD > "$OUT/nss-clients-commit.txt" 2>/dev/null || true
+
+        {
+          echo "requested_commit=$COMMIT"
+          echo "checkout_exit=$crc"
+          echo "actual_commit=$(cat "$OUT/nss-clients-commit.txt" 2>/dev/null)"
+        } > "$OUT/nss-clients-selected-ref.txt"
+
+        find "$SRC" -maxdepth 2 -type f -name Makefile -printf '%P\n' \
+          | grep -E 'qca-nss-(netfn|ecm)|flow' > "$OUT/nss-clients-package-tree.txt" || true
+
+        if [ "$crc" -ne 0 ] || \
+           [ ! -f "$SRC/qca-nss-netfn/Makefile" ] || \
+           [ ! -f "$SRC/qca-nss-ecm/Makefile" ]; then
+          echo 92 > "$OUT/nss-clients-feed-exit.txt"
+          exit 0
+        fi
+
+        # Register the exact local feed.
+        grep -v '^src-link stage17_nss_clients ' "$O/feeds.conf.default" > "$O/feeds.conf.default.tmp" || true
+        mv "$O/feeds.conf.default.tmp" "$O/feeds.conf.default"
+        echo "src-link stage17_nss_clients $SRC" >> "$O/feeds.conf.default"
+
+        cd "$O"
+        ./scripts/feeds update stage17_nss_clients > "$OUT/nss-clients-feeds-update.log" 2>&1
+        urc=$?
+        ./scripts/feeds install -p stage17_nss_clients -f \
+          qca-nss-netfn qca-nss-netfn-pkt-steer qca-nss-ecm \
+          > "$OUT/nss-clients-feeds-install.log" 2>&1
+        irc=$?
+
+        {
+          echo "update=$urc"
+          echo "install=$irc"
+          echo "netfn=$(test -e package/feeds/stage17_nss_clients/qca-nss-netfn && echo yes || echo no)"
+          echo "netfn_pkt_steer=$(test -e package/feeds/stage17_nss_clients/qca-nss-netfn-pkt-steer && echo yes || echo no)"
+          echo "ecm=$(test -e package/feeds/stage17_nss_clients/qca-nss-ecm && echo yes || echo no)"
+        } > "$OUT/nss-clients-feed-status.txt"
+
+        if [ "$urc" -eq 0 ] && [ "$irc" -eq 0 ] \
+           && [ -e package/feeds/stage17_nss_clients/qca-nss-netfn ] \
+           && [ -e package/feeds/stage17_nss_clients/qca-nss-ecm ]; then
+          echo 0 > "$OUT/nss-clients-feed-exit.txt"
+        else
+          echo 2 > "$OUT/nss-clients-feed-exit.txt"
+        fi
+        exit 0
+    - name: Restore QSDK local-development build helpers
+      id: localdev
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        W="$GITHUB_WORKSPACE/stage17-work"
+        OUT="$GITHUB_WORKSPACE/stage17-results/integration"
+        Q="$W/qsdk-openwrt-repo"
+        URL="https://git.codelinaro.org/clo/qsdk/oss/system/openwrt_repo.git"
+        mkdir -p "$OUT"
+
+        rm -rf "$Q"
+        git clone --depth 1 "$URL" "$Q" > "$OUT/localdev-clone.log" 2>&1
+        crc=$?
+
+        src=""
+        if [ "$crc" -eq 0 ]; then
+          src="$Q/include/local-development.mk"
+        fi
+
+        # If the shallow default branch lacks it, fetch a QSDK13 tag and retry.
+        if [ ! -f "$src" ]; then
+          tag="$(git ls-remote --tags "$URL" 'refs/tags/NHSS.QSDK.13*' 2>/dev/null \
+              | sed 's#refs/tags/##' | sed 's/\^{}//' | awk '{print $2}' | sort -V | tail -n1)"
+          echo "fallback_tag=$tag" > "$OUT/localdev-ref.txt"
+          if [ -n "$tag" ]; then
+            rm -rf "$Q"
+            git clone --depth 1 --branch "$tag" "$URL" "$Q" >> "$OUT/localdev-clone.log" 2>&1
+            src="$Q/include/local-development.mk"
+          fi
+        else
+          echo "fallback_tag=default-branch" > "$OUT/localdev-ref.txt"
+        fi
+
+        if [ ! -f "$src" ]; then
+          echo 91 > "$OUT/local-development-exit.txt"
+          exit 0
+        fi
+
+        cp "$src" "$OUT/local-development.mk.original"
+        cp "$src" "$O/include/local-development.mk"
+
+        # Adapt QSDK's expected local source root to this workflow layout where the
+        # exact nss-clients checkout is a sibling of the OpenWrt tree.
+        python3 - "$O/include/local-development.mk" <<'PY'
+        from pathlib import Path
+        import sys
+        p = Path(sys.argv[1])
+        s = p.read_text(errors="replace")
+        repls = [
+            ("$(TOPDIR)/qca/src/$(PKG_NAME)", "$(TOPDIR)/../nss-clients-feed/$(PKG_NAME)"),
+            ("$(TOPDIR)/qca/src/$(PKG_NAME)/", "$(TOPDIR)/../nss-clients-feed/$(PKG_NAME)/"),
+        ]
+        for a,b in repls:
+            s = s.replace(a,b)
+        # Avoid dirty working-tree suffixes creating unstable package versions.
+        s = s.replace("git describe --dirty", "git describe")
+        p.write_text(s)
+        PY
+
+        cp "$O/include/local-development.mk" "$OUT/local-development.mk.adapted"
+        {
+          echo "exists=$(test -f "$O/include/local-development.mk" && echo true || echo false)"
+          echo "nss_source_root=$(realpath "$W/nss-clients-feed" 2>/dev/null)"
+          grep -nE 'qca/src|nss-clients-feed|git describe|LOCAL' "$O/include/local-development.mk" | head -n 120 || true
+        } > "$OUT/local-development-status.txt"
+
+        # Snapshot the problematic package wrappers before build.
+        for d in qca-nss-netfn qca-nss-netfn-pkt-steer qca-nss-ecm emesh-sp; do
+          [ -f "$W/nss-clients-feed/$d/Makefile" ] || continue
+          cp "$W/nss-clients-feed/$d/Makefile" "$OUT/${d}-Makefile.txt"
+        done
+
+        echo 0 > "$OUT/local-development-exit.txt"
+        exit 0
+    - name: Pin PPE feed recipes to Rule commit and preserve diagnostics
+      id: local-sources
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/local-sources"
+        ROOT="$O/qca/src/nss/clients"
+        PREFERRED_TAG="NHSS.QSDK.13.1.5.r1-00011-O"
+
+        mkdir -p "$OUT" "$ROOT"
+        : > "$OUT/source-tree-status.tsv"
+        : > "$OUT/source-tree-errors.txt"
+        : > "$OUT/source-resolver.log"
+
+        resolve_project() {
+          name="$1"
+          dest="$2"
+          shift 2
+
+          rm -rf "$dest"
+          local url="" tag="" list="$OUT/${name}.ls-remote.txt"
+          : > "$list"
+
+          for candidate in "$@"; do
+            echo "=== probing $name :: $candidate ===" | tee -a "$OUT/source-resolver.log"
+            timeout 120 git ls-remote --tags "$candidate" 'refs/tags/NHSS.QSDK.13*' \
+              > "$OUT/${name}.probe.txt" 2>>"$OUT/source-tree-errors.txt"
+            rc=$?
+            if [ "$rc" -eq 0 ] && [ -s "$OUT/${name}.probe.txt" ]; then
+              url="$candidate"
+              cp "$OUT/${name}.probe.txt" "$list"
+              break
+            fi
+          done
+
+          if [ -z "$url" ]; then
+            printf '%s\t%s\t%s\t%s\n' "$name" "NO_URL" "-" "91" >> "$OUT/source-tree-status.tsv"
+            return 91
+          fi
+
+          if grep -qE "refs/tags/${PREFERRED_TAG}(\^\{\})?$" "$list"; then
+            tag="$PREFERRED_TAG"
+          else
+            tags="$(
+              awk '{print $2}' "$list" \
+                | sed -e 's#refs/tags/##' -e 's/\^{}$//' \
+                | sort -Vu
+            )"
+            tag="$(printf '%s\n' "$tags" | grep '^NHSS\.QSDK\.13\.1\.5\.r1-' | sort -V | tail -n1)"
+            [ -n "$tag" ] || tag="$(printf '%s\n' "$tags" | grep '^NHSS\.QSDK\.13\.1\.5' | sort -V | tail -n1)"
+            [ -n "$tag" ] || tag="$(printf '%s\n' "$tags" | grep '^NHSS\.QSDK\.13\.1' | sort -V | tail -n1)"
+            [ -n "$tag" ] || tag="$(printf '%s\n' "$tags" | grep '^NHSS\.QSDK\.13\.0' | sort -V | tail -n1)"
+          fi
+
+          if [ -z "$tag" ]; then
+            printf '%s\t%s\t%s\t%s\n' "$name" "$url" "NO_QSDK13_TAG" "92" >> "$OUT/source-tree-status.tsv"
+            return 92
+          fi
+
+          mkdir -p "$dest"
+          git -C "$dest" init -q
+          git -C "$dest" remote add origin "$url"
+          timeout 300 git -C "$dest" fetch -q --depth 1 origin "refs/tags/$tag" \
+            >> "$OUT/source-resolver.log" 2>>"$OUT/source-tree-errors.txt"
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            printf '%s\t%s\t%s\t%s\n' "$name" "$url" "$tag" "$rc" >> "$OUT/source-tree-status.tsv"
+            rm -rf "$dest"
+            return "$rc"
+          fi
+
+          git -C "$dest" checkout -q --detach FETCH_HEAD \
+            >> "$OUT/source-resolver.log" 2>>"$OUT/source-tree-errors.txt"
+          rc=$?
+          if [ "$rc" -ne 0 ] || [ ! -f "$dest/Makefile" ]; then
+            printf '%s\t%s\t%s\t%s\n' "$name" "$url" "$tag" "93" >> "$OUT/source-tree-status.tsv"
+            return 93
+          fi
+
+          commit="$(git -C "$dest" rev-parse HEAD 2>/dev/null || echo unknown)"
+          printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$url" "$tag" "$commit" "0" >> "$OUT/source-tree-status.tsv"
+          printf '%s\n' "$tag" > "$OUT/${name}.selected-tag.txt"
+          printf '%s\n' "$commit" > "$OUT/${name}.commit.txt"
+          find "$dest" -maxdepth 2 -type f \( -name Makefile -o -name '*.c' -o -name '*.h' \) \
+            | sed "s#^$O/##" | sort | head -n 1000 > "$OUT/${name}.tree.txt" || true
+          return 0
+        }
+
+        overall=0
+
+        # SFE has its own upstream source. The feed wrapper alone is not a kernel module.
+        # Resolve the wrapper's LOCAL_SRC before fetching, and do not guess a destination.
+        SFE_RECIPE="$O/package/feeds/stage17_nss_clients/qca-nss-sfe/Makefile"
+        SFE_URL="https://git.codelinaro.org/clo/qsdk/oss/lklm/shortcut-fe.git"
+        SFE_DEST=""
+        sfe_rc=0
+        if [ ! -f "$SFE_RECIPE" ]; then
+          echo "MISSING_SFE_RECIPE=$SFE_RECIPE" | tee -a "$OUT/source-tree-errors.txt"
+          sfe_rc=94
+        else
+          cp "$SFE_RECIPE" "$OUT/qca-nss-sfe-package-Makefile.txt"
+          sfe_local_src="$(sed -nE 's/^[[:space:]]*LOCAL_SRC[[:space:]]*[:?]?=[[:space:]]*//p' "$SFE_RECIPE" | head -n1)"
+          printf '%s\n' "$sfe_local_src" > "$OUT/qca-nss-sfe-LOCAL_SRC.txt"
+          case "$sfe_local_src" in
+            '$(TOPDIR)/qca/src/nss/'*)
+              sfe_rel="${sfe_local_src#'$(TOPDIR)/'}"
+              case "$sfe_rel" in
+                *'..'*|*'//'*) sfe_rc=95 ;;
+                *) SFE_DEST="$O/$sfe_rel" ;;
+              esac ;;
+            *) sfe_rc=95 ;;
+          esac
+          if [ "$sfe_rc" -ne 0 ]; then
+            echo "UNEXPECTED_SFE_LOCAL_SRC=$sfe_local_src" | tee -a "$OUT/source-tree-errors.txt"
+          fi
+        fi
+
+        if [ "$sfe_rc" -eq 0 ]; then
+          printf '%s\n' "$SFE_DEST" > "$OUT/qca-nss-sfe-destination.txt"
+          # Require the same release tag used by the NetFN and ECM sources.
+          timeout 120 git ls-remote --tags "$SFE_URL" "refs/tags/$PREFERRED_TAG" \
+            > "$OUT/qca-nss-sfe.probe.txt" 2>> "$OUT/source-tree-errors.txt"
+          probe_rc=$?
+          if [ "$probe_rc" -ne 0 ] || ! grep -qE "refs/tags/${PREFERRED_TAG}(\^\{\})?$" "$OUT/qca-nss-sfe.probe.txt"; then
+            echo "SFE_EXACT_TAG_UNAVAILABLE=$PREFERRED_TAG probe_exit=$probe_rc" | tee -a "$OUT/source-tree-errors.txt"
+            sfe_rc=96
+          else
+            rm -rf "$SFE_DEST"
+            mkdir -p "$SFE_DEST"
+            git -C "$SFE_DEST" init -q
+            git -C "$SFE_DEST" remote add origin "$SFE_URL"
+            timeout 300 git -C "$SFE_DEST" fetch -q --depth 1 origin "refs/tags/$PREFERRED_TAG" \
+              >> "$OUT/source-resolver.log" 2>> "$OUT/source-tree-errors.txt"
+            sfe_rc=$?
+            if [ "$sfe_rc" -eq 0 ]; then
+              git -C "$SFE_DEST" checkout -q --detach FETCH_HEAD \
+                >> "$OUT/source-resolver.log" 2>> "$OUT/source-tree-errors.txt"
+              sfe_rc=$?
+            fi
+            if [ "$sfe_rc" -eq 0 ] && [ ! -f "$SFE_DEST/Makefile" ]; then
+              echo "MISSING_SFE_SOURCE_MAKEFILE=$SFE_DEST/Makefile" | tee -a "$OUT/source-tree-errors.txt"
+              sfe_rc=97
+            fi
+            if [ "$sfe_rc" -eq 0 ] && [ ! -f "$SFE_DEST/exports/sfe_api.h" ]; then
+              echo "MISSING_SFE_API_HEADER=$SFE_DEST/exports/sfe_api.h" | tee -a "$OUT/source-tree-errors.txt"
+              sfe_rc=98
+            fi
+          fi
+        fi
+
+        if [ "$sfe_rc" -eq 0 ]; then
+          sfe_commit="$(git -C "$SFE_DEST" rev-parse HEAD)"
+          printf '%s\n' "$sfe_commit" > "$OUT/qca-nss-sfe.commit.txt"
+          printf 'qca-nss-sfe\t%s\t%s\t%s\t0\n' "$SFE_URL" "$PREFERRED_TAG" "$sfe_commit" \
+            >> "$OUT/source-tree-status.tsv"
+        else
+          printf 'qca-nss-sfe\t%s\t%s\t%d\n' "$SFE_URL" "$PREFERRED_TAG" "$sfe_rc" \
+            >> "$OUT/source-tree-status.tsv"
+          overall=1
+        fi
+
+        resolve_project \
+          nss-netfn \
+          "$ROOT/qca-nss-netfn" \
+          "https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-netfn.git" \
+          || overall=1
+
+        resolve_project \
+          qca-nss-ecm \
+          "$ROOT/qca-nss-ecm" \
+          "https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-nss-ecm.git" \
+          "https://git.codelinaro.org/clo/femto5g/oss/lklm/qca-nss-ecm.git" \
+          || overall=1
+
+        resolve_project \
+          emesh-sp \
+          "$ROOT/emesh-sp" \
+          "https://git.codelinaro.org/clo/femto5g/oss/lklm/emesh-sp.git" \
+          "https://git.codelinaro.org/clo/qsdk/oss/lklm/emesh-sp.git" \
+          || overall=1
+
+
+        # V5.6.4: align qca-nss-ppe-rule with the same QSDK release tag as
+        # shortcut-fe / NetFN / ECM. V5.4 proved that using the older feed-ipq
+        # nss-ppe commit can build PPE Rule but leaves this SFE tag without the
+        # ppe_rfs_rule_eligible_get() API it expects.
+        PPE_RECIPE="$O/package/feeds/stage17_nss_clients/qca-nss-ppe-rule/Makefile"
+        PPE_URL="https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe.git"
+        PPE_FALLBACK_COMMIT="0161cd27ea8d20079814d8562dc59cdb79f1f9d5"
+        PPE_DEST="$O/qca/src/nss/base/qca-nss-ppe"
+
+        if [ ! -f "$PPE_RECIPE" ]; then
+          echo "MISSING_RECIPE=$PPE_RECIPE" | tee -a "$OUT/source-tree-errors.txt"
+          overall=1
+        else
+          cp "$PPE_RECIPE" "$OUT/qca-nss-ppe-rule-package-Makefile.txt"
+          ppe_local_src="$(sed -nE 's/^[[:space:]]*LOCAL_SRC[[:space:]]*:?=[[:space:]]*//p' "$PPE_RECIPE" | head -n1)"
+          printf '%s\n' "$ppe_local_src" > "$OUT/qca-nss-ppe-rule-LOCAL_SRC.txt"
+          printf '%s\n' "$PPE_DEST" > "$OUT/qca-nss-ppe-rule-destination.txt"
+
+          if [ "$ppe_local_src" != '$(TOPDIR)/qca/src/nss/base/qca-nss-ppe' ]; then
+            echo "UNEXPECTED_PPE_RULE_LOCAL_SRC=$ppe_local_src" | tee -a "$OUT/source-tree-errors.txt"
+            overall=1
+          else
+            rm -rf "$PPE_DEST"
+            mkdir -p "$PPE_DEST"
+            git -C "$PPE_DEST" init -q
+            git -C "$PPE_DEST" remote add origin "$PPE_URL"
+
+            timeout 120 git ls-remote --tags "$PPE_URL" "refs/tags/$PREFERRED_TAG" \
+              > "$OUT/nss-ppe-base.probe.txt" 2>>"$OUT/source-tree-errors.txt"
+            probe_rc=$?
+            ppe_ref=""
+            ppe_mode=""
+            ppe_rc=1
+
+            if [ "$probe_rc" -eq 0 ] && \
+               grep -qE "refs/tags/${PREFERRED_TAG}(\^\{\})?$" "$OUT/nss-ppe-base.probe.txt"; then
+              timeout 300 git -C "$PPE_DEST" fetch -q --depth 1 origin "refs/tags/$PREFERRED_TAG" \
+                >> "$OUT/source-resolver.log" 2>>"$OUT/source-tree-errors.txt"
+              ppe_rc=$?
+              if [ "$ppe_rc" -eq 0 ]; then
+                git -C "$PPE_DEST" checkout -q --detach FETCH_HEAD \
+                  >> "$OUT/source-resolver.log" 2>>"$OUT/source-tree-errors.txt"
+                ppe_rc=$?
+              fi
+              ppe_ref="$PREFERRED_TAG"
+              ppe_mode="release-tag"
+            else
+              echo "PPE_EXACT_TAG_UNAVAILABLE=$PREFERRED_TAG probe_exit=$probe_rc; fallback=$PPE_FALLBACK_COMMIT" \
+                | tee -a "$OUT/source-resolver.log"
+              timeout 300 git -C "$PPE_DEST" fetch -q --depth 1 origin "$PPE_FALLBACK_COMMIT" \
+                >> "$OUT/source-resolver.log" 2>>"$OUT/source-tree-errors.txt"
+              ppe_rc=$?
+              if [ "$ppe_rc" -ne 0 ]; then
+                timeout 600 git -C "$PPE_DEST" fetch -q origin \
+                  >> "$OUT/source-resolver.log" 2>>"$OUT/source-tree-errors.txt"
+                ppe_rc=$?
+              fi
+              if [ "$ppe_rc" -eq 0 ]; then
+                git -C "$PPE_DEST" checkout -q --detach "$PPE_FALLBACK_COMMIT" \
+                  >> "$OUT/source-resolver.log" 2>>"$OUT/source-tree-errors.txt"
+                ppe_rc=$?
+              fi
+              ppe_ref="$PPE_FALLBACK_COMMIT"
+              ppe_mode="fallback-commit"
+            fi
+
+            if [ "$ppe_rc" -ne 0 ]; then
+              printf '%s\t%s\t%s\t%s\t%s\n' \
+                "nss-ppe-base" "$PPE_URL" "$ppe_mode" "$ppe_ref" "$ppe_rc" \
+                >> "$OUT/source-tree-status.tsv"
+              overall=1
+            else
+              got="$(git -C "$PPE_DEST" rev-parse HEAD 2>/dev/null || echo unknown)"
+              printf '%s\t%s\t%s:%s\t%s\t%s\n' \
+                "nss-ppe-base" "$PPE_URL" "$ppe_mode" "$ppe_ref" "$got" "0" \
+                >> "$OUT/source-tree-status.tsv"
+              printf '%s\n' "$got" > "$OUT/nss-ppe-base.commit.txt"
+              printf '%s\n' "$ppe_ref" > "$OUT/nss-ppe-base.selected-ref.txt"
+              printf '%s\n' "$ppe_mode" > "$OUT/nss-ppe-base.selected-mode.txt"
+              find "$PPE_DEST" -maxdepth 4 -type f \
+                \( -name Makefile -o -name '*.c' -o -name '*.h' \) \
+                | sed "s#^$O/##" | sort | head -n 4000 \
+                > "$OUT/nss-ppe-base.tree.txt" || true
+
+              if [ ! -f "$PPE_DEST/Makefile" ]; then
+                echo "MISSING_NSS_PPE_ROOT_MAKEFILE=$PPE_DEST/Makefile" | tee -a "$OUT/source-tree-errors.txt"
+                overall=1
+              fi
+              if [ ! -f "$PPE_DEST/drv/ppe_rule/Makefile" ]; then
+                echo "MISSING_PPE_RULE_MAKEFILE=$PPE_DEST/drv/ppe_rule/Makefile" | tee -a "$OUT/source-tree-errors.txt"
+                overall=1
+              fi
+
+              : > "$OUT/ppe-rfs-api-hits.txt"
+              grep -RIn --include='*.h' --include='*.c' \
+                'ppe_rfs_rule_eligible_get' "$PPE_DEST/drv" \
+                > "$OUT/ppe-rfs-api-hits.txt" 2>/dev/null || true
+              if [ -f "$PPE_DEST/drv/exports/ppe_rfs.h" ]; then
+                cp "$PPE_DEST/drv/exports/ppe_rfs.h" "$OUT/ppe_rfs.h"
+              fi
+              if ! grep -q 'ppe_rfs_rule_eligible_get' "$OUT/ppe-rfs-api-hits.txt"; then
+                echo "RFS_API_MISSING=ppe_rfs_rule_eligible_get selected_ref=$ppe_ref commit=$got" \
+                  | tee -a "$OUT/source-tree-errors.txt"
+                overall=1
+              fi
+            fi
+          fi
+        fi
+
+        # V5.6.4 SFE RFS compatibility: expose the PPE RFS compile-time macro when
+        # this package enables SFE_RFS_SUPPORTED. Do not suppress compiler errors.
+        if [ -f "$SFE_RECIPE" ]; then
+          cp "$SFE_RECIPE" "$OUT/qca-nss-sfe-package-Makefile.before-rfs-align.txt"
+          python3 - "$SFE_RECIPE" "$OUT" <<'PY'
+        from pathlib import Path
+        import sys, json
+        p = Path(sys.argv[1]); out = Path(sys.argv[2])
+        s = p.read_text(errors='replace')
+        before = s
+        needle = 'SFE_MAKE_OPTS+=SFE_RFS_SUPPORTED=y'
+        flag = 'EXTRA_CFLAGS+= -DPPE_RFS_ENABLED'
+        if needle in s and flag not in s:
+            s = s.replace(needle, needle + '\n' + flag)
+        p.write_text(s)
+        result = {'changed': s != before, 'rfs_make_opt_present': needle in s, 'ppe_rfs_cflag_present': flag in s}
+        (out / 'sfe-rfs-wrapper-align.json').write_text(json.dumps(result, indent=2) + '\n')
+        print(json.dumps(result, indent=2))
+        sys.exit(0 if result['rfs_make_opt_present'] and result['ppe_rfs_cflag_present'] else 2)
+        PY
+          align_rc=$?
+          cp "$SFE_RECIPE" "$OUT/qca-nss-sfe-package-Makefile.after-rfs-align.txt"
+          if [ "$align_rc" -ne 0 ]; then
+            echo "SFE_RFS_WRAPPER_ALIGN_FAILED=$align_rc" | tee -a "$OUT/source-tree-errors.txt"
+            overall=1
+          fi
+        fi
+
+        for p in \
+          "${SFE_DEST:-/nonexistent}/Makefile" \
+          "$ROOT/qca-nss-netfn/Makefile" \
+          "$ROOT/qca-nss-ecm/Makefile" \
+          "$ROOT/emesh-sp/Makefile" \
+          "${PPE_DEST:-/nonexistent}/Makefile"; do
+          if [ ! -f "$p" ]; then
+            echo "MISSING_LOCAL_SOURCE=$p" | tee -a "$OUT/source-tree-errors.txt"
+            overall=1
+          fi
+        done
+
+        # Align the actual feed recipe pins with the already-fetched PPE Rule source.
+        # The previous run did not retain Python stderr; always collect the traceback.
+        if [ "$(cat "$OUT/nss-ppe-base.selected-mode.txt" 2>/dev/null)" != release-tag ]; then
+          echo "PPE_RELEASE_TAG_REQUIRED" | tee -a "$OUT/source-tree-errors.txt"
+          overall=1
+        else
+          python3 - "$OUT" "$PPE_DEST" "$GITHUB_WORKSPACE/stage17-work/feed-ipq/feeds/nss-host" \
+            2>"$OUT/ppe-family-recipe-pin.stderr" <<'PY'
+        import json, pathlib, re, subprocess, sys
+        out, source, feed = map(pathlib.Path, sys.argv[1:])
+        old = '0161cd27ea8d20079814d8562dc59cdb79f1f9d5'
+        commit = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+        assert re.fullmatch(r'[0-9a-f]{40}', commit), commit
+        assert feed.is_dir(), f'missing feed directory: {feed}'
+        recipes = sorted(p for p in feed.rglob('*') if p.is_file() and
+                         (p.name == 'Makefile' or p.suffix == '.mk'))
+        matches = []
+        for recipe in recipes:
+            content = recipe.read_text(errors='replace')
+            count = content.count(old)
+            if count:
+                updated = content.replace(old, commit)
+                updated, hashes = re.subn(
+                    r'(?m)^(PKG_MIRROR_HASH\s*:?=\s*)[^\n]+$',
+                    lambda m: m.group(1) + 'skip', updated)
+                matches.append((recipe, updated, count, hashes))
+        if not matches:
+            raise RuntimeError(f'no old PPE source pin found among {len(recipes)} nss-host recipes')
+        for recipe, updated, count, hashes in matches:
+            recipe.write_text(updated)
+        report = {'old_commit': old, 'new_commit': commit, 'inspected_recipes': len(recipes),
+                  'updated': [{'path': str(p.relative_to(feed)), 'pin_replacements': n,
+                               'mirror_hash_replacements': h} for p, _, n, h in matches]}
+        (out / 'ppe-family-recipe-pin.json').write_text(json.dumps(report, indent=2) + '\n')
+        print(json.dumps(report, indent=2))
+        PY
+          pin_rc=$?
+          if [ "$pin_rc" -ne 0 ]; then
+            echo "PPE_FAMILY_RECIPE_PIN_FAILED=$pin_rc" | tee -a "$OUT/source-tree-errors.txt"
+            tail -n 20 "$OUT/ppe-family-recipe-pin.stderr" | tee -a "$OUT/source-tree-errors.txt"
+            # Preserve the exact upstream recipes for diagnosis, even on a failed pin.
+            for name in qca-nss-ppe qca-nss-ppe-vp qca-nss-ppe-ds qca-nss-ppe-clients; do
+              test ! -f "$GITHUB_WORKSPACE/stage17-work/feed-ipq/feeds/nss-host/$name/Makefile" || \
+                cp "$GITHUB_WORKSPACE/stage17-work/feed-ipq/feeds/nss-host/$name/Makefile" \
+                  "$OUT/$name.feed-Makefile.txt"
+            done
+            overall=1
+          fi
+        fi
+
+        find "$O/build_dir" -maxdepth 5 -type d \( \
+          -name 'qca-nss-netfn*' -o \
+          -name 'qca-nss-ppe-rule*' -o \
+          -name 'qca-nss-ppe-*' -o \
+          -name 'qca-nss-ecm*' -o \
+          -name 'emesh-sp*' \
+        \) -print -exec rm -rf {} + 2>/dev/null > "$OUT/cleaned-build-dirs.txt" || true
+
+        {
+          echo "preferred_tag=$PREFERRED_TAG"
+          echo "local_source_root=$ROOT"
+          echo "source_tree_exit=$overall"
+        } > "$OUT/source-tree-summary.txt"
+        echo "$overall" > "$OUT/source-tree-exit.txt"
+        exit 0
+    - name: Configure SBE1V1K QSDK13 engineering profile
+      id: config
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/config"
+        cd "$O" || { echo 90 > "$OUT/config-exit.txt"; exit 0; }
+
+        cat > .config <<'EOF'
+        CONFIG_TARGET_ipq95xx=y
+        CONFIG_TARGET_ipq95xx_generic=y
+        CONFIG_TARGET_ipq95xx_generic_DEVICE_askey_sbe1v1k=y
+        CONFIG_DEVEL=y
+        CONFIG_BUILD_LOG=y
+        CONFIG_CCACHE=y
+        CONFIG_PACKAGE_kmod-qca-ssdk-qca-nohnat=y
+        CONFIG_PACKAGE_kmod-qca-nss-phy=y
+        CONFIG_PACKAGE_kmod-qca-nss-dp-qca=y
+        CONFIG_PACKAGE_kmod-qca-nss-ppe=y
+        EOF
+
+        # Select copied RTL826x firmware only if its package symbol exists after metadata generation.
+        make defconfig > "$OUT/defconfig-pass1.log" 2>&1
+        rc=$?
+
+        # Enable native QSDK13 NetFN / ECM packages only when their symbols exist.
+        for sym in   CONFIG_PACKAGE_kmod-qca-nss-netfn   CONFIG_PACKAGE_kmod-qca-nss-netfn-pkt-steer   CONFIG_PACKAGE_kmod-qca-nss-ecm   CONFIG_PACKAGE_qca-nss-ecm; do
+          key="${sym#CONFIG_}"
+          if grep -q "$key" tmp/.config-package.in 2>/dev/null; then
+            echo "$sym=y" >> .config
+          fi
+        done
+        make defconfig > "$OUT/defconfig-netfn-ecm.log" 2>&1
+        rc_ne=$?
+        [ "$rc_ne" -ne 0 ] && rc=$rc_ne
+
+        # Second pass after Stage17 local nss-clients feed integration:
+        # enable exact package symbols actually exposed by the selected QSDK13 tag.
+        for key in \
+          PACKAGE_kmod-qca-nss-netfn \
+          PACKAGE_kmod-qca-nss-netfn-pkt-steer \
+          PACKAGE_kmod-qca-nss-ecm \
+          PACKAGE_qca-nss-ecm; do
+          if grep -q "^config $key$" tmp/.config-package.in 2>/dev/null; then
+            echo "CONFIG_${key}=y" >> .config
+          fi
+        done
+        make defconfig > "$OUT/defconfig-stage14-netfn-ecm.log" 2>&1
+        rc_ne2=$?
+        [ "$rc_ne2" -ne 0 ] && rc=$rc_ne2
+        if grep -Rqs 'Package/rtl826x-firmware' package/firmware/rtl826x-firmware 2>/dev/null; then
+          echo 'CONFIG_PACKAGE_rtl826x-firmware=y' >> .config
+          make defconfig > "$OUT/defconfig-pass2.log" 2>&1
+          rc2=$?
+          [ "$rc2" -ne 0 ] && rc=$rc2
+        fi
+
+        echo "$rc" > "$OUT/config-exit.txt"
+        cp .config "$OUT/final.config" 2>/dev/null || true
+        grep -E '^(CONFIG_TARGET_|CONFIG_PACKAGE_.*(qca|nss|ppe|ssdk|netfn|ecm|rtl826)|CONFIG_KERNEL_.*(NSS|PPE|EDMA))' .config \
+          > "$OUT/selected-config.txt" 2>/dev/null || true
+        grep -nEi 'askey_sbe1v1k|rtl826|qca-nss|nss-ppe|nss-dp|ssdk|netfn|flowmgr|ecm' tmp/.config-package.in \
+          > "$OUT/available-kconfig.txt" 2>/dev/null || true
+
+        {
+          echo "=== NetFN / ECM selected symbols ==="
+          grep -E '^CONFIG_PACKAGE_.*(qca-nss-netfn|qca-nss-ecm).*=[ym]$' .config || true
+        } > "$OUT/netfn-ecm-selected.txt"
+
+        # Stage17: select the IPQ95xx/PPE connection-manager path explicitly.
+        # On IPQ95xx, ECM Premium selects PPE; legacy qca-nss-drv dependencies apply
+        # only to older IPQ50xx/60xx/80xx targets.
+        for line in \
+          'CONFIG_PACKAGE_kmod-qca-nss-flowmgr=y' \
+          'CONFIG_PACKAGE_kmod-qca-nss-netfn-pkt-steer=y' \
+          'CONFIG_PACKAGE_kmod-qca-nss-ecm-premium=y'; do
+          key="${line%%=*}"
+          sed -i "/^${key}=.*/d;/^# ${key} is not set/d" .config
+          echo "$line" >> .config
+        done
+
+        make defconfig > "$OUT/defconfig-stage17-flowmgr-ecm-premium.log" 2>&1
+        rc17=$?
+        [ "$rc17" -ne 0 ] && rc=$rc17
+
+        {
+          grep -E '^CONFIG_PACKAGE_kmod-qca-nss-(flowmgr|netfn-pkt-steer|ecm-premium)=[ym]$' .config || true
+          grep -E '^# CONFIG_PACKAGE_kmod-qca-nss-(flowmgr|netfn-pkt-steer|ecm-premium) is not set$' .config || true
+        } > "$OUT/stage17-flowmgr-ecm-selection.txt"
+
+
+        # V5 hard gate: these three packages are required for the intended
+        # IPQ95xx PPE/NetFN/ECM path. Record the exact post-defconfig state.
+        v5_gate=0
+        for sym in \
+          CONFIG_PACKAGE_kmod-qca-nss-flowmgr \
+          CONFIG_PACKAGE_kmod-qca-nss-netfn-pkt-steer \
+          CONFIG_PACKAGE_kmod-qca-nss-ecm-premium; do
+          if grep -qx "${sym}=y" .config; then
+            echo "${sym}=y"
+          else
+            echo "MISSING: ${sym}=y"
+            v5_gate=1
+          fi
+        done | tee "$OUT/v5-required-config.txt"
+
+        cp .config "$OUT/final.config" 2>/dev/null || true
+        grep -E '^(CONFIG_TARGET_|CONFIG_PACKAGE_.*(qca|nss|ppe|ssdk|netfn|flowmgr|ecm|rtl826)|CONFIG_KERNEL_.*(NSS|PPE|EDMA))' .config \
+          > "$OUT/selected-config.txt" 2>/dev/null || true
+
+        echo "$v5_gate" > "$OUT/v5-config-gate-exit.txt"
+        if [ "$v5_gate" -ne 0 ]; then
+          rc=3
+        fi
+        echo "$rc" > "$OUT/config-exit.txt"
+        exit 0
+    - name: Download all selected sources
+      id: download
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/config"
+        cd "$O" || { echo 90 > "$OUT/download-exit.txt"; exit 0; }
+        make -j"$(nproc)" download V=s > "$OUT/download.log" 2>&1
+        rc=$?
+        echo "$rc" > "$OUT/download-exit.txt"
+        grep -nE '(ERROR|Error|failed|404|hash mismatch)' "$OUT/download.log" | tail -n 300 > "$OUT/download-errors.txt" || true
+        exit 0
+    - name: Import prepared host and toolchain cache
+      id: cache-import
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        SRC="$GITHUB_WORKSPACE/stage16-work/openwrt/staging_dir"
+        OUT="$GITHUB_WORKSPACE/stage17-results/bootstrap"
+        mkdir -p "$OUT" "$O/staging_dir"
+        imported=0
+        if [ -d "$SRC/host" ]; then
+          rm -rf "$O/staging_dir/host"
+          cp -a "$SRC/host" "$O/staging_dir/host"
+          imported=1
+        fi
+        shopt -s nullglob
+        for d in "$SRC"/toolchain-*; do
+          bn="$(basename "$d")"
+          rm -rf "$O/staging_dir/$bn"
+          cp -a "$d" "$O/staging_dir/$bn"
+          imported=1
+        done
+        echo "$imported" > "$OUT/cache-imported.txt"
+        echo "cache_hit=${{ steps.bootstrap-cache.outputs.cache-hit }}" > "$OUT/cache-status.txt"
+        echo "cache_imported=$imported" >> "$OUT/cache-status.txt"
+        find "$O/staging_dir" -maxdepth 3 -type f \(-name m4 -o -name '*gcc' -o -name '*g++'\) -printf '%p\n' 2>/dev/null | head -n 80 >> "$OUT/cache-status.txt" || true
+        exit 0
+    - name: Bootstrap host tools and toolchain
+      id: bootstrap
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/bootstrap"
+        cd "$O" || { echo 90 > "$OUT/bootstrap-exit.txt"; exit 0; }
+        export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+        imported=$(cat "$OUT/cache-imported.txt" 2>/dev/null || echo 0)
+        host_ok=0
+        tc_ok=0
+        [ -x "$O/staging_dir/host/bin/m4" ] && host_ok=1
+        comp=$(find "$O/staging_dir" -path '*/bin/aarch64-openwrt-linux-musl-gcc' -type f -perm -111 2>/dev/null | head -n1)
+        [ -n "$comp" ] && tc_ok=1
+
+        echo "imported=$imported host_ok=$host_ok toolchain_ok=$tc_ok compiler=$comp" | tee "$OUT/bootstrap-fastpath.txt"
+        if [ "$imported" = "1" ] && [ "$host_ok" = "1" ] && [ "$tc_ok" = "1" ]; then
+          echo "FASTPATH: restored Stage 11 host/toolchain cache; skip full bootstrap" | tee "$OUT/tools.log" "$OUT/toolchain.log"
+          trc=0
+          crc=0
+        else
+          echo "CACHE MISS/INCOMPLETE: run normal bootstrap" | tee "$OUT/bootstrap-fallback.txt"
+          timeout 3600 make -j"$(nproc)" tools/install V=s > "$OUT/tools.log" 2>&1
+          trc=$?
+          timeout 5400 make -j"$(nproc)" toolchain/install V=s > "$OUT/toolchain.log" 2>&1
+          crc=$?
+        fi
+        echo "$trc" > "$OUT/tools-exit.txt"
+        echo "$crc" > "$OUT/toolchain-exit.txt"
+        if [ "$trc" -eq 0 ] && [ "$crc" -eq 0 ]; then rc=0; else rc=1; fi
+        echo "$rc" > "$OUT/bootstrap-exit.txt"
+        grep -nE '(^|[[:space:]])(error:|fatal error:|No rule to make target|Error [0-9]+)' "$OUT/tools.log" "$OUT/toolchain.log" \
+          | tail -n 300 > "$OUT/bootstrap-errors.txt" || true
+        exit 0
+    - name: Save prepared host toolchain cache for next fast rounds
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          stage17-work/openwrt/staging_dir/host
+          stage17-work/openwrt/staging_dir/toolchain-*
+        key: qsdk66-bootstrap-${{ runner.os }}-${{ env.OPENWRT_TAG }}-${{ env.FEED_IPQ_BRANCH }}-v11
+    - name: Native OpenWrt DTB preflight then full Linux 6.6 build
+      id: kernel
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/kernel"
+        cd "$O" || { echo 90 > "$OUT/kernel-exit.txt"; exit 0; }
+        export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+        CLEAN_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -Fvx "$O/staging_dir/host/bin" | paste -sd: -)"
+        export PATH="$CLEAN_PATH"
+        {
+          echo "PATH=$PATH"
+          for x in bash git g++ rsync grep gzip perl file make; do
+            printf '%s=' "$x"
+            command -v "$x" || true
+          done
+        } > "$OUT/native-prereq-paths.txt"
+
+        # Use OpenWrt's native DTB target. It depends on the kernel configured stamp,
+        # so the build system creates the kernel .config before device-tree compilation.
+        timeout 2700 make -j"$(nproc)" target/linux/dtb V=s > "$OUT/dtb-preflight.log" 2>&1
+        dtbrc=$?
+        echo "$dtbrc" > "$OUT/dtb-preflight-exit.txt"
+
+        grep -nE '(ERROR \(|error:|fatal error:|Reference to non-existent|Duplicate label|syntax error|Error [0-9]+|No rule to make target)' \
+          "$OUT/dtb-preflight.log" | tail -n 400 > "$OUT/dtb-preflight-errors.txt" || true
+
+        KDIR="$(find "$O/build_dir" -maxdepth 3 -type d -path '*linux-ipq95xx_generic/linux-6.6.47' | head -n1)"
+        {
+          echo "dtb_exit=$dtbrc"
+          echo "kdir=$KDIR"
+          if [ -n "$KDIR" ] && [ -d "$KDIR" ]; then
+            echo "kernel_config_exists=$(test -f "$KDIR/.config" && echo true || echo false)"
+            [ -f "$KDIR/.config" ] && {
+              echo "kernel_config_size=$(stat -c %s "$KDIR/.config" 2>/dev/null || echo 0)"
+              sha256sum "$KDIR/.config" 2>/dev/null || true
+            }
+          fi
+        } > "$OUT/kernel-preflight-state.txt"
+
+        find build_dir -type f \( -name 'ipq9574-sbe1v1k.dtb' -o -name '*sbe1v1k*.dtb' \) \
+          -printf '%p\t%s bytes\n' 2>/dev/null | sort > "$OUT/sbe1v1k-dtb.txt" || true
+        dtb_count=$(wc -l < "$OUT/sbe1v1k-dtb.txt" 2>/dev/null || echo 0)
+        echo "$dtb_count" > "$OUT/sbe1v1k-dtb-count.txt"
+
+        if [ "$dtbrc" -ne 0 ] || [ "$dtb_count" -eq 0 ]; then
+          final_rc="$dtbrc"
+          [ "$final_rc" -eq 0 ] && final_rc=98
+          echo "$final_rc" > "$OUT/kernel-exit.txt"
+          cp "$OUT/dtb-preflight.log" "$OUT/kernel-build.log"
+          cp "$OUT/dtb-preflight-errors.txt" "$OUT/kernel-errors.txt"
+          tail -n 500 "$OUT/dtb-preflight.log" > "$OUT/kernel-tail.txt" 2>/dev/null || true
+        else
+          echo "NATIVE_DTB_PREFLIGHT=PASS" > "$OUT/dtb-preflight-pass.txt"
+          timeout 5400 make -j"$(nproc)" target/linux/compile V=s > "$OUT/kernel-build.log" 2>&1
+          rc=$?
+          echo "$rc" > "$OUT/kernel-exit.txt"
+          grep -nE '(^|[[:space:]])(error:|fatal error:|undefined reference|No rule to make target|Error [0-9]+)' \
+            "$OUT/kernel-build.log" | tail -n 500 > "$OUT/kernel-errors.txt" || true
+          tail -n 500 "$OUT/kernel-build.log" > "$OUT/kernel-tail.txt" 2>/dev/null || true
+        fi
+
+        first_dtb=$(awk 'NR==1{print $1}' "$OUT/sbe1v1k-dtb.txt")
+        if [ -n "$first_dtb" ] && [ -f "$first_dtb" ]; then
+          dtc -I dtb -O dts -o "$OUT/sbe1v1k-built.dts" "$first_dtb" 2>"$OUT/dtc-decompile.err" || true
+          grep -nE 'model =|compatible =|ethernet-ports|wifi@|rtl826|qca8075|qca8081|mmc|reserved-memory|q6_' \
+            "$OUT/sbe1v1k-built.dts" > "$OUT/sbe1v1k-built-keynodes.txt" 2>/dev/null || true
+        fi
+        exit 0
+    - name: Capture exact PPE and kernel minidump APIs before PPE build
+      if: always()
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/compat"
+        mkdir -p "$OUT"
+        export QSDK_COMPAT_SOURCE="$O/qca/src/nss/base/qca-nss-ppe/drv/ppe_drv/ppe_drv.h"
+        export QSDK_COMPAT_KERNEL="$(find "$O/build_dir" -maxdepth 3 -type d -path '*/linux-ipq95xx_generic/linux-6.6.47' -print -quit)"
+        python3 - "$OUT" <<'PY'
+        import os, pathlib, re, sys
+
+        out = pathlib.Path(sys.argv[1])
+        source = pathlib.Path(os.environ['QSDK_COMPAT_SOURCE'])
+        kernel_path = os.environ.get('QSDK_COMPAT_KERNEL', '')
+        kernel = pathlib.Path(kernel_path) if kernel_path else None
+        patterns = re.compile(
+            r'minidump_(?:add|fill|remove|register|update|enabled)|'
+            r'MINIDUMP_CRASH_TYPE|QCA_WDT_LOG_DUMP_TYPE|'
+            r'CONFIG_.*MINIDUMP|nss_ppe_drv_minidump_log', re.I)
+
+        status = [f'ppe_source={source}', f'ppe_source_exists={source.is_file()}',
+                  f'kernel={kernel_path}', f'kernel_exists={kernel is not None and kernel.is_dir()}']
+        if source.is_file():
+            data = source.read_text(errors='replace')
+            (out / 'ppe_drv.h').write_text(data)
+            lines = data.splitlines()
+            picked = set()
+            for i, line in enumerate(lines):
+                if patterns.search(line):
+                    picked.update(range(max(0, i-16), min(len(lines), i+17)))
+            (out / 'ppe-header-minidump-context.txt').write_text(''.join(
+                f'{i+1:5}: {lines[i]}\n' for i in sorted(picked)))
+            status.append(f'ppe_header_lines={len(lines)}')
+
+        if kernel and kernel.is_dir():
+            config = kernel / '.config'
+            if config.is_file():
+                (out / 'kernel-minidump-config.txt').write_text(''.join(
+                    line + '\n' for line in config.read_text(errors='replace').splitlines()
+                    if 'MINIDUMP' in line or 'QCOM_WDT' in line or 'QCA_WDT' in line))
+            matches = []
+            scan_count = 0
+            for subtree in ('include', 'drivers', 'arch/arm64'):
+                root = kernel / subtree
+                if not root.is_dir():
+                    continue
+                for path in root.rglob('*'):
+                    if not path.is_file() or path.suffix not in ('.h', '.c'):
+                        continue
+                    scan_count += 1
+                    if path.stat().st_size > 1024 * 1024:
+                        continue
+                    lines = path.read_text(errors='replace').splitlines()
+                    match_lines = [i for i, line in enumerate(lines) if patterns.search(line)]
+                    if match_lines:
+                        selected = set()
+                        for i in match_lines:
+                            selected.update(range(max(0, i-8), min(len(lines), i+12)))
+                        matches.append((str(path.relative_to(kernel)), len(match_lines), ''.join(
+                            f'{i+1:5}: {lines[i]}\n' for i in sorted(selected))))
+            matches.sort(key=lambda item: item[0])
+            (out / 'kernel-minidump-paths.tsv').write_text(''.join(
+                f'{name}\t{count}\n' for name, count, _ in matches))
+            (out / 'kernel-minidump-api-context.txt').write_text(''.join(
+                f'===== {name} ({count} matches) =====\n{content}\n'
+                for name, count, content in matches)[:500000])
+            status += [f'kernel_scanned_files={scan_count}', f'kernel_matched_files={len(matches)}']
+        (out / 'capture-status.txt').write_text('\n'.join(status) + '\n')
+        print('\n'.join(status))
+        PY
+    - name: Apply verified minidump adapter and scoped tunnel variable annotations
+      id: minidump-compat
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/compat"
+        mkdir -p "$OUT"
+        python3 - "$O" "$OUT" > "$OUT/minidump-compat-fix.log" 2>&1 <<'PY'
+        import difflib, pathlib, re, shutil, sys
+
+        openwrt, out = map(pathlib.Path, sys.argv[1:])
+        local = openwrt / 'qca/src/nss/base/qca-nss-ppe/drv/ppe_drv/ppe_drv.h'
+        kernel_dirs = list((openwrt / 'build_dir').glob('*/linux-ipq95xx_generic/linux-6.6.47'))
+        assert len(kernel_dirs) == 1, f'expected one kernel tree, got {kernel_dirs}'
+        kernel = kernel_dirs[0]
+        api = (kernel / 'include/soc/qcom/ctx-save.h').read_text()
+        implementation = (kernel / 'drivers/soc/qcom/ctx-save.c').read_text()
+        assert re.search(r'int minidump_fill_segments\(const uint64_t start_addr, uint64_t size,\s*enum minidump_tlv_type type, const char \*name\);', api)
+        assert 'QCA_WDT_LOG_DUMP_TYPE_WLAN_MOD,' in api
+        assert 'EXPORT_SYMBOL(minidump_fill_segments);' in implementation
+        assert 'int minidump_remove_segments(const uint64_t virtual_address);' in api
+        assert local.is_file(), f'missing PPE source: {local}'
+        old = local.read_text()
+        before = 'minidump_add_segments((uint64_t)(uintptr_t)(start_addr), size, QCA_WDT_LOG_DUMP_TYPE_MOD, name, MINIDUMP_CRASH_TYPE_NSS, "qca_nss_ppe")'
+        after = 'minidump_fill_segments((uint64_t)(uintptr_t)(start_addr), size, QCA_WDT_LOG_DUMP_TYPE_WLAN_MOD, name)'
+        assert old.count(before) == 1, f'unexpected PPE minidump call count: {old.count(before)}'
+        new = old.replace(before, after)
+        patch_data = ''.join(difflib.unified_diff(
+            old.splitlines(keepends=True), new.splitlines(keepends=True),
+            fromfile='a/drv/ppe_drv/ppe_drv.h', tofile='b/drv/ppe_drv/ppe_drv.h'))
+        assert patch_data.startswith('--- a/drv/ppe_drv/ppe_drv.h\n')
+        recipe = openwrt / 'feeds/ipq_nss_host/qca-nss-ppe'
+        assert recipe.is_dir(), f'missing installed PPE recipe: {recipe}'
+        patch_file = recipe / 'patches/999-qsdk66-minidump-compat.patch'
+        assert not patch_file.exists(), f'patch file already exists: {patch_file}'
+        patch_file.parent.mkdir(parents=True, exist_ok=True)
+        patch_file.write_text(patch_data)
+        (out / 'minidump-compat.patch').write_text(patch_data)
+        shutil.copy2(local, out / 'ppe_drv.h.before-fix')
+        local.write_text(new)
+        shutil.copy2(local, out / 'ppe_drv.h.after-fix')
+        print(f'local_source={local}\npackage_patch={patch_file}\nkernel={kernel}\nchanges=1')
+        # Scope the warning fix to the exact function reported by V5.6.4.
+        tun = local.parent / 'tun/ppe_drv_tun.c'
+        tun_old = tun.read_text()
+        (out / 'ppe_drv_tun.c.before-fix').write_text(tun_old)
+        function = re.search(r'\bppe_drv_tun_gretap_to_mapt_sc\s*\([^;]*?\)\s*\{', tun_old)
+        assert function, 'expected tunnel function definition missing'
+        declaration = re.search(r'(?m)^([ \t]*)struct net_device \*tx_dev, \*rx_dev;', tun_old[function.end():function.end()+1200])
+        assert declaration, 'expected tunnel variable declaration missing near function start'
+        start = function.end() + declaration.start()
+        end = function.end() + declaration.end()
+        indent = declaration.group(1)
+        replacement = indent + 'struct net_device *tx_dev __maybe_unused;\n' + indent + 'struct net_device *rx_dev __maybe_unused;'
+        tun_new = tun_old[:start] + replacement + tun_old[end:]
+        tun_patch = ''.join(difflib.unified_diff(tun_old.splitlines(keepends=True), tun_new.splitlines(keepends=True), fromfile='a/drv/ppe_drv/tun/ppe_drv_tun.c', tofile='b/drv/ppe_drv/tun/ppe_drv_tun.c'))
+        tun_patch_file = recipe / 'patches/999-qsdk66-tun-unused.patch'
+        assert not tun_patch_file.exists(), f'patch already exists: {tun_patch_file}'
+        (out / 'ppe_drv_tun.c.before-fix').write_text(tun_old)
+        (out / 'ppe_drv_tun.c.after-fix').write_text(tun_new)
+        (out / 'tun-unused.patch').write_text(tun_patch)
+        tun_patch_file.write_text(tun_patch)
+        tun.write_text(tun_new)
+        print(f'tunnel_source={tun}\ntunnel_patch={tun_patch_file}\ntunnel_declarations_marked=2')
+
+        PY
+        rc=$?
+        echo "$rc" > "$OUT/minidump-compat-gate-exit.txt"
+        tail -n 20 "$OUT/minidump-compat-fix.log"
+        exit 0
+    - name: Build aligned PPE base with RFS and verify exports before Rule and SFE
+      id: packages
+      continue-on-error: true
+      shell: bash
+      run: "set +e\nO=\"$GITHUB_WORKSPACE/stage17-work/openwrt\"\nOUT=\"$GITHUB_WORKSPACE/stage17-results/packages\"\
+        \ncd \"$O\" || { echo 90 > \"$OUT/package-batch-exit.txt\"; exit 0; }\nexport CCACHE_DIR=\"$GITHUB_WORKSPACE/.ccache\"\
+        \n\nsrc_rc=$(cat \"$GITHUB_WORKSPACE/stage17-results/local-sources/source-tree-exit.txt\" 2>/dev/null ||\
+        \ echo 99)\nif [ \"$src_rc\" != \"0\" ]; then\n  echo \"SKIPPED_LOCAL_SOURCE_TREE_$src_rc\" > \"$OUT/package-batch-exit.txt\"\
+        \n  echo -e \"all\\tSKIPPED: source_tree_exit=$src_rc\\t99\" > \"$OUT/package-build-status.tsv\"\n  exit\
+        \ 0\nfi\n\ncgrc=$(cat \"$GITHUB_WORKSPACE/stage17-results/config/v5-config-gate-exit.txt\" 2>/dev/null ||\
+        \ echo 99)\nif [ \"$cgrc\" != \"0\" ]; then\n  echo \"SKIPPED_V5_CONFIG_GATE_$cgrc\" > \"$OUT/package-batch-exit.txt\"\
+        \n  echo -e \"all\\tSKIPPED: v5_config_gate=$cgrc\\t99\" > \"$OUT/package-build-status.tsv\"\n  exit 0\n\
+        fi\n\n# Do not generate misleading MODPOST noise when the board kernel/DTB itself failed.\nkrc=$(cat \"\
+        $GITHUB_WORKSPACE/stage17-results/kernel/kernel-exit.txt\" 2>/dev/null || echo 99)\nif [ \"$krc\" != \"\
+        0\" ]; then\n  echo \"SKIPPED_KERNEL_EXIT_$krc\" > \"$OUT/package-batch-exit.txt\"\n  echo -e \"all\\tSKIPPED:\
+        \ kernel_exit=$krc\\t99\" > \"$OUT/package-build-status.tsv\"\n  exit 0\nfi\n\ncompat_rc=$(cat \"$GITHUB_WORKSPACE/stage17-results/compat/minidump-compat-gate-exit.txt\"\
+        \ 2>/dev/null || echo 99)\nif [ \"$compat_rc\" != \"0\" ]; then\n  echo \"SKIPPED_MINIDUMP_COMPAT_GATE_$compat_rc\"\
+        \ > \"$OUT/package-batch-exit.txt\"\n  echo -e \"ppe_base_rfs\\tSKIPPED: minidump_compat=$compat_rc\\t99\"\
+        \ > \"$OUT/package-build-status.tsv\"\n  exit 0\nfi\n\n# Build the real PPE base first with the RFS option\
+        \ used by PPE Rule.\n# The V5.5 log showed the base was reused from the older source revision.\ntimeout\
+        \ 3600 make -j\"$(nproc)\" package/feeds/ipq_nss_host/qca-nss-ppe/compile \\\n  PPE_RFS_ENABLED=y V=s >\
+        \ \"$OUT/ppe-base-rfs-first.log\" 2>&1\nbase_rc=$?\necho \"$base_rc\" > \"$OUT/ppe-base-rfs-first-exit.txt\"\
+        \ngrep -nE 'error:|undefined!|No rule to make target|Error [0-9]+' \\\n  \"$OUT/ppe-base-rfs-first.log\"\
+        \ | tail -n 250 > \"$OUT/ppe-base-rfs-first.log.errors\" || true\nif [ \"$base_rc\" -ne 0 ]; then\n  echo\
+        \ 1 > \"$OUT/package-batch-exit.txt\"\n  printf 'ppe_base_rfs\\tpackage/feeds/ipq_nss_host/qca-nss-ppe\\\
+        t%s\\n' \"$base_rc\" > \"$OUT/package-build-status.tsv\"\n  exit 0\nfi\n\n: > \"$OUT/package-candidates.tsv\"\
+        \n: > \"$OUT/package-build-status.tsv\"\n\ndiscover_group() {\n  local group=\"$1\" regex=\"$2\"\n  find\
+        \ -L package/feeds/ipq_* package/firmware/rtl826x-firmware -type f -name Makefile 2>/dev/null | while read\
+        \ -r mf; do\n    if grep -qiE \"$regex\" \"$mf\"; then\n      dir=\"${mf%/Makefile}\"\n      echo -e \"\
+        $group\\t$dir\" >> \"$OUT/package-candidates.tsv\"\n    fi\n  done\n}\ndiscover_group ssdk 'KernelPackage/(qca-)?ssdk|PKG_NAME.*ssdk'\n\
+        discover_group phy 'KernelPackage/qca-nss-phy|PKG_NAME.*qca-nss-phy'\ndiscover_group nss_dp 'KernelPackage/.*nss.*dp|PKG_NAME.*nss-dp'\n\
+        discover_group ppe 'KernelPackage/qca-nss-ppe|PKG_NAME.*nss-ppe'\ndiscover_group netfn 'KernelPackage/.*netfn|PKG_NAME.*netfn|flowmgr'\n\
+        discover_group ecm 'KernelPackage/.*ecm|PKG_NAME.*ecm'\ndiscover_group rtl 'rtl826x-firmware|rtl8261n'\n\
+        \n# Add known QSDK native NetFN/ECM directories directly if present.\nfor d in \\\n  package/feeds/stage17_nss_clients/qca-nss-netfn\
+        \ \\\n  package/feeds/stage17_nss_clients/qca-nss-netfn-pkt-steer \\\n  package/feeds/stage17_nss_clients/qca-nss-ecm\
+        \ \\\n  package/feeds/ipq_nss_host/qca-nss-netfn \\\n  package/feeds/ipq_nss_host/qca-nss-netfn-pkt-steer\
+        \ \\\n  package/feeds/ipq_nss_host/qca-nss-ecm; do\n  [ -d \"$d\" ] || continue\n  case \"$d\" in\n    *qca-nss-ecm)\
+        \ echo -e \"ecm\\t$d\" >> \"$OUT/package-candidates.tsv\" ;;\n    *) echo -e \"netfn\\t$d\" >> \"$OUT/package-candidates.tsv\"\
+        \ ;;\n  esac\ndone\nawk '!seen[$0]++' \"$OUT/package-candidates.tsv\" > \"$OUT/package-candidates.unique.tsv\"\
+        \nmv \"$OUT/package-candidates.unique.tsv\" \"$OUT/package-candidates.tsv\"\n\noverall=0\nfor group in ssdk\
+        \ phy nss_dp ppe rtl; do\n  while IFS=$'\\t' read -r g dir; do\n    [ \"$g\" = \"$group\" ] || continue\n\
+        \    rel=\"${dir#./}\"\n    log=\"$OUT/build-${group}-$(basename \"$dir\").log\"\n    echo \"===== BUILD\
+        \ $group :: $rel =====\" | tee \"$log\"\n    timeout 3600 make -j\"$(nproc)\" \"$rel/compile\" V=s >> \"\
+        $log\" 2>&1\n    brc=$?\n    echo -e \"$group\\t$rel\\t$brc\" | tee -a \"$OUT/package-build-status.tsv\"\
+        \n    grep -nE '(^|[[:space:]])(error:|fatal error:|undefined reference|undefined!|No rule to make target|Error\
+        \ [0-9]+)' \\\n      \"$log\" | tail -n 250 > \"$log.errors\" || true\n    [ \"$brc\" -ne 0 ] && overall=1\n\
+        \  done < \"$OUT/package-candidates.tsv\"\ndone\n\nfind build_dir -type f -name '*.ko' -printf '%p\\t%s\
+        \ bytes\\n' 2>/dev/null | sort > \"$OUT/all-built-kos.txt\" || true\ngrep -Ei 'qca|nss|ppe|ssdk|netfn|ecm|rtl826'\
+        \ \"$OUT/all-built-kos.txt\" > \"$OUT/relevant-built-kos.txt\" || true\n# Stage17 acceptance: NetFN and\
+        \ ECM must both be attempted and succeed.\nnetfn_ok=0\necm_ok=0\nawk -F'\t' '$1==\"netfn\" && $3==\"0\"\
+        {ok=1} END{exit ok?0:1}' \"$OUT/package-build-status.tsv\" && netfn_ok=1\nawk -F'\t' '$1==\"ecm\" && $3==\"\
+        0\"{ok=1} END{exit ok?0:1}' \"$OUT/package-build-status.tsv\" && ecm_ok=1\n{\n  echo \"netfn_ok=$netfn_ok\"\
+        \n  echo \"ecm_ok=$ecm_ok\"\n} > \"$OUT/netfn-ecm-build-gate.txt\"\n\nif [ \"$netfn_ok\" -ne 1 ] || [ \"\
+        $ecm_ok\" -ne 1 ]; then\n  overall=1\nfi\necho \"$overall\" > \"$OUT/package-batch-exit.txt\"\n\n# Collect\
+        \ package metadata/dependency warnings specifically for NetFN/ECM.\ngrep -RniE 'kmod-qca-nss-drv|kmod-qca-mcs|kmod-qca-hyfi-bridge|netfn|ecm'\
+        \ \\\n  package/feeds/stage17_nss_clients/qca-nss-netfn \\\n  package/feeds/stage17_nss_clients/qca-nss-ecm\
+        \ 2>/dev/null \\\n  > \"$OUT/netfn-ecm-package-metadata.txt\" || true\n\n# Fail before building PPE Rule/SFE\
+        \ if the new PPE base still lacks its\n# required RFS exports. Record symbol providers and relevant source\
+        \ definitions.\nsymvers=\"$(find build_dir -type f -path '*/symvers/qca-nss-ppe.symvers' -print -quit)\"\
+        \n{\n  echo \"ppe_base_symvers=$symvers\"\n  echo \"ppe_base_source_commit=$(cat \"$GITHUB_WORKSPACE/stage17-results/local-sources/nss-ppe-base.commit.txt\"\
+        \ 2>/dev/null)\"\n  echo '=== actual exports ==='\n  [ -f \"$symvers\" ] && grep -E 'ppe_drv_(port_phy_rfs_(set|clear)|wlan_rfs_enable_set)'\
+        \ \"$symvers\" || true\n  echo '=== source definitions and compile guards ==='\n  grep -RInE 'ppe_drv_(port_phy_rfs_(set|clear)|wlan_rfs_enable_set)|PPE_RFS_ENABLED'\
+        \ \\\n    qca/src/nss/base/qca-nss-ppe/drv/ppe_drv 2>/dev/null | head -n 120 || true\n} > \"$OUT/ppe-base-rfs-exports.txt\"\
+        \nrfs_export_ok=1\nfor symbol in ppe_drv_port_phy_rfs_set ppe_drv_port_phy_rfs_clear ppe_drv_wlan_rfs_enable_set;\
+        \ do\n  if [ ! -f \"$symvers\" ] || ! awk -v sym=\"$symbol\" '$2==sym {ok=1} END {exit !ok}' \"$symvers\"\
+        ; then\n    echo \"MISSING_RFS_EXPORT=$symbol\" >> \"$OUT/ppe-base-rfs-exports.txt\"\n    rfs_export_ok=0\n\
+        \  fi\ndone\necho \"$rfs_export_ok\" > \"$OUT/ppe-base-rfs-export-gate.txt\"\nif [ \"$rfs_export_ok\" -ne\
+        \ 1 ]; then\n  echo 1 > \"$OUT/package-batch-exit.txt\"\n  echo -e 'ppe_rule\\tSKIPPED_MISSING_PPE_BASE_RFS_EXPORT\\\
+        t99' > \"$OUT/stage17-focused-status.tsv\"\n  exit 0\nfi\n\n# V5.1 focused source-tree build for the actual\
+        \ IPQ95xx path.\n# local-development.mk has now been restored, so build in dependency order.\nbuild_one()\
+        \ {\n  group=\"$1\"\n  path=\"$2\"\n  log=\"$OUT/stage17-${group}-$(basename \"$path\").log\"\n  err=\"\
+        $log.errors\"\n  if [ ! -d \"$path\" ]; then\n    printf '%s\\t%s\\t%s\\n' \"$group\" \"$path\" \"MISSING\"\
+        \ >> \"$OUT/stage17-focused-status.tsv\"\n    return 1\n  fi\n  echo \"===== STAGE17 BUILD $group :: $path\
+        \ =====\"\n  timeout 3600 make -j\"$(nproc)\" \"$path/compile\" V=s > \"$log\" 2>&1\n  rc=$?\n  grep -nE\
+        \ '(^|[[:space:]])(error:|fatal error:|No rule to make target|undefined reference|Error [0-9]+|has both\
+        \ : and :: entries)' \\\n    \"$log\" | tail -n 400 > \"$err\" || true\n  printf '%s\\t%s\\t%s\\n' \"$group\"\
+        \ \"$path\" \"$rc\" >> \"$OUT/stage17-focused-status.tsv\"\n  return \"$rc\"\n}\n\n: > \"$OUT/stage17-focused-status.tsv\"\
+        \nfocused_overall=0\n\n# qca-nss-ppe-rule is a direct dependency of FlowMgr/ECM.\nbuild_one ppe_rule package/feeds/stage17_nss_clients/qca-nss-ppe-rule\
+        \ || focused_overall=1\n\n# SFE must compile before its NetFN/ECM dependents.\nbuild_one sfe package/feeds/stage17_nss_clients/qca-nss-sfe\
+        \ || focused_overall=1\n\n# FlowMgr is emitted by the qca-nss-netfn wrapper.\nbuild_one flowmgr package/feeds/stage17_nss_clients/qca-nss-netfn\
+        \ || focused_overall=1\n\n# Packet steering is a separate package wrapper.\nbuild_one netfn_pkt_steer package/feeds/stage17_nss_clients/qca-nss-netfn-pkt-steer\
+        \ || focused_overall=1\n\n# ECM on IPQ95xx pulls in emesh-sp. Build it explicitly first.\nbuild_one emesh_sp\
+        \ package/feeds/stage17_nss_clients/emesh-sp || focused_overall=1\n\n# ECM Premium is emitted by the qca-nss-ecm\
+        \ wrapper.\nbuild_one ecm_premium package/feeds/stage17_nss_clients/qca-nss-ecm || focused_overall=1\n\n\
+        ppe_rule_ok=0\nsfe_ok=0\nflowmgr_ok=0\npkt_ok=0\nemesh_ok=0\necm_ok=0\nawk -F'\\t' '$1==\"ppe_rule\" &&\
+        \ $3==\"0\"{ok=1} END{exit ok?0:1}' \"$OUT/stage17-focused-status.tsv\" && ppe_rule_ok=1\nawk -F'\\t' '$1==\"\
+        sfe\" && $3==\"0\"{ok=1} END{exit ok?0:1}' \"$OUT/stage17-focused-status.tsv\" && sfe_ok=1\nawk -F'\\t'\
+        \ '$1==\"flowmgr\" && $3==\"0\"{ok=1} END{exit ok?0:1}' \"$OUT/stage17-focused-status.tsv\" && flowmgr_ok=1\n\
+        awk -F'\\t' '$1==\"netfn_pkt_steer\" && $3==\"0\"{ok=1} END{exit ok?0:1}' \"$OUT/stage17-focused-status.tsv\"\
+        \ && pkt_ok=1\nawk -F'\\t' '$1==\"emesh_sp\" && $3==\"0\"{ok=1} END{exit ok?0:1}' \"$OUT/stage17-focused-status.tsv\"\
+        \ && emesh_ok=1\nawk -F'\\t' '$1==\"ecm_premium\" && $3==\"0\"{ok=1} END{exit ok?0:1}' \"$OUT/stage17-focused-status.tsv\"\
+        \ && ecm_ok=1\n\n{\n  echo \"ppe_rule_ok=$ppe_rule_ok\"\n  echo \"sfe_ok=$sfe_ok\"\n  echo \"flowmgr_ok=$flowmgr_ok\"\
+        \n  echo \"netfn_pkt_steer_ok=$pkt_ok\"\n  echo \"emesh_sp_ok=$emesh_ok\"\n  echo \"ecm_premium_ok=$ecm_ok\"\
+        \n} > \"$OUT/stage17-flowmgr-ecm-gate.txt\"\n\n# Overwrite the batch gate with the focused result so the\
+        \ image stage only\n# proceeds when the actual IPQ95xx FlowMgr/NetFN/emesh/ECM path compiled.\nif [ \"$ppe_rule_ok\"\
+        \ -eq 1 ] && [ \"$sfe_ok\" -eq 1 ] && [ \"$flowmgr_ok\" -eq 1 ] && [ \"$pkt_ok\" -eq 1 ] && [ \"$emesh_ok\"\
+        \ -eq 1 ] && [ \"$ecm_ok\" -eq 1 ]; then\n  echo 0 > \"$OUT/package-batch-exit.txt\"\nelse\n  echo 1 > \"\
+        $OUT/package-batch-exit.txt\"\nfi\n\n# Capture relevant final kernel modules for audit.\nfind build_dir\
+        \ -type f \\( \\\n  -name '*flowmgr*.ko' -o \\\n  -name '*netfn*.ko' -o \\\n  -name '*ecm*.ko' \\\n\\) -printf\
+        \ '%p\\t%s bytes\\n' 2>/dev/null | sort > \"$OUT/stage17-flowmgr-netfn-ecm-kos.txt\" || true\n\n"
+    - name: Audit PPE RFS header and exported symbol after focused build
+      id: rfs-api-audit
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/packages"
+        cd "$O" || exit 0
+        {
+          echo '=== staged PPE RFS API ==='
+          grep -RIn 'ppe_rfs_rule_eligible_get' staging_dir/target-*/usr/include/qca-nss-ppe 2>/dev/null || true
+          echo
+          echo '=== PPE Rule Module.symvers API ==='
+          find build_dir -type f -path '*qca-nss-ppe-rule*/Module.symvers' -print \
+            -exec grep -Hn 'ppe_rfs_rule_eligible_get' {} \; 2>/dev/null || true
+          echo
+          echo '=== SFE wrapper RFS flags ==='
+          grep -nE 'SFE_RFS_SUPPORTED|PPE_RFS_ENABLED' package/feeds/stage17_nss_clients/qca-nss-sfe/Makefile 2>/dev/null || true
+        } > "$OUT/ppe-rfs-build-api-check.txt"
+        find build_dir -type f -path '*qca-nss-ppe-rule*/Module.symvers' \
+          -exec cp {} "$OUT/ppe-rule.Module.symvers" \; 2>/dev/null || true
+        exit 0
+
+        cat "$OUT/ppe-base-rfs-exports.txt" 2>/dev/null || true
+    - name: Discover and inspect NetFN / FlowMgr / ECM source trees
+      id: discovery
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        F="$GITHUB_WORKSPACE/stage17-work/feed-ipq"
+        OUT="$GITHUB_WORKSPACE/stage17-results/discovery"
+        SRC="$GITHUB_WORKSPACE/stage17-work/qca-discovery"
+        mkdir -p "$SRC" "$OUT"
+
+        grep -RInEi 'netfn|flowmgr|qca-nss-ecm|(^|[^a-z])ecm([^a-z]|$)' "$F" "$O/package/feeds" 2>/dev/null \
+          | head -n 8000 > "$OUT/local-netfn-ecm-hits.txt" || true
+
+        : > "$OUT/remote-probes.tsv"
+        probe_clone() {
+          name="$1"; url="$2"
+          git ls-remote "$url" > "$OUT/$name.ls-remote.txt" 2>&1
+          lrc=$?
+          echo -e "$name\t$url\tlsremote=$lrc" >> "$OUT/remote-probes.tsv"
+          [ "$lrc" -eq 0 ] || return 0
+          rm -rf "$SRC/$name"
+          git clone --depth 1 "$url" "$SRC/$name" > "$OUT/$name.clone.log" 2>&1
+          crc=$?
+          echo -e "$name\t$url\tclone=$crc" >> "$OUT/remote-probes.tsv"
+          if [ "$crc" -eq 0 ]; then
+            { find "$SRC/$name" -maxdepth 4 -type f -name Makefile -o -type d \( -iname '*ecm*' -o -iname '*netfn*' -o -iname '*flow*' \); } \
+              2>/dev/null | sed "s#^$SRC/$name/##" | sort -u > "$OUT/$name.tree-hits.txt" || true
+            git -C "$SRC/$name" rev-parse HEAD > "$OUT/$name.commit.txt" 2>/dev/null || true
+          fi
+        }
+        probe_clone nss-clients https://git.codelinaro.org/clo/qsdk/oss/system/feeds/nss-clients.git
+        probe_clone nss-netfn https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-netfn.git
+        exit 0
+    - name: Build V5.6.4 full-stack engineering firmware images
+      id: image
+      continue-on-error: true
+      shell: bash
+      run: |
+        set +e
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        OUT="$GITHUB_WORKSPACE/stage17-results/image"
+        cd "$O" || { echo 90 > "$OUT/image-exit.txt"; exit 0; }
+        export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+
+        src_rc=$(cat "$GITHUB_WORKSPACE/stage17-results/local-sources/source-tree-exit.txt" 2>/dev/null || echo 99)
+        if [ "$src_rc" != "0" ]; then
+          echo "SKIPPED_LOCAL_SOURCE_TREE_$src_rc" > "$OUT/image-exit.txt"
+          echo "Image pipeline skipped because Qualcomm local source tree restoration failed." > "$OUT/target-install.log"
+          : > "$OUT/image-errors.txt"
+          : > "$OUT/image-tail.txt"
+          : > "$OUT/bin-artifacts.txt"
+          exit 0
+        fi
+
+        cgrc=$(cat "$GITHUB_WORKSPACE/stage17-results/config/v5-config-gate-exit.txt" 2>/dev/null || echo 99)
+        if [ "$cgrc" != "0" ]; then
+          echo "SKIPPED_V5_CONFIG_GATE_$cgrc" > "$OUT/image-exit.txt"
+          echo "Image pipeline skipped until FlowMgr/NetFN/ECM Premium are selected." > "$OUT/target-install.log"
+          : > "$OUT/image-errors.txt"
+          : > "$OUT/image-tail.txt"
+          : > "$OUT/bin-artifacts.txt"
+          exit 0
+        fi
+
+        prc=$(cat "$GITHUB_WORKSPACE/stage17-results/packages/package-batch-exit.txt" 2>/dev/null || echo 99)
+        if [ "$prc" != "0" ]; then
+          echo "SKIPPED_PACKAGE_BATCH_EXIT_$prc" > "$OUT/image-exit.txt"
+          echo "Image pipeline skipped until NetFN/ECM and package cascade are green." > "$OUT/target-install.log"
+          : > "$OUT/image-errors.txt"
+          : > "$OUT/image-tail.txt"
+          : > "$OUT/bin-artifacts.txt"
+          exit 0
+        fi
+
+        # Host opkg is needed by package/install.
+        if [ ! -x staging_dir/host/bin/opkg ]; then
+          timeout 1800 make -j"$(nproc)" package/system/opkg/host/compile V=s > "$OUT/opkg-host.log" 2>&1
+          orc=$?
+        else
+          orc=0
+          echo "reused existing staging_dir/host/bin/opkg" > "$OUT/opkg-host.log"
+        fi
+        echo "$orc" > "$OUT/opkg-host-exit.txt"
+        echo "$(test -x staging_dir/host/bin/opkg && echo true || echo false)" > "$OUT/opkg-host-present.txt"
+
+        # fwtool is required to append valid OpenWrt metadata/certificates to sysupgrade images.
+        frc=0
+        if [ ! -x staging_dir/host/bin/fwtool ]; then
+          timeout 1800 make -j"$(nproc)" package/system/fwtool/host/compile V=s > "$OUT/fwtool-host.log" 2>&1
+          frc=$?
+          if [ "$frc" -ne 0 ] || [ ! -x staging_dir/host/bin/fwtool ]; then
+            # Fallback for trees where fwtool is provided through the normal package compile.
+            timeout 1800 make -j"$(nproc)" package/system/fwtool/compile V=s >> "$OUT/fwtool-host.log" 2>&1
+            frc=$?
+          fi
+        else
+          echo "reused existing staging_dir/host/bin/fwtool" > "$OUT/fwtool-host.log"
+        fi
+        echo "$frc" > "$OUT/fwtool-host-exit.txt"
+        echo "$(test -x staging_dir/host/bin/fwtool && echo true || echo false)" > "$OUT/fwtool-host-present.txt"
+
+        if [ "$orc" -ne 0 ] || [ ! -x staging_dir/host/bin/opkg ] || \
+           [ "$frc" -ne 0 ] || [ ! -x staging_dir/host/bin/fwtool ]; then
+          echo 127 > "$OUT/image-exit.txt"
+          {
+            echo "opkg_present=$(test -x staging_dir/host/bin/opkg && echo true || echo false)"
+            echo "fwtool_present=$(test -x staging_dir/host/bin/fwtool && echo true || echo false)"
+          } > "$OUT/image-host-tools-gate.txt"
+          cat "$OUT/opkg-host.log" "$OUT/fwtool-host.log" 2>/dev/null \
+            | grep -nE '(^|[[:space:]])(error:|fatal error:|No rule to make target|Error [0-9]+)' \
+            | tail -n 400 > "$OUT/image-errors.txt" || true
+          exit 0
+        fi
+
+        timeout 5400 make -j"$(nproc)" package/install V=s > "$OUT/package-install.log" 2>&1
+        irc=$?
+        echo "$irc" > "$OUT/package-install-exit.txt"
+        if [ "$irc" -ne 0 ]; then
+          echo "$irc" > "$OUT/image-exit.txt"
+          grep -nE '(^|[[:space:]])(error:|fatal error:|Traceback|No rule to make target|Error [0-9]+)' \
+            "$OUT/package-install.log" | tail -n 400 > "$OUT/image-errors.txt" || true
+          tail -n 500 "$OUT/package-install.log" > "$OUT/image-tail.txt" 2>/dev/null || true
+          exit 0
+        fi
+
+        timeout 5400 make -j"$(nproc)" target/install V=s > "$OUT/target-install.log" 2>&1
+        rc=$?
+        echo "$rc" > "$OUT/image-exit.txt"
+        grep -nE '(^|[[:space:]])(error:|fatal error:|Traceback|No rule to make target|Error [0-9]+|command not found)' \
+          "$OUT/target-install.log" | tail -n 500 > "$OUT/image-errors.txt" || true
+        tail -n 600 "$OUT/target-install.log" > "$OUT/image-tail.txt" 2>/dev/null || true
+
+        find bin/targets/ipq95xx/generic -maxdepth 2 -type f -printf '%p\t%s bytes\n' 2>/dev/null \
+          | sort > "$OUT/bin-artifacts.txt" || true
+
+        SYSUP="$(find bin/targets/ipq95xx/generic -maxdepth 1 -type f -name '*askey_sbe1v1k*sysupgrade.bin' | head -n1)"
+        FACTORY="$(find bin/targets/ipq95xx/generic -maxdepth 1 -type f -name '*askey_sbe1v1k*factory.bin' | head -n1)"
+        {
+          echo "sysupgrade=$SYSUP"
+          echo "factory=$FACTORY"
+          [ -n "$SYSUP" ] && sha256sum "$SYSUP" || true
+          [ -n "$FACTORY" ] && sha256sum "$FACTORY" || true
+        } > "$OUT/image-candidates.txt"
+
+        # If target/install returned success but metadata tool errors leaked into the log, fail the engineering gate.
+        if grep -qE 'fwtool: command not found|command not found.*fwtool' "$OUT/target-install.log"; then
+          echo 126 > "$OUT/image-exit.txt"
+        fi
+        exit 0
+    - name: Collect V5.6.4 firmware candidates and write verdict
+      if: always()
+      shell: bash
+      run: |
+        set +e
+        R="$GITHUB_WORKSPACE/stage17-results"
+        O="$GITHUB_WORKSPACE/stage17-work/openwrt"
+        F="$R/firmware"
+        mkdir -p "$F"
+
+        src_rc="$(cat "$R/local-sources/source-tree-exit.txt" 2>/dev/null || echo 99)"
+        cgrc="$(cat "$R/config/v5-config-gate-exit.txt" 2>/dev/null || echo 99)"
+        erc="$(cat "$R/device/ethernet-v4-exit.txt" 2>/dev/null || echo 99)"
+        krc="$(cat "$R/kernel/kernel-exit.txt" 2>/dev/null || echo 99)"
+        prc="$(cat "$R/packages/package-batch-exit.txt" 2>/dev/null || echo 99)"
+        irc="$(cat "$R/image/image-exit.txt" 2>/dev/null || echo 99)"
+
+        : > "$F/source-files.txt"
+        if [ -d "$O/bin/targets/ipq95xx/generic" ]; then
+          find "$O/bin/targets/ipq95xx/generic" -maxdepth 1 -type f \
+            \( -iname '*sbe1v1k*' -o -name 'sha256sums' -o -name 'profiles.json' \) \
+            -print | sort > "$F/source-files.txt" || true
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            cp -f "$f" "$F/" || true
+          done < "$F/source-files.txt"
+        fi
+
+        find "$F" -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort > "$F/manifest.txt" 2>/dev/null || true
+        (
+          cd "$F" || exit 0
+          sha256sum * 2>/dev/null | grep -vE ' (sha256sums|manifest.txt|source-files.txt|V5-VERDICT.txt)$' \
+            > firmware-sha256.txt || true
+        )
+
+        initramfs_count="$(find "$F" -maxdepth 1 -type f \( -name '*initramfs*.itb' -o -name '*initramfs*.bin' -o -name '*initramfs*uImage*' \) | wc -l)"
+        factory_count="$(find "$F" -maxdepth 1 -type f -name '*factory*.bin' | wc -l)"
+        sysupgrade_count="$(find "$F" -maxdepth 1 -type f -name '*sysupgrade*.bin' | wc -l)"
+
+        {
+          echo "source_tree_exit=$src_rc"
+          echo "v5_config_gate_exit=$cgrc"
+          echo "ethernet_v4_exit=$erc"
+          echo "kernel_exit=$krc"
+          echo "package_batch_exit=$prc"
+          echo "image_exit=$irc"
+          echo "initramfs_count=$initramfs_count"
+          echo "factory_count=$factory_count"
+          echo "sysupgrade_count=$sysupgrade_count"
+          if [ "$src_rc" = 0 ] && [ "$cgrc" = 0 ] && [ "$erc" = 0 ] && [ "$krc" = 0 ] && \
+             [ "$prc" = 0 ] && [ "$irc" = 0 ] && [ "$initramfs_count" -gt 0 ]; then
+            echo "VERDICT=V5_6_4_RAM_BOOT_CANDIDATE_BUILT"
+          else
+            echo "VERDICT=V5_NOT_READY"
+          fi
+          echo
+          echo "SAFETY=DO_NOT_FLASH_EMMC"
+          echo "Reason: DEVICE_DTS_CONFIG still uses config-rdp433-mht-phy as an engineering placeholder."
+        } | tee "$F/V5-VERDICT.txt"
+        exit 0
+    - name: Generate V5.6.4 summary
+      if: always()
+      shell: bash
+      run: |
+        set +e
+        R="$GITHUB_WORKSPACE/stage17-results"
+        val() { [ -f "$1" ] && cat "$1" || echo NOT_RUN; }
+        IRC="$(val "$R/integration/integration-exit.txt")"
+        TRC="$(val "$R/device/transplant-exit.txt")"
+        CRC="$(val "$R/config/config-exit.txt")"
+        BRC="$(val "$R/bootstrap/bootstrap-exit.txt")"
+        KRC="$(val "$R/kernel/kernel-exit.txt")"
+        DTC="$(val "$R/kernel/sbe1v1k-dtb-count.txt")"
+        PRC="$(val "$R/packages/package-batch-exit.txt")"
+        IMRC="$(val "$R/image/image-exit.txt")"
+        KOS="$(wc -l < "$R/packages/relevant-built-kos.txt" 2>/dev/null || echo 0)"
+
+        cat > "$R/stage14-summary.txt" <<EOF
+        SBE1V1K QSDK 6.6 V5.6.4 - RFS API aligned NetFN / emesh / ECM full-stack firmware
+        ====================================================
+        openwrt_tag: $OPENWRT_TAG
+        feed_ipq_branch: $FEED_IPQ_BRANCH
+        kernel_target: IPQ95xx / Linux 6.6.47 / Cortex-A73
+        integration_exit: $IRC
+        transplant_exit: $TRC
+        config_exit: $CRC
+        bootstrap_exit: $BRC
+        bootstrap_cache_hit: ${{ steps.bootstrap-cache.outputs.cache-hit }}
+        bootstrap_cache_imported: $(cat "$R/bootstrap/cache-imported.txt" 2>/dev/null || echo 0)
+        kernel_exit: $KRC
+        sbe1v1k_dtb_count: $DTC
+        qca_package_batch_exit: $PRC
+        relevant_ko_count: $KOS
+        engineering_image_exit: $IMRC
+
+        Stage 17 gates:
+        - Gate A: fast DTB preflight compiles ipq9574-sbe1v1k.dtb before any expensive full-kernel build.
+        - Gate B: SSDK -> PHY -> NSS-DP -> PPE remains green after device transplant.
+        - Gate C: identify NetFN / FlowMgr / ECM package/source path in the QSDK13 environment.
+        - Gate D: exercise target/install only to expose image-pipeline blockers early.
+
+        SAFETY:
+        - DEVICE_DTS_CONFIG still reuses config-rdp433-mht-phy as an engineering placeholder.
+        - Stage 17 maps PCIe labels, resolves the duplicate tzapp node, and imports native QSDK q6 reserved-memory labels only for compile validation; secure-memory/runtime parity is NOT validated.
+        - Any V5 factory/sysupgrade image is NOT flashable and MUST NOT be flashed to eMMC.
+        - RTL8261N runtime driver/firmware, Wi-Fi/caldata, MAC/partition/recovery and board-config parity still require validation.
+        EOF
+
+        echo "===== STAGE 8 SUMMARY ====="
+        cat "$R/stage14-summary.txt"
+        echo "===== DTB ====="
+        cat "$R/kernel/sbe1v1k-dtb.txt" 2>/dev/null || true
+        echo "===== PACKAGE STATUS ====="
+        cat "$R/packages/package-build-status.tsv" 2>/dev/null || true
+        echo "===== IMAGE ERRORS ====="
+        cat "$R/image/image-errors.txt" 2>/dev/null || true
+
+        echo "===== V5 FIRMWARE VERDICT ====="
+        cat "$R/firmware/V5-VERDICT.txt" 2>/dev/null || true
+        echo "===== V5 FIRMWARE MANIFEST ====="
+        cat "$R/firmware/manifest.txt" 2>/dev/null || true
+
+        echo "===== V5.6.4 LOCAL SOURCE TREE ====="
+        cat "$R/local-sources/source-tree-summary.txt" 2>/dev/null || true
+        cat "$R/local-sources/source-tree-status.tsv" 2>/dev/null || true
+
+        echo "===== V5.6.4 EXACT SFE SOURCE ====="
+        cat "$R/local-sources/qca-nss-sfe.commit.txt" 2>/dev/null || true
+        cat "$R/local-sources/qca-nss-sfe-LOCAL_SRC.txt" 2>/dev/null || true
+        cat "$R/local-sources/qca-nss-sfe-destination.txt" 2>/dev/null || true
+
+        echo "===== V5.6.4 RFS-ALIGNED NSS-PPE BASE ====="
+        cat "$R/local-sources/nss-ppe-base.commit.txt" 2>/dev/null || true
+        cat "$R/local-sources/qca-nss-ppe-rule-LOCAL_SRC.txt" 2>/dev/null || true
+        cat "$R/local-sources/qca-nss-ppe-rule-destination.txt" 2>/dev/null || true
+
+        cat "$R/local-sources/ppe-family-recipe-pin.json" 2>/dev/null || true
+        cat "$R/packages/ppe-base-rfs-exports.txt" 2>/dev/null || true
+    - name: Pack V5.6.4 diagnostics
+      if: always()
+      shell: bash
+      run: |
+        set -euxo pipefail
+        du -ah stage17-results | sort -h > stage17-results/size-summary.txt || true
+        tar -C stage17-results -czf SBE1V1K-QSDK66-V5-6-4-results.tar.gz .
+        ls -lh SBE1V1K-QSDK66-V5-6-4-results.tar.gz
+    - name: Upload V5.6.4 full-stack firmware artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: SBE1V1K-QSDK66-V5-6-4-PPE-Tunnel-Fix
+        if-no-files-found: warn
+        retention-days: 14
+        path: |
+          stage17-results/
+          SBE1V1K-QSDK66-V5-6-4-results.tar.gz
+    name: Stage 17 - Adapt SBE1V1K DTS on QSDK 6.6 and cascade
