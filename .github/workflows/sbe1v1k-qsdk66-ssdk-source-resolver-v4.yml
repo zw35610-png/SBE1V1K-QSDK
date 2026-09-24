@@ -1,0 +1,119 @@
+name: SBE1V1K QSDK66 SSDK Source Resolver V4
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact feed-ipq
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/zilogic-systems/feed-ipq.git feed-ipq
+          git -C feed-ipq checkout 183c0317fad6f23bd450a4d1953324de1931f712
+          test "$(git -C feed-ipq rev-parse HEAD)" = "183c0317fad6f23bd450a4d1953324de1931f712"
+
+      - name: Resolve exact qca-ssdk-qca package
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/resolver"
+          MF="feed-ipq/feeds/clo-upstream/qca-ssdk-qca/Makefile"
+          mkdir -p "$OUT"
+          test -f "$MF"
+          cp "$MF" "$OUT/qca-ssdk-qca-Makefile.txt"
+          URL="$(sed -n 's/^PKG_SOURCE_URL[[:space:]]*:=[[:space:]]*//p' "$MF" | head -1)"
+          VER="$(sed -n 's/^PKG_VERSION[[:space:]]*:=[[:space:]]*//p' "$MF" | head -1)"
+          BRANCH="$(sed -n 's/^PKG_BRANCH[[:space:]]*:=[[:space:]]*//p' "$MF" | head -1)"
+          test -n "$URL"
+          test -n "$VER"
+          printf '%s\n' "$URL" > "$OUT/resolved-url.txt"
+          printf '%s\n' "$VER" > "$OUT/resolved-version.txt"
+          printf '%s\n' "$BRANCH" > "$OUT/resolved-branch.txt"
+          {
+            echo "URL=$URL"
+            echo "VERSION=$VER"
+            echo "BRANCH=$BRANCH"
+          } | tee "$OUT/RESOLUTION.txt"
+
+      - name: Fetch exact source commit
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/resolver"
+          URL="$(cat "$OUT/resolved-url.txt")"
+          VER="$(cat "$OUT/resolved-version.txt")"
+          git init qca-ssdk
+          git -C qca-ssdk remote add origin "$URL"
+          git -C qca-ssdk fetch --depth=1 origin "$VER"
+          git -C qca-ssdk checkout --detach FETCH_HEAD
+          ACTUAL="$(git -C qca-ssdk rev-parse HEAD)"
+          test "$ACTUAL" = "$VER"
+          echo "$ACTUAL" > "$OUT/actual-source-commit.txt"
+          git -C qca-ssdk log -1 --format=fuller > "$OUT/source-commit.txt"
+
+      - name: Scan QSGMII and port-mode implementation
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/resolver"
+          grep -RInE 'QSGMII|PSGMII|USXGMII|PORT_WRAPPER_[A-Z0-9_]+|UNIPHY|switch_mac_mode|fal_port_interface_mode|ssdk_dt_parse_mac_mode' \
+            qca-ssdk --exclude-dir=.git > "$OUT/mode-hits.txt" || true
+          grep -RInE 'QSGMII|PORT_WRAPPER_QSGMII|UNIPHY_QSGMII|SSDK_QSGMII' \
+            qca-ssdk --exclude-dir=.git > "$OUT/qsgmii-hits.txt" || true
+          grep -RInE 'PORT_WRAPPER_[A-Z0-9_]+' \
+            qca-ssdk --exclude-dir=.git > "$OUT/wrapper-enums.txt" || true
+          grep -RInE 'switch_mac_mode|switch_mac_mode1|switch_mac_mode2|ssdk_dt_parse_mac_mode' \
+            qca-ssdk --exclude-dir=.git > "$OUT/mac-mode-parser.txt" || true
+
+      - name: Extract decisive context and verdict
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/resolver"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          root=Path("qca-ssdk"); out=Path("resolver")
+          rx=re.compile(r'QSGMII|PORT_WRAPPER_|switch_mac_mode|ssdk_dt_parse_mac_mode|UNIPHY',re.I)
+          with (out/"decisive-context.txt").open("w") as w:
+              for f in root.rglob("*"):
+                  if not f.is_file() or ".git" in f.parts: continue
+                  try: lines=f.read_text(errors="replace").splitlines()
+                  except Exception: continue
+                  hits=[i for i,l in enumerate(lines) if rx.search(l)]
+                  if not hits: continue
+                  ranges=[]
+                  for i in hits:
+                      a=max(0,i-12); b=min(len(lines),i+25)
+                      if ranges and a<=ranges[-1][1]+2: ranges[-1][1]=max(ranges[-1][1],b)
+                      else: ranges.append([a,b])
+                  w.write(f"\n===== {f} =====\n")
+                  for a,b in ranges:
+                      w.write(f"--- lines {a+1}-{b} ---\n")
+                      for n in range(a,b): w.write(f"{n+1:5d}: {lines[n]}\n")
+          PY
+          Q="$(grep -RIl 'QSGMII' qca-ssdk --exclude-dir=.git | wc -l)"
+          ENUM="$(grep -RIlE 'PORT_WRAPPER_QSGMII|UNIPHY_QSGMII|SSDK_QSGMII' qca-ssdk --exclude-dir=.git | wc -l)"
+          {
+            echo "SOURCE_VERSION=$(cat "$OUT/actual-source-commit.txt")"
+            echo "QSGMII_FILES=$Q"
+            echo "QSGMII_ENUM_FILES=$ENUM"
+            if [ "$Q" -eq 0 ]; then
+              echo "VERDICT=NO_QSGMII_CODE"
+            elif [ "$ENUM" -eq 0 ]; then
+              echo "VERDICT=QSGMII_REFERENCED_IMPLEMENTATION_UNPROVEN"
+            else
+              echo "VERDICT=QSGMII_CODE_PRESENT_REVIEW_CONTEXT"
+            fi
+          } | tee "$OUT/VERDICT.txt"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-QSDK66-SSDK-Source-Resolver-V4
+          path: resolver/
+          if-no-files-found: error
+          retention-days: 7
