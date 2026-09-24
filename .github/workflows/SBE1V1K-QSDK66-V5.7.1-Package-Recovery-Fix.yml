@@ -1,0 +1,78 @@
+name: SBE1V1K-QSDK66-V5.7.1-Package-Recovery-Fix
+
+on:
+  workflow_dispatch:
+
+env:
+  BOARD: sbe1v1k
+  SOC: ipq9574
+
+jobs:
+  package-recovery:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y             build-essential             gcc-aarch64-linux-gnu             flex             bison             libncurses-dev             zlib1g-dev             python3             rsync             unzip             git
+
+      - name: Detect source tree
+        run: |
+          pwd
+          ls -la
+          test -f Makefile || exit 1
+
+      - name: Update feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Prepare config
+        run: |
+          if [ -f configs/sbe1v1k_defconfig ]; then
+            cp configs/sbe1v1k_defconfig .config
+          elif [ -f .config ]; then
+            echo "Using existing .config"
+          else
+            echo "No board defconfig found, using default configuration"
+            make defconfig
+          fi
+          make defconfig
+
+      - name: Check NSS PPE packages
+        run: |
+          for pkg in qca-nss-dp qca-nss-ppe qca-ssdk qca-ecm; do
+            echo "Checking $pkg"
+            grep -R "$pkg" package/ 2>/dev/null || true
+          done
+
+      - name: Build packages
+        run: |
+          make package/compile V=s -j$(nproc)
+
+      - name: Build firmware
+        run: |
+          make V=s -j$(nproc)
+
+      - name: Verify output
+        run: |
+          find bin -type f | grep -E "factory|sysupgrade|img" || true
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-QSDK66-V5.7.1-Package-Recovery
+          path: bin/**
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-build-log
+          path: |
+            build_dir/**
+            logs/**
