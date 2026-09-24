@@ -1,0 +1,196 @@
+name: SBE1V1K QSDK66 Ethernet DTS Inventory
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout pinned OpenWrt 24.10.2
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          git checkout bb59922007043c0a0813d62b0d9f6e801caff9df
+          test "$(git rev-parse HEAD)" = "bb59922007043c0a0813d62b0d9f6e801caff9df"
+
+      - name: Checkout pinned QSDK IPQ feed
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/zilogic-systems/feed-ipq.git feed-ipq
+          cd feed-ipq
+          git checkout 183c0317fad6f23bd450a4d1953324de1931f712
+          test "$(git rev-parse HEAD)" = "183c0317fad6f23bd450a4d1953324de1931f712"
+
+      - name: Checkout pinned SBE1V1K reference
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/luckkyboy/SBE1V1K.git sbe1v1k-ref
+          cd sbe1v1k-ref
+          git checkout 02fb9517c9aefac9f3825a15ae46e7998bae7edd
+          test "$(git rev-parse HEAD)" = "02fb9517c9aefac9f3825a15ae46e7998bae7edd"
+
+      - name: Locate all IPQ9574 DTS sources
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/inventory"
+          mkdir -p "$OUT/raw"
+          {
+            echo "OpenWrt=$(git -C openwrt rev-parse HEAD)"
+            echo "feed-ipq=$(git -C feed-ipq rev-parse HEAD)"
+            echo "SBE1V1K=$(git -C sbe1v1k-ref rev-parse HEAD)"
+          } > "$OUT/commits.txt"
+
+          find openwrt feed-ipq -type f \
+            \( -name 'ipq9574*.dts' -o -name 'ipq9574*.dtsi' -o -name 'ipq95*.dtsi' \) \
+            -print | sort > "$OUT/ipq9574-files.txt"
+
+          if ! grep -q 'ipq9574' "$OUT/ipq9574-files.txt"; then
+            echo "ERROR: no IPQ9574 DTS/DTSI files found" >&2
+            exit 20
+          fi
+
+          while IFS= read -r f; do
+            safe="$(printf '%s' "$f" | sed 's#/#__#g')"
+            cp "$f" "$OUT/raw/$safe"
+          done < "$OUT/ipq9574-files.txt"
+
+      - name: Extract Ethernet topology evidence
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/inventory"
+
+          PAT='ess-instance|ess-switch|qcom,port_phyinfo|port_phyinfo|switch_mac_mode|switch_mac_mode1|switch_mac_mode2|port_mac_sel|qcom,nss-dp|nss-dp|dp[1-6][[:space:]]*:|ethernet-phy@|qca8075|qca808|qca81|rtl826|qsgmii|usxgmii|10gbase-r|sgmii|uniphy|mdio'
+
+          grep -RInE "$PAT" openwrt feed-ipq \
+            --include='ipq9574*.dts' --include='ipq9574*.dtsi' \
+            > "$OUT/ethernet-all-hits.txt" || true
+
+          for name in \
+            ipq9574-rdp433.dts \
+            ipq9574-rdp433-mht-phy.dts \
+            ipq9574-rdp433-mht-switch.dts \
+            ipq9574-rdp433-sfp.dts \
+            ipq9574-rdp475.dts \
+            ipq9574-rdp475-qca81xx.dts \
+            ipq9574-rdp475-qca81xx-i2c.dts
+          do
+            f="$(find openwrt feed-ipq -type f -name "$name" -print -quit)"
+            if [ -n "$f" ]; then
+              echo "$name=$f" >> "$OUT/focus-files.txt"
+              cp "$f" "$OUT/raw/FOCUS-$name"
+              grep -nE "$PAT" "$f" > "$OUT/${name}.ethernet-hits.txt" || true
+            else
+              echo "$name=MISSING" >> "$OUT/focus-files.txt"
+            fi
+          done
+
+      - name: Capture complete relevant DTS blocks
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/inventory"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          out = Path("inventory")
+          focus = []
+          p = out / "focus-files.txt"
+          if p.exists():
+              for line in p.read_text(errors="replace").splitlines():
+                  name, path = line.split("=", 1)
+                  if path != "MISSING":
+                      focus.append((name, Path(path)))
+
+          needles = re.compile(
+              r'ess-instance|ess-switch|port_phyinfo|switch_mac_mode|port_mac_sel|'
+              r'nss-dp|dp[1-6]\s*:|ethernet-phy@|qca8075|qca808|qca81|rtl826|'
+              r'qsgmii|usxgmii|uniphy|mdio',
+              re.I
+          )
+
+          def enclosing_block(lines, idx):
+              start = idx
+              depth = 0
+              found_open = False
+              for i in range(idx, -1, -1):
+                  s = lines[i]
+                  depth += s.count("}") - s.count("{")
+                  if "{" in s and depth < 0:
+                      start = i
+                      found_open = True
+                      break
+              if not found_open:
+                  start = max(0, idx - 12)
+
+              depth = 0
+              end = min(len(lines), idx + 20)
+              for i in range(start, len(lines)):
+                  depth += lines[i].count("{") - lines[i].count("}")
+                  if i >= idx and depth <= 0 and "}" in lines[i]:
+                      end = i + 1
+                      break
+              return start, min(end, len(lines))
+
+          for name, path in focus:
+              lines = path.read_text(errors="replace").splitlines()
+              ranges = []
+              for i, line in enumerate(lines):
+                  if needles.search(line):
+                      ranges.append(enclosing_block(lines, i))
+              ranges.sort()
+              merged = []
+              for a, b in ranges:
+                  if not merged or a > merged[-1][1] + 2:
+                      merged.append([a, b])
+                  else:
+                      merged[-1][1] = max(merged[-1][1], b)
+              with (out / f"{name}.blocks.txt").open("w") as fh:
+                  fh.write(f"===== {name} :: {path} =====\n")
+                  for a, b in merged:
+                      fh.write(f"\n--- lines {a+1}-{b} ---\n")
+                      for n in range(a, b):
+                          fh.write(f"{n+1:5d}: {lines[n]}\n")
+          PY
+
+      - name: Compare against SBE1V1K upstream Ethernet ports
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/inventory"
+          SRC="$(find sbe1v1k-ref -type f -name 'ipq9570-sbe1v1k.dts' -print -quit)"
+          test -n "$SRC"
+          cp "$SRC" "$OUT/sbe1v1k-upstream.dts"
+          grep -nE 'ethernet-ports|port@[0-9]|phy-handle|phy-mode|pcs-handle|ethernet-phy@|qca8075|qca8081|rtl826|mdio|qcom_ppe' \
+            "$SRC" > "$OUT/sbe1v1k-ethernet-hits.txt" || true
+
+      - name: Static gate
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/inventory"
+          test -s "$OUT/ipq9574-files.txt"
+          test -s "$OUT/ethernet-all-hits.txt"
+          test -s "$OUT/sbe1v1k-upstream.dts"
+
+          {
+            echo "=== focus files ==="
+            cat "$OUT/focus-files.txt"
+            echo
+            echo "=== QSDK topology token counts ==="
+            for token in 'ess-instance' 'port_phyinfo' 'switch_mac_mode' 'port_mac_sel' 'nss-dp' 'qca808' 'qsgmii' 'usxgmii'; do
+              printf '%-20s ' "$token"
+              grep -Ric "$token" "$OUT/raw" || true
+            done
+          } | tee "$OUT/SUMMARY.txt"
+
+      - name: Upload DTS inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-QSDK66-Ethernet-DTS-Inventory
+          path: inventory/
+          if-no-files-found: error
+          retention-days: 7
