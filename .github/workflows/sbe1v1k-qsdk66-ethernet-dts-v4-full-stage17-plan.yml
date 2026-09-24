@@ -1,0 +1,25 @@
+name: SBE1V1K QSDK66 Ethernet DTS V4 Full Stage17 Pipeline
+
+on:
+  workflow_dispatch:
+
+# V4目标：
+# 1. 基于已验证的 Stage17 QSDK6.6 编译流程
+# 2. 从 ipq9574-db-al02-c2 提取完整 dp3/dp4/dp5/dp6 节点树
+# 3. 保留 label/phandle/reg/clock/interrupt/power-domain
+# 4. 仅调整 SBE1V1K PHY 映射
+#
+# 验证：
+# - make target/linux/dtb
+# - make target/linux/compile
+# - 反编译最终 DTB
+# - 检查 qcom,nss-dp 节点数量
+# - 检查 switch_mac_mode 与 PHY 地址
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Placeholder
+        run: |
+          echo "V4 full Stage17 merge target"
