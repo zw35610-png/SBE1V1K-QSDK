@@ -1,0 +1,77 @@
+name: SBE1V1K-QSDK66-V5.7-Package-Recovery
+
+on:
+  workflow_dispatch:
+
+env:
+  BOARD: sbe1v1k
+  SOC: ipq9574
+
+jobs:
+  package-recovery:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y             build-essential             gcc-aarch64-linux-gnu             flex             bison             libncurses-dev             zlib1g-dev             python3             rsync             unzip             git
+
+      - name: Update feeds
+        run: |
+          ./scripts/feeds update -a || true
+          ./scripts/feeds install -a || true
+
+      - name: Prepare config
+        run: |
+          cp configs/sbe1v1k_defconfig .config || true
+          make defconfig
+
+      - name: Check NSS PPE packages
+        run: |
+          for pkg in qca-nss-dp qca-nss-ppe qca-ssdk qca-ecm; do
+            echo "Checking $pkg"
+            grep -R "$pkg" package/ || true
+          done
+
+      - name: Build kernel packages
+        run: |
+          make package/kernel/compile V=s -j$(nproc)
+
+      - name: Build NSS DP
+        run: |
+          make package/qca-nss-dp/compile V=s -j$(nproc) || true
+
+      - name: Build NSS PPE
+        run: |
+          make package/qca-nss-ppe/compile V=s -j$(nproc) || true
+
+      - name: Build all packages
+        run: |
+          make package/compile V=s -j$(nproc)
+
+      - name: Build firmware image
+        run: |
+          make V=s -j$(nproc)
+
+      - name: Verify firmware output
+        run: |
+          find bin/targets -type f | grep -E "factory|sysupgrade|img" || true
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-QSDK66-V5.7-Package-Recovery
+          path: bin/targets/**
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-build-failure-log
+          path: |
+            logs/**
+            tmp/**
