@@ -1,0 +1,23 @@
+name: SBE1V1K QSDK66 Ethernet DTS V4 - Full NSS-DP Node Tree
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# V4 design:
+# - Reuse Stage17 proven QSDK6.6 build pipeline
+# - Copy complete dp3/dp4/dp5/dp6 node trees from ipq9574-db-al02-c2
+# - Keep labels/phandles/reg/clock/interrupt properties
+# - Only adjust PHY address and PHY mode for SBE1V1K
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: V4 placeholder integration point
+        run: |
+          echo "Use Stage17 pipeline as base."
+          echo "Inject full NSS-DP nodes from reference DTS."
+          echo "Validate DTB before kernel image."
