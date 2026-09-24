@@ -1,0 +1,112 @@
+name: SBE1V1K-QSDK66-V5.7.4-OpenWrt-Dir-Fix
+
+on:
+  workflow_dispatch:
+
+env:
+  BOARD: sbe1v1k
+  SOC: ipq9574
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            flex \
+            bison \
+            libncurses-dev \
+            zlib1g-dev \
+            python3 \
+            rsync \
+            unzip \
+            git \
+            device-tree-compiler
+
+      - name: Enter OpenWrt tree
+        run: |
+          if [ ! -d openwrt ]; then
+            echo "openwrt directory not found"
+            find . -maxdepth 3 -type d
+            exit 1
+          fi
+
+          cd openwrt
+          pwd
+          ls -la
+
+      - name: Update feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Prepare config
+        run: |
+          cd openwrt
+
+          if [ -f .config ]; then
+            echo "Existing config detected"
+          else
+            echo "Generating default config"
+            make defconfig
+          fi
+
+      - name: Apply SBE1V1K patches
+        run: |
+          cd openwrt
+
+          if [ -d ../patches ]; then
+            echo "Applying patches"
+            ls ../patches
+          else
+            echo "No patch directory found"
+          fi
+
+      - name: Check NSS PPE components
+        run: |
+          cd openwrt
+
+          for pkg in qca-nss-dp qca-nss-ppe qca-ssdk qca-ecm; do
+            echo "Checking $pkg"
+            grep -R "$pkg" package/ 2>/dev/null || true
+          done
+
+      - name: Build packages
+        run: |
+          cd openwrt
+          make package/compile V=s -j$(nproc)
+
+      - name: Build firmware
+        run: |
+          cd openwrt
+          make V=s -j$(nproc)
+
+      - name: Verify firmware
+        run: |
+          cd openwrt
+          find bin -type f | grep -E "factory|sysupgrade|img" || true
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-QSDK66-V5.7.4-Build
+          path: |
+            openwrt/bin/**
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-QSDK66-V5.7.4-Logs
+          path: |
+            openwrt/logs/**
+            openwrt/build_dir/**
