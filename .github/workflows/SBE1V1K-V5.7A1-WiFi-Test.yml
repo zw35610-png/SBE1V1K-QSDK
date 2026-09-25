@@ -94,7 +94,7 @@ jobs:
           test -s "$ROOT"
 
           file "$SYS" "$INIT" "$KERNEL" "$ROOT" | tee validation/file-types.txt
-          sha256sum "$OUT"/* | tee validation/SHA256SUMS
+          find "$OUT" -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum | tee validation/SHA256SUMS
           ls -lh "$OUT" | tee validation/image-list.txt
 
           cp source-info.txt validation/
