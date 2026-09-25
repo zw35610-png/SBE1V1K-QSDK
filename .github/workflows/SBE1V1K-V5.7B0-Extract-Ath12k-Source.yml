@@ -1,0 +1,92 @@
+name: SBE1V1K V5.7B0 Extract Ath12k Source
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib \
+            gettext git libncurses-dev libssl-dev python3 rsync unzip zlib1g-dev file wget \
+            curl subversion swig time jq zstd
+
+      - name: Clone exact A1 source tree
+        run: |
+          git clone https://github.com/yintaomu/SBE1V1K-OpenWrt.git openwrt
+          cd openwrt
+          git checkout 6c7c3c6bac78ddbe6c51a88284453d9c724713e1
+          git rev-parse HEAD | tee ../SOURCE_COMMIT.txt
+
+      - name: Prepare feeds and config
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          cp configs/sbe1v1k.config .config
+          make defconfig
+
+      - name: Download mac80211 sources
+        run: |
+          cd openwrt
+          make package/kernel/mac80211/download V=s
+
+      - name: Prepare mac80211/backports tree
+        run: |
+          cd openwrt
+          make package/kernel/mac80211/prepare V=s
+
+      - name: Locate actual ath12k source
+        run: |
+          cd openwrt
+          {
+            echo "===== SOURCE COMMIT ====="
+            git rev-parse HEAD
+            echo "===== ATH12K DIRECTORIES ====="
+            find build_dir -type d \( -path '*/drivers/net/wireless/ath/ath12k' -o -path '*/drivers/net/wireless/ath/ath12k/wifi7' \) -print
+            echo "===== HTC/WMI CONNECT LOCATIONS ====="
+            grep -R -n -E 'WMI MAC1|WMI CONTROL|htc_connect_service|connect.*service|wmi.*connect' \
+              build_dir/target-*/linux-*/backports-*/drivers/net/wireless/ath/ath12k* 2>/dev/null || true
+          } | tee ../ATH12K-LOCATIONS.txt
+
+      - name: Collect source and OpenWrt patches
+        run: |
+          set -e
+          mkdir -p artifact
+          cd openwrt
+
+          BP="$(find build_dir -maxdepth 4 -type d -name 'backports-*' | head -n1)"
+          test -n "$BP"
+          echo "$BP" | tee ../BACKPORTS-PATH.txt
+
+          mkdir -p ../artifact/backports
+          cp -a "$BP/drivers/net/wireless/ath/ath12k" ../artifact/backports/ 2>/dev/null || true
+          if [ -d "$BP/drivers/net/wireless/ath/ath12k/wifi7" ]; then
+            :
+          fi
+
+          mkdir -p ../artifact/openwrt-mac80211
+          cp -a package/kernel/mac80211/* ../artifact/openwrt-mac80211/
+
+          cd ..
+          cp SOURCE_COMMIT.txt BACKPORTS-PATH.txt ATH12K-LOCATIONS.txt artifact/
+
+          find artifact -type f -print0 | sort -z | xargs -0 sha256sum > artifact/SHA256SUMS.txt
+          tar -C artifact -czf SBE1V1K-V5.7B0-Ath12k-Source.tar.gz .
+          sha256sum SBE1V1K-V5.7B0-Ath12k-Source.tar.gz | tee SBE1V1K-V5.7B0-Ath12k-Source.tar.gz.sha256
+
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-V5.7B0-Ath12k-Source
+          path: |
+            SBE1V1K-V5.7B0-Ath12k-Source.tar.gz
+            SBE1V1K-V5.7B0-Ath12k-Source.tar.gz.sha256
+            artifact/ATH12K-LOCATIONS.txt
+            artifact/SOURCE_COMMIT.txt
+            artifact/BACKPORTS-PATH.txt
+          if-no-files-found: error
+          retention-days: 7
