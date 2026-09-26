@@ -1,0 +1,250 @@
+name: SBE1V1K V5.7B0.1-R6 Select Backports Tree
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib gettext git \
+            libncurses-dev libssl-dev python3 rsync unzip zlib1g-dev file wget \
+            curl subversion swig time jq zstd binutils
+
+      - name: Clone exact A1 source
+        run: |
+          git clone https://github.com/yintaomu/SBE1V1K-OpenWrt.git openwrt
+          cd openwrt
+          git checkout 6c7c3c6bac78ddbe6c51a88284453d9c724713e1
+          git rev-parse HEAD | tee ../SOURCE_COMMIT.txt
+
+      - name: Configure feeds and target
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          cp configs/sbe1v1k.config .config
+          make defconfig
+
+      - name: Bootstrap complete build environment
+        run: |
+          cd openwrt
+          # First complete a normal baseline build. This creates all host tools,
+          # including staging_dir/host/bin/libdeflate-gzip, before we do a
+          # targeted mac80211 rebuild.
+          make -j"$(nproc)" world || make -j1 V=s world
+          test -x staging_dir/host/bin/libdeflate-gzip
+          staging_dir/host/bin/libdeflate-gzip --version || true
+
+      - name: Clean and prepare mac80211
+        run: |
+          set -euo pipefail
+          cd openwrt
+          make package/kernel/mac80211/clean V=s
+          make package/kernel/mac80211/download V=s
+          make package/kernel/mac80211/prepare V=s
+
+      - name: Discover actual ath12k source
+        run: |
+          set -euo pipefail
+          cd openwrt
+          echo "=== WMI candidates ==="
+          find build_dir -type f -path '*/drivers/net/wireless/ath/ath12k/wmi.c' -print | tee ../WMI-CANDIDATES.txt
+          echo "=== HTC candidates ==="
+          find build_dir -type f -path '*/drivers/net/wireless/ath/ath12k/htc.c' -print | tee ../HTC-CANDIDATES.txt
+
+      - name: Apply B01 WMI HTC diagnostics
+        run: |
+          set -euo pipefail
+          cd openwrt
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # A complete world build creates multiple ath12k source copies.
+          # Patch only the mac80211 package backports tree used for kmod-ath12k.
+          wmis = [p for p in Path("build_dir").rglob("wmi.c")
+                  if "/mac80211-regular/backports-" in str(p)
+                  and str(p).endswith("drivers/net/wireless/ath/ath12k/wmi.c")]
+          htcs = [p for p in Path("build_dir").rglob("htc.c")
+                  if "/mac80211-regular/backports-" in str(p)
+                  and str(p).endswith("drivers/net/wireless/ath/ath12k/htc.c")]
+
+          print("Selected WMI candidates:", wmis)
+          print("Selected HTC candidates:", htcs)
+
+          if len(wmis) != 1 or len(htcs) != 1:
+              raise SystemExit(
+                  f"Expected exactly one mac80211 backports ath12k tree, got "
+                  f"wmi={len(wmis)} htc={len(htcs)}"
+              )
+
+          wmi = wmis[0]
+          htc = htcs[0]
+
+          if wmi.parent != htc.parent:
+              raise SystemExit(f"WMI/HTC trees differ: {wmi.parent} vs {htc.parent}")
+
+          # ---- wmi.c: per-pdev service-connect diagnostics ----
+          s = wmi.read_text()
+
+          old = (
+              "\tstatus = ath12k_htc_connect_service(&ab->htc, &conn_req, &conn_resp);\n"
+              "\tif (status) {"
+          )
+          new = (
+              '\tath12k_warn(ab, "B01 begin pdev=%u svc=0x%x ep_count=%u max_radios=%u hw_mode=%d\\n",\n'
+              '\t\t    pdev_idx, conn_req.service_id, ab->htc.wmi_ep_count,\n'
+              '\t\t    ab->hw_params->max_radios, ab->wmi_ab.preferred_hw_mode);\n'
+              '\tstatus = ath12k_htc_connect_service(&ab->htc, &conn_req, &conn_resp);\n'
+              '\tath12k_warn(ab, "B01 end pdev=%u svc=0x%x ret=%d fw_resp=0x%x eid=%u max_msg=%u\\n",\n'
+              '\t\t    pdev_idx, conn_req.service_id, status, conn_resp.connect_resp_code,\n'
+              '\t\t    conn_resp.eid, conn_resp.max_msg_len);\n'
+              '\tif (status) {'
+          )
+
+          if old not in s:
+              raise SystemExit("WMI service-connect anchor missing")
+          s = s.replace(old, new, 1)
+
+          # ---- wmi.c: log the loop and each return value, while preserving original behavior ----
+          old = (
+              "\tfor (i = 0; i < wmi_ep_count; i++)\n"
+              "\t\tath12k_connect_pdev_htc_service(ab, i);\n\n"
+              "\treturn 0;"
+          )
+          new = (
+              '\tath12k_warn(ab, "B01 wmi_connect ep_count=%u max_radios=%u hw_mode=%d\\n",\n'
+              '\t\t    wmi_ep_count, ab->hw_params->max_radios,\n'
+              '\t\t    ab->wmi_ab.preferred_hw_mode);\n'
+              '\tfor (i = 0; i < wmi_ep_count; i++) {\n'
+              '\t\tint b01_ret = ath12k_connect_pdev_htc_service(ab, i);\n'
+              '\t\tath12k_warn(ab, "B01 pdev_result pdev=%u ret=%d\\n", i, b01_ret);\n'
+              '\t}\n\n'
+              '\treturn 0;'
+          )
+
+          if old not in s:
+              raise SystemExit("WMI connect-loop anchor missing")
+          wmi.write_text(s.replace(old, new, 1))
+
+          # ---- htc.c: firmware connect response diagnostics ----
+          s = htc.read_text()
+
+          old = (
+              "\tconn_resp->connect_resp_code = le32_get_bits(resp_msg->flags_len,\n"
+              "\t\t\t\t\t\t     HTC_SVC_RESP_MSG_STATUS);\n\n"
+              "\t/* check response status */"
+          )
+          new = (
+              "\tconn_resp->connect_resp_code = le32_get_bits(resp_msg->flags_len,\n"
+              "\t\t\t\t\t\t     HTC_SVC_RESP_MSG_STATUS);\n"
+              '\tath12k_warn(ab, "B01 htc_resp req_svc=0x%x resp_svc=0x%x fw=0x%x len=%u\\n",\n'
+              "\t\t    conn_req->service_id, service_id,\n"
+              "\t\t    conn_resp->connect_resp_code, htc->control_resp_len);\n\n"
+              "\t/* check response status */"
+          )
+
+          if old not in s:
+              raise SystemExit("HTC response anchor missing")
+          htc.write_text(s.replace(old, new, 1))
+
+          Path("../ATH12K-ACTUAL-PATH.txt").write_text(str(wmi.parent) + "\n")
+          print("Patched:", wmi.parent)
+          PY
+
+          grep -R -n 'B01 ' "$(cat ../ATH12K-ACTUAL-PATH.txt)" | tee ../B01-SOURCE-CHECK.txt
+
+      - name: Compile mac80211 normally
+        run: |
+          set -euo pipefail
+          cd openwrt
+          make package/kernel/mac80211/compile V=s
+          make package/kernel/mac80211/install V=s
+
+      - name: Verify compiled ath12k module contains B01
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          find build_dir staging_dir -type f -name 'ath12k*.ko' -print \
+            | tee ../ATH12K-KO-LIST.txt
+
+          found=0
+          while IFS= read -r ko; do
+            [ -f "$ko" ] || continue
+            if strings "$ko" | grep -q 'B01 '; then
+              echo "PASS B01: $ko" | tee -a ../B01-MODULE-CHECK.txt
+              strings "$ko" | grep 'B01 ' | tee -a ../B01-MODULE-CHECK.txt
+              found=1
+            fi
+          done < ../ATH12K-KO-LIST.txt
+
+          if [ "$found" -ne 1 ]; then
+            echo "ERROR: no compiled ath12k module contains B01"
+            exit 1
+          fi
+
+      - name: Build final firmware
+        run: |
+          cd openwrt
+          make -j"$(nproc)" world || make -j1 V=s world
+
+      - name: Recheck modules after world
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          find build_dir staging_dir -type f -name 'ath12k*.ko' -print \
+            | tee ../FINAL-ATH12K-KO-LIST.txt
+
+          found=0
+          while IFS= read -r ko; do
+            [ -f "$ko" ] || continue
+            if strings "$ko" | grep -q 'B01 '; then
+              echo "FINAL PASS B01: $ko" | tee -a ../B01-FINAL-MODULE-CHECK.txt
+              found=1
+            fi
+          done < ../FINAL-ATH12K-KO-LIST.txt
+
+          if [ "$found" -ne 1 ]; then
+            echo "ERROR: B01 disappeared after make world"
+            exit 1
+          fi
+
+      - name: Collect firmware and validation
+        run: |
+          set -euo pipefail
+          OUT=openwrt/bin/targets/qualcommbe/ipq95xx
+          SYS="$OUT/openwrt-qualcommbe-ipq95xx-askey_sbe1v1k-squashfs-sysupgrade.bin"
+
+          test -s "$SYS"
+
+          mkdir -p artifact/VALIDATION
+
+          cp "$OUT"/openwrt-qualcommbe-ipq95xx-askey_sbe1v1k-* artifact/
+          cp "$OUT"/*.manifest "$OUT"/config.buildinfo "$OUT"/profiles.json \
+             "$OUT"/version.buildinfo artifact/ 2>/dev/null || true
+
+          cp SOURCE_COMMIT.txt \
+             WMI-CANDIDATES.txt HTC-CANDIDATES.txt \
+             ATH12K-ACTUAL-PATH.txt B01-SOURCE-CHECK.txt \
+             ATH12K-KO-LIST.txt B01-MODULE-CHECK.txt \
+             FINAL-ATH12K-KO-LIST.txt B01-FINAL-MODULE-CHECK.txt \
+             artifact/VALIDATION/
+
+          sha256sum "$SYS" | tee artifact/VALIDATION/SYSUPGRADE-SHA256.txt
+          find artifact -maxdepth 1 -type f -print0 | sort -z \
+            | xargs -0 sha256sum > artifact/VALIDATION/SHA256SUMS.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-V5.7B0.1-R6-Select-Backports-Tree
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
