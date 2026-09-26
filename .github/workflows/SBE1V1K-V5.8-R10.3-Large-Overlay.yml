@@ -1,0 +1,1433 @@
+name: SBE1V1K V5.8-R10.3 Large Overlay
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib gettext git \
+            libncurses-dev libssl-dev python3 rsync unzip zlib1g-dev file wget \
+            curl subversion swig time jq zstd binutils
+
+      - name: Clone exact stable source
+        run: |
+          git clone https://github.com/yintaomu/SBE1V1K-OpenWrt.git openwrt
+          cd openwrt
+          git checkout 6c7c3c6bac78ddbe6c51a88284453d9c724713e1
+          git rev-parse HEAD | tee ../SOURCE_COMMIT.txt
+
+      - name: Configure feeds target UI and plugins
+        run: |
+          set -euo pipefail
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          cp configs/sbe1v1k.config .config
+
+          cat >> .config <<'EOF'
+          # V5.8 R10 UI / Chinese
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_PACKAGE_luci-theme-material=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+
+          # DNS / SQM
+          CONFIG_PACKAGE_smartdns=y
+          CONFIG_PACKAGE_luci-app-smartdns=y
+          CONFIG_PACKAGE_luci-i18n-smartdns-zh-cn=y
+          CONFIG_PACKAGE_sqm-scripts=y
+          CONFIG_PACKAGE_luci-app-sqm=y
+          CONFIG_PACKAGE_luci-i18n-sqm-zh-cn=y
+
+          # Common LuCI tools
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+          CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y
+          CONFIG_PACKAGE_luci-app-wol=y
+          CONFIG_PACKAGE_luci-i18n-wol-zh-cn=y
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
+          CONFIG_PACKAGE_luci-app-filemanager=y
+          CONFIG_PACKAGE_luci-i18n-filemanager-zh-cn=y
+          CONFIG_PACKAGE_luci-app-nlbwmon=y
+          CONFIG_PACKAGE_luci-i18n-nlbwmon-zh-cn=y
+          CONFIG_PACKAGE_luci-app-irqbalance=y
+          CONFIG_PACKAGE_luci-i18n-irqbalance-zh-cn=y
+          CONFIG_PACKAGE_luci-app-commands=y
+          CONFIG_PACKAGE_luci-i18n-commands-zh-cn=y
+
+          # Large internal eMMC overlay / extroot
+          CONFIG_PACKAGE_block-mount=y
+          CONFIG_PACKAGE_mkf2fs=y
+          CONFIG_PACKAGE_f2fsck=y
+          CONFIG_PACKAGE_kmod-fs-f2fs=y
+
+          # Useful network tools
+          CONFIG_PACKAGE_ddns-scripts=y
+          CONFIG_PACKAGE_ddns-scripts-services=y
+          CONFIG_PACKAGE_miniupnpd-nftables=y
+          CONFIG_PACKAGE_etherwake=y
+          CONFIG_PACKAGE_ttyd=y
+          CONFIG_PACKAGE_nlbwmon=y
+          CONFIG_PACKAGE_irqbalance=y
+          CONFIG_PACKAGE_bind-dig=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_bash=y
+          CONFIG_PACKAGE_nano=y
+          CONFIG_PACKAGE_htop=y
+          CONFIG_PACKAGE_luci-proto-wireguard=y
+          CONFIG_PACKAGE_wireguard-tools=y
+          EOF
+
+          make defconfig
+
+          required_pkgs='
+          luci-theme-material
+          luci-i18n-base-zh-cn
+          smartdns
+          luci-app-smartdns
+          luci-app-sqm
+          luci-app-ddns
+          luci-app-upnp
+          luci-app-wol
+          luci-app-ttyd
+          luci-app-filemanager
+          luci-app-nlbwmon
+          luci-app-irqbalance
+          luci-app-commands
+          block-mount
+          '
+          : > ../R10-PACKAGE-CHECK.txt
+          for p in $required_pkgs; do
+            if grep -q "^CONFIG_PACKAGE_${p}=y$" .config; then
+              echo "PASS $p" | tee -a ../R10-PACKAGE-CHECK.txt
+            else
+              echo "MISSING $p" | tee -a ../R10-PACKAGE-CHECK.txt
+              exit 1
+            fi
+          done
+
+      - name: Add Chinese defaults and automatic fan control
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          mkdir -p files/etc/config
+          mkdir -p files/etc/init.d
+          mkdir -p files/etc/uci-defaults
+          mkdir -p files/usr/sbin
+
+          cat > files/etc/config/sbe1v1k-fan <<'EOF'
+          config fan 'main'
+                  option enabled '1'
+                  option interval '5'
+                  option start_temp '50'
+                  option medium_temp '60'
+                  option high_temp '70'
+                  option stop_temp '45'
+                  option low_pwm '72'
+                  option medium_pwm '128'
+                  option high_pwm '255'
+          EOF
+
+          cat > files/usr/sbin/sbe1v1k-fand <<'EOF'
+          #!/bin/sh
+
+          TAG="sbe1v1k-fan"
+
+          cfg_get() {
+                  uci -q get "sbe1v1k-fan.main.$1" 2>/dev/null || echo "$2"
+          }
+
+          find_pwm_hwmon() {
+                  for d in /sys/class/hwmon/hwmon*; do
+                          [ -d "$d" ] || continue
+                          [ -w "$d/pwm1" ] || continue
+                          echo "$d"
+                          return 0
+                  done
+                  return 1
+          }
+
+          get_max_temp_mc() {
+                  max=0
+                  found=0
+                  for f in /sys/class/thermal/thermal_zone*/temp; do
+                          [ -r "$f" ] || continue
+                          v="$(cat "$f" 2>/dev/null)"
+                          case "$v" in
+                                  ''|*[!0-9-]*) continue ;;
+                          esac
+                          [ "$v" -ge 10000 ] 2>/dev/null || continue
+                          [ "$v" -le 125000 ] 2>/dev/null || continue
+                          [ "$v" -gt "$max" ] && max="$v"
+                          found=1
+                  done
+                  [ "$found" -eq 1 ] || return 1
+                  echo "$max"
+          }
+
+          write_pwm() {
+                  val="$1"
+                  [ -n "$PWM_DIR" ] || return 1
+                  if [ -w "$PWM_DIR/pwm1_enable" ]; then
+                          echo 1 > "$PWM_DIR/pwm1_enable" 2>/dev/null || true
+                  fi
+                  echo "$val" > "$PWM_DIR/pwm1"
+          }
+
+          status_write() {
+                  rpm="n/a"
+                  [ -r "$PWM_DIR/fan1_input" ] && rpm="$(cat "$PWM_DIR/fan1_input" 2>/dev/null)"
+                  name="unknown"
+                  [ -r "$PWM_DIR/name" ] && name="$(cat "$PWM_DIR/name" 2>/dev/null)"
+                  {
+                          echo "hwmon=$PWM_DIR"
+                          echo "driver=$name"
+                          echo "temperature_c=$((TEMP_MC / 1000))"
+                          echo "pwm=$TARGET"
+                          echo "rpm=$rpm"
+                          echo "updated=$(date '+%Y-%m-%d %H:%M:%S')"
+                  } > /tmp/sbe1v1k-fan.status
+          }
+
+          LAST=-1
+          PWM_DIR=""
+
+          while true; do
+                  enabled="$(cfg_get enabled 1)"
+                  interval="$(cfg_get interval 5)"
+                  start_temp="$(cfg_get start_temp 50)"
+                  medium_temp="$(cfg_get medium_temp 60)"
+                  high_temp="$(cfg_get high_temp 70)"
+                  stop_temp="$(cfg_get stop_temp 45)"
+                  low_pwm="$(cfg_get low_pwm 72)"
+                  medium_pwm="$(cfg_get medium_pwm 128)"
+                  high_pwm="$(cfg_get high_pwm 255)"
+
+                  if [ "$enabled" != "1" ]; then
+                          sleep "$interval"
+                          continue
+                  fi
+
+                  if [ -z "$PWM_DIR" ] || [ ! -w "$PWM_DIR/pwm1" ]; then
+                          PWM_DIR="$(find_pwm_hwmon 2>/dev/null)"
+                          if [ -z "$PWM_DIR" ]; then
+                                  logger -t "$TAG" "PWM hwmon not ready; retrying"
+                                  sleep 5
+                                  continue
+                          fi
+                          logger -t "$TAG" "using $PWM_DIR"
+                  fi
+
+                  TEMP_MC="$(get_max_temp_mc 2>/dev/null)"
+                  if [ -z "$TEMP_MC" ]; then
+                          TARGET=255
+                  else
+                          TEMP_C=$((TEMP_MC / 1000))
+
+                          if [ "$TEMP_C" -ge "$high_temp" ]; then
+                                  TARGET="$high_pwm"
+                          elif [ "$TEMP_C" -ge "$medium_temp" ]; then
+                                  TARGET="$medium_pwm"
+                          elif [ "$TEMP_C" -ge "$start_temp" ]; then
+                                  TARGET="$low_pwm"
+                          elif [ "$TEMP_C" -le "$stop_temp" ]; then
+                                  TARGET=0
+                          else
+                                  if [ "$LAST" -ge 0 ]; then
+                                          TARGET="$LAST"
+                                  else
+                                          TARGET=0
+                                  fi
+                          fi
+                  fi
+
+                  if [ "$TARGET" != "$LAST" ]; then
+                          # Kick-start the physical fan when changing from stopped to running.
+                          if [ "$LAST" -eq 0 ] 2>/dev/null && [ "$TARGET" -gt 0 ] 2>/dev/null; then
+                                  write_pwm 128
+                                  sleep 1
+                          fi
+                          write_pwm "$TARGET"
+                          logger -t "$TAG" "temp=$((TEMP_MC / 1000))C pwm=$TARGET"
+                          LAST="$TARGET"
+                  fi
+
+                  status_write
+                  sleep "$interval"
+          done
+          EOF
+          chmod 0755 files/usr/sbin/sbe1v1k-fand
+
+          cat > files/etc/init.d/sbe1v1k-fan <<'EOF'
+          #!/bin/sh /etc/rc.common
+
+          START=95
+          STOP=10
+          USE_PROCD=1
+
+          start_service() {
+                  procd_open_instance
+                  procd_set_param command /usr/sbin/sbe1v1k-fand
+                  procd_set_param respawn 3600 5 5
+                  procd_set_param stdout 1
+                  procd_set_param stderr 1
+                  procd_close_instance
+          }
+
+          reload_service() {
+                  stop
+                  start
+          }
+
+          service_triggers() {
+                  procd_add_reload_trigger "sbe1v1k-fan"
+          }
+          EOF
+          chmod 0755 files/etc/init.d/sbe1v1k-fan
+
+          cat > files/etc/uci-defaults/95-sbe1v1k-r10 <<'EOF'
+          #!/bin/sh
+
+          # Simplified Chinese + Material theme
+          uci -q set luci.main.lang='zh_cn'
+          uci -q set luci.main.mediaurlbase='/luci-static/material'
+
+          # Convenient LuCI command entries for the fan controller
+          uci -q delete luci.sbe1v1k_fan_status
+          uci set luci.sbe1v1k_fan_status='command'
+          uci set luci.sbe1v1k_fan_status.name='SBE1V1K 风扇状态'
+          uci set luci.sbe1v1k_fan_status.command='cat /tmp/sbe1v1k-fan.status 2>/dev/null || echo 风扇状态尚未生成'
+
+          uci -q delete luci.sbe1v1k_fan_restart
+          uci set luci.sbe1v1k_fan_restart='command'
+          uci set luci.sbe1v1k_fan_restart.name='重启 SBE1V1K 风扇控制'
+          uci set luci.sbe1v1k_fan_restart.command='/etc/init.d/sbe1v1k-fan restart && sleep 2 && cat /tmp/sbe1v1k-fan.status 2>/dev/null'
+
+          uci commit luci
+
+          /etc/init.d/sbe1v1k-fan enable
+
+          exit 0
+          EOF
+          chmod 0755 files/etc/uci-defaults/95-sbe1v1k-r10
+
+          {
+            echo "Chinese LuCI: enabled"
+            echo "Theme: luci-theme-material"
+            echo "Fan service: /etc/init.d/sbe1v1k-fan"
+            echo "Fan daemon: /usr/sbin/sbe1v1k-fand"
+            echo "Fan curve: <=45C off, >=50C pwm72, >=60C pwm128, >=70C pwm255"
+          } | tee ../R10-FEATURES.txt
+
+      - name: Add visual hardware acceleration page
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          mkdir -p files/etc/init.d
+          mkdir -p files/usr/sbin
+          mkdir -p files/usr/share/luci/menu.d
+          mkdir -p files/usr/share/luci/view/sbe1v1k
+          mkdir -p files/usr/share/rpcd/acl.d
+          mkdir -p files/etc/uci-defaults
+
+          cat > files/usr/sbin/sbe1v1k-hwaccel-status <<'EOF'
+          #!/bin/sh
+
+          OUT=/tmp/sbe1v1k-hwaccel.status
+
+          uci_get() {
+                  uci -q get "firewall.@defaults[0].$1" 2>/dev/null || echo 0
+          }
+
+          flow="$(uci_get flow_offloading)"
+          hw="$(uci_get flow_offloading_hw)"
+
+          ppe=0
+          edma=0
+          flowtable=0
+          hw_conn=0
+          sw_conn=0
+
+          grep -q 'qcom_ppe' /proc/modules 2>/dev/null && ppe=1
+          for d in /sys/bus/platform/drivers/*ppe* /sys/bus/platform/drivers/*PPE*; do
+                  [ -e "$d" ] && ppe=1
+          done
+          dmesg 2>/dev/null | grep -q 'qcom_ppe .*EDMA configuration successful' && ppe=1
+          dmesg 2>/dev/null | grep -q 'EDMA Hardware Configured' && edma=1
+
+          if command -v nft >/dev/null 2>&1; then
+                  nft list ruleset 2>/dev/null | grep -q 'flowtable' && flowtable=1
+          fi
+
+          if [ -r /proc/net/nf_conntrack ]; then
+                  hw_conn="$(grep -c 'HW_OFFLOAD' /proc/net/nf_conntrack 2>/dev/null || true)"
+                  all_offload="$(grep -c 'OFFLOAD' /proc/net/nf_conntrack 2>/dev/null || true)"
+                  case "$hw_conn" in ''|*[!0-9]*) hw_conn=0 ;; esac
+                  case "$all_offload" in ''|*[!0-9]*) all_offload=0 ;; esac
+                  sw_conn=$((all_offload - hw_conn))
+                  [ "$sw_conn" -lt 0 ] && sw_conn=0
+          fi
+
+          ready=0
+          active=0
+          [ "$flow" = "1" ] && [ "$hw" = "1" ] && [ "$ppe" = "1" ] && [ "$flowtable" = "1" ] && ready=1
+          [ "$ready" = "1" ] && [ "$hw_conn" -gt 0 ] 2>/dev/null && active=1
+
+          tmp="${OUT}.tmp"
+          cat > "$tmp" <<JSON
+          {
+            "ppe": $ppe,
+            "edma": $edma,
+            "flow_offloading": $flow,
+            "flow_offloading_hw": $hw,
+            "flowtable": $flowtable,
+            "hw_conn": $hw_conn,
+            "sw_conn": $sw_conn,
+            "ready": $ready,
+            "active": $active
+          }
+          JSON
+          mv "$tmp" "$OUT"
+          EOF
+          chmod 0755 files/usr/sbin/sbe1v1k-hwaccel-status
+
+          cat > files/usr/sbin/sbe1v1k-hwacceld <<'EOF'
+          #!/bin/sh
+          while true; do
+                  /usr/sbin/sbe1v1k-hwaccel-status
+                  sleep 5
+          done
+          EOF
+          chmod 0755 files/usr/sbin/sbe1v1k-hwacceld
+
+          cat > files/etc/init.d/sbe1v1k-hwaccel <<'EOF'
+          #!/bin/sh /etc/rc.common
+
+          START=96
+          STOP=10
+          USE_PROCD=1
+
+          start_service() {
+                  procd_open_instance
+                  procd_set_param command /usr/sbin/sbe1v1k-hwacceld
+                  procd_set_param respawn 3600 5 5
+                  procd_set_param stdout 1
+                  procd_set_param stderr 1
+                  procd_close_instance
+          }
+
+          reload_service() {
+                  /usr/sbin/sbe1v1k-hwaccel-status
+          }
+          EOF
+          chmod 0755 files/etc/init.d/sbe1v1k-hwaccel
+
+          cat > files/usr/share/luci/menu.d/luci-app-sbe1v1k-hwaccel.json <<'EOF'
+          {
+            "admin/network/sbe1v1k_hwaccel": {
+              "title": "硬件加速",
+              "order": 75,
+              "action": {
+                "type": "view",
+                "path": "sbe1v1k/hwaccel"
+              },
+              "depends": {
+                "acl": [ "luci-app-sbe1v1k-hwaccel" ]
+              }
+            }
+          }
+          EOF
+
+          cat > files/usr/share/rpcd/acl.d/luci-app-sbe1v1k-hwaccel.json <<'EOF'
+          {
+            "luci-app-sbe1v1k-hwaccel": {
+              "description": "SBE1V1K hardware acceleration status and switches",
+              "read": {
+                "uci": [ "firewall" ],
+                "ubus": {
+                  "file": [ "read" ]
+                }
+              },
+              "write": {
+                "uci": [ "firewall" ]
+              }
+            }
+          }
+          EOF
+
+          cat > files/usr/share/luci/view/sbe1v1k/hwaccel.js <<'EOF'
+          'use strict';
+          'require view';
+          'require form';
+          'require fs';
+          'require poll';
+
+          return view.extend({
+                  load: function() {
+                          return Promise.all([
+                                  fs.read('/tmp/sbe1v1k-hwaccel.status').catch(function() { return '{}'; })
+                          ]);
+                  },
+
+                  render: function(data) {
+                          var status = {};
+                          try {
+                                  status = JSON.parse(data[0] || '{}');
+                          } catch (e) {
+                                  status = {};
+                          }
+
+                          var yesno = function(v) {
+                                  return v ? _('正常') : _('未检测到');
+                          };
+
+                          var accelText = _('未开启');
+                          if (status.active)
+                                  accelText = _('正在进行硬件加速');
+                          else if (status.ready)
+                                  accelText = _('硬件加速已就绪（当前暂无 HW_OFFLOAD 连接）');
+                          else if (status.flow_offloading_hw)
+                                  accelText = _('已开启配置，但运行条件尚未全部满足');
+
+                          var m = new form.Map('firewall', _('SBE1V1K 硬件加速'),
+                                  _('这里区分“配置已开启”和“实际正在硬件加速”。状态每 5 秒刷新。'));
+
+                          var s = m.section(form.TypedSection, 'defaults', _('实时状态'));
+                          s.anonymous = true;
+                          s.addremove = false;
+
+                          var o;
+
+                          o = s.option(form.DummyValue, '_ppe', _('Qualcomm PPE'));
+                          o.cfgvalue = function() { return yesno(status.ppe); };
+
+                          o = s.option(form.DummyValue, '_edma', _('EDMA'));
+                          o.cfgvalue = function() { return yesno(status.edma); };
+
+                          o = s.option(form.DummyValue, '_flowtable', _('nftables Flowtable'));
+                          o.cfgvalue = function() { return yesno(status.flowtable); };
+
+                          o = s.option(form.DummyValue, '_state', _('实际硬件加速状态'));
+                          o.cfgvalue = function() { return accelText; };
+
+                          o = s.option(form.DummyValue, '_hwconn', _('HW_OFFLOAD 连接数'));
+                          o.cfgvalue = function() { return String(status.hw_conn || 0); };
+
+                          o = s.option(form.DummyValue, '_swconn', _('软件 OFFLOAD 连接数'));
+                          o.cfgvalue = function() { return String(status.sw_conn || 0); };
+
+                          o = s.option(form.Flag, 'flow_offloading', _('软件流量分载'));
+                          o.default = o.disabled;
+                          o.rmempty = false;
+                          o.description = _('硬件流量分载依赖此项。');
+
+                          o = s.option(form.Flag, 'flow_offloading_hw', _('硬件流量分载'));
+                          o.default = o.disabled;
+                          o.rmempty = false;
+                          o.depends('flow_offloading', '1');
+                          o.description = _('开启后由 Qualcomm PPE/硬件 flowtable 尝试接管符合条件的连接。');
+
+                          var warn = m.section(form.TypedSection, 'defaults', _('使用提示'));
+                          warn.anonymous = true;
+                          warn.addremove = false;
+
+                          o = warn.option(form.DummyValue, '_sqmwarn', _('SQM / QoS'));
+                          o.cfgvalue = function() {
+                                  return _('普通 Hardware Flow Offload 可能绕过 SQM/QoS。启用 SQM 时建议关闭“硬件流量分载”。');
+                          };
+
+                          poll.add(function() {
+                                  return fs.read('/tmp/sbe1v1k-hwaccel.status').then(function(txt) {
+                                          var st = {};
+                                          try { st = JSON.parse(txt || '{}'); } catch (e) {}
+                                          var node = document.querySelector('[data-name="_state"] .cbi-value-field');
+                                          if (node) {
+                                                  var t = _('未开启');
+                                                  if (st.active)
+                                                          t = _('正在进行硬件加速');
+                                                  else if (st.ready)
+                                                          t = _('硬件加速已就绪（当前暂无 HW_OFFLOAD 连接）');
+                                                  else if (st.flow_offloading_hw)
+                                                          t = _('已开启配置，但运行条件尚未全部满足');
+                                                  node.textContent = t;
+                                          }
+                                  }).catch(function() {});
+                          }, 5);
+
+                          return m.render();
+                  }
+          });
+          EOF
+
+          cat > files/etc/uci-defaults/96-sbe1v1k-hwaccel <<'EOF'
+          #!/bin/sh
+
+          # Default to hardware flow offload enabled on this PPE-capable target.
+          uci -q set firewall.@defaults[0].flow_offloading='1'
+          uci -q set firewall.@defaults[0].flow_offloading_hw='1'
+          uci commit firewall
+
+          /etc/init.d/sbe1v1k-hwaccel enable
+          /usr/sbin/sbe1v1k-hwaccel-status >/dev/null 2>&1 || true
+
+          exit 0
+          EOF
+          chmod 0755 files/etc/uci-defaults/96-sbe1v1k-hwaccel
+
+          {
+            echo "Hardware acceleration page: /admin/network/sbe1v1k_hwaccel"
+            echo "PPE / EDMA / nft flowtable status: enabled"
+            echo "HW_OFFLOAD live connection counter: enabled"
+            echo "Software flow offload switch: enabled"
+            echo "Hardware flow offload switch: enabled"
+            echo "Default HFO: enabled"
+          } | tee ../R10-HWACCEL-FEATURES.txt
+
+      - name: Add Full Cone NAT status and switch
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          mkdir -p files/etc/config
+          mkdir -p files/etc/init.d
+          mkdir -p files/etc/uci-defaults
+          mkdir -p files/usr/sbin
+          mkdir -p files/usr/share/luci/menu.d
+          mkdir -p files/usr/share/luci/view/sbe1v1k
+          mkdir -p files/usr/share/rpcd/acl.d
+          mkdir -p files/etc/nftables.d
+
+          cat > files/etc/config/sbe1v1k-nat <<'EOF'
+          config nat 'main'
+                  option fullcone '0'
+          EOF
+
+          cat > files/usr/sbin/sbe1v1k-fullcone <<'EOF'
+          #!/bin/sh
+
+          CFG="sbe1v1k-nat.main.fullcone"
+          NFTFILE="/etc/nftables.d/95-sbe1v1k-fullcone.nft"
+          STATUS="/tmp/sbe1v1k-fullcone.status"
+
+          get_wan_dev() {
+                  ubus call network.interface.wan status 2>/dev/null \
+                    | jsonfilter -e '@.l3_device' 2>/dev/null
+          }
+
+          test_support() {
+                  modprobe nft_fullcone 2>/dev/null || true
+                  nft -c 'add table inet __sbe1v1k_fc_test; add chain inet __sbe1v1k_fc_test dstnat { type nat hook prerouting priority -100; policy accept; fullcone; }; delete table inet __sbe1v1k_fc_test' \
+                    >/dev/null 2>&1
+          }
+
+          write_status() {
+                  supported="$1"
+                  enabled="$2"
+                  active="$3"
+                  wan="$4"
+                  cat > "${STATUS}.tmp" <<JSON
+          {
+            "supported": $supported,
+            "enabled": $enabled,
+            "active": $active,
+            "wan_device": "$wan"
+          }
+          JSON
+                  mv "${STATUS}.tmp" "$STATUS"
+          }
+
+          apply_fullcone() {
+                  wanted="$(uci -q get "$CFG" 2>/dev/null || echo 0)"
+                  wan="$(get_wan_dev)"
+                  [ -n "$wan" ] || wan="wan"
+
+                  if ! test_support; then
+                          rm -f "$NFTFILE"
+                          [ "$wanted" = "1" ] && {
+                                  logger -t sbe1v1k-fullcone "kernel/userspace fullcone expression unsupported; disabling"
+                                  uci -q set "$CFG=0"
+                                  uci commit sbe1v1k-nat
+                          }
+                          write_status 0 0 0 "$wan"
+                          /etc/init.d/firewall reload >/dev/null 2>&1 || true
+                          exit 0
+                  fi
+
+                  if [ "$wanted" = "1" ]; then
+                          cat > "$NFTFILE" <<NFT
+          chain sbe1v1k_fullcone_dstnat {
+                  type nat hook prerouting priority -101; policy accept;
+                  iifname "$wan" fullcone
+          }
+
+          chain sbe1v1k_fullcone_srcnat {
+                  type nat hook postrouting priority 101; policy accept;
+                  oifname "$wan" fullcone
+          }
+          NFT
+                          /etc/init.d/firewall reload >/dev/null 2>&1 || true
+
+                          active=0
+                          nft list ruleset 2>/dev/null | grep -q 'sbe1v1k_fullcone_' && active=1
+                          write_status 1 1 "$active" "$wan"
+                  else
+                          rm -f "$NFTFILE"
+                          /etc/init.d/firewall reload >/dev/null 2>&1 || true
+                          write_status 1 0 0 "$wan"
+                  fi
+          }
+
+          case "$1" in
+                  status)
+                          wanted="$(uci -q get "$CFG" 2>/dev/null || echo 0)"
+                          wan="$(get_wan_dev)"
+                          [ -n "$wan" ] || wan="wan"
+                          if test_support; then
+                                  active=0
+                                  nft list ruleset 2>/dev/null | grep -q 'sbe1v1k_fullcone_' && active=1
+                                  write_status 1 "$wanted" "$active" "$wan"
+                          else
+                                  write_status 0 0 0 "$wan"
+                          fi
+                          cat "$STATUS"
+                          ;;
+                  apply|"")
+                          apply_fullcone
+                          ;;
+                  *)
+                          echo "Usage: $0 {apply|status}" >&2
+                          exit 1
+                          ;;
+          esac
+          EOF
+          chmod 0755 files/usr/sbin/sbe1v1k-fullcone
+
+          cat > files/etc/init.d/sbe1v1k-fullcone <<'EOF'
+          #!/bin/sh /etc/rc.common
+
+          START=97
+          STOP=10
+          USE_PROCD=1
+
+          start_service() {
+                  /usr/sbin/sbe1v1k-fullcone apply
+          }
+
+          reload_service() {
+                  /usr/sbin/sbe1v1k-fullcone apply
+          }
+
+          service_triggers() {
+                  procd_add_reload_trigger "sbe1v1k-nat"
+                  procd_add_reload_trigger "network"
+          }
+          EOF
+          chmod 0755 files/etc/init.d/sbe1v1k-fullcone
+
+          cat > files/usr/share/luci/menu.d/luci-app-sbe1v1k-fullcone.json <<'EOF'
+          {
+            "admin/network/sbe1v1k_fullcone": {
+              "title": "全锥形 NAT",
+              "order": 76,
+              "action": {
+                "type": "view",
+                "path": "sbe1v1k/fullcone"
+              },
+              "depends": {
+                "acl": [ "luci-app-sbe1v1k-fullcone" ]
+              }
+            }
+          }
+          EOF
+
+          cat > files/usr/share/rpcd/acl.d/luci-app-sbe1v1k-fullcone.json <<'EOF'
+          {
+            "luci-app-sbe1v1k-fullcone": {
+              "description": "SBE1V1K Full Cone NAT switch and status",
+              "read": {
+                "uci": [ "sbe1v1k-nat" ],
+                "ubus": {
+                  "file": [ "read" ]
+                }
+              },
+              "write": {
+                "uci": [ "sbe1v1k-nat" ]
+              }
+            }
+          }
+          EOF
+
+          cat > files/usr/share/luci/view/sbe1v1k/fullcone.js <<'EOF'
+          'use strict';
+          'require view';
+          'require form';
+          'require fs';
+          'require poll';
+
+          return view.extend({
+                  load: function() {
+                          return Promise.all([
+                                  fs.exec('/usr/sbin/sbe1v1k-fullcone', [ 'status' ]).then(function(r) {
+                                          return r.stdout || '{}';
+                                  }).catch(function() { return '{}'; })
+                          ]);
+                  },
+
+                  render: function(data) {
+                          var st = {};
+                          try { st = JSON.parse(data[0] || '{}'); } catch (e) {}
+
+                          var m = new form.Map('sbe1v1k-nat', _('全锥形 NAT'),
+                                  _('用于改善部分游戏、P2P 和点对点连接的 NAT 映射兼容性。真正生效需要内核与 nftables 同时支持 fullcone 表达式。'));
+
+                          var s = m.section(form.NamedSection, 'main', 'nat', _('状态与开关'));
+                          s.addremove = false;
+
+                          var o = s.option(form.DummyValue, '_support', _('Full Cone 能力'));
+                          o.cfgvalue = function() {
+                                  return st.supported ? _('支持') : _('当前内核/用户态不支持');
+                          };
+
+                          o = s.option(form.DummyValue, '_active', _('实际运行状态'));
+                          o.cfgvalue = function() {
+                                  if (!st.supported)
+                                          return _('不可用');
+                                  return st.active ? _('已生效') : _('未生效');
+                          };
+
+                          o = s.option(form.DummyValue, '_wan', _('当前 WAN 设备'));
+                          o.cfgvalue = function() {
+                                  return st.wan_device || '-';
+                          };
+
+                          o = s.option(form.Flag, 'fullcone', _('全锥形 NAT 开关'));
+                          o.default = o.disabled;
+                          o.rmempty = false;
+                          o.description = _('保存并应用后会自动检测 fullcone 能力；若不支持会自动回退为关闭，避免破坏防火墙。');
+
+                          var note = m.section(form.NamedSection, 'main', 'nat', _('说明'));
+                          note.addremove = false;
+                          o = note.option(form.DummyValue, '_note', _('注意'));
+                          o.cfgvalue = function() {
+                                  return _('全锥形 NAT 不能突破运营商 CGNAT；若上级网络本身限制入站映射，路由器开启后也不能把公网 NAT 类型强行变成 Full Cone。');
+                          };
+
+                          poll.add(function() {
+                                  return fs.exec('/usr/sbin/sbe1v1k-fullcone', [ 'status' ]).then(function() {});
+                          }, 5);
+
+                          return m.render();
+                  }
+          });
+          EOF
+
+          cat > files/etc/uci-defaults/97-sbe1v1k-fullcone <<'EOF'
+          #!/bin/sh
+
+          /etc/init.d/sbe1v1k-fullcone enable
+          /usr/sbin/sbe1v1k-fullcone status >/dev/null 2>&1 || true
+
+          exit 0
+          EOF
+          chmod 0755 files/etc/uci-defaults/97-sbe1v1k-fullcone
+
+          {
+            echo "Full Cone NAT LuCI page: /admin/network/sbe1v1k_fullcone"
+            echo "Runtime capability detection: enabled"
+            echo "Safe auto-fallback when unsupported: enabled"
+            echo "Firewall integration: /etc/nftables.d/95-sbe1v1k-fullcone.nft"
+            echo "Default Full Cone NAT: disabled"
+          } | tee ../R10-FULLCONE-FEATURES.txt
+
+      - name: Add safe large eMMC overlay migration
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          mkdir -p files/usr/sbin
+          mkdir -p files/etc/init.d
+          mkdir -p files/etc/uci-defaults
+          mkdir -p files/usr/share/luci/menu.d
+          mkdir -p files/usr/share/luci/view/sbe1v1k
+          mkdir -p files/usr/share/rpcd/acl.d
+
+          cat > files/usr/sbin/sbe1v1k-large-overlay <<'EOF'
+          #!/bin/sh
+
+          STATUS=/tmp/sbe1v1k-large-overlay.status
+          MNT=/mnt/sbe1v1k-large-overlay
+
+          find_rootfs_data() {
+                  for u in /sys/class/block/mmcblk0p*/uevent; do
+                          [ -r "$u" ] || continue
+                          grep -q '^PARTNAME=rootfs_data$' "$u" || continue
+                          devname="$(sed -n 's/^DEVNAME=//p' "$u" | head -n1)"
+                          [ -n "$devname" ] || continue
+                          echo "/dev/$devname"
+                          return 0
+                  done
+                  return 1
+          }
+
+          dev_kib() {
+                  devbase="$(basename "$1")"
+                  sectors="$(cat "/sys/class/block/$devbase/size" 2>/dev/null)"
+                  case "$sectors" in ''|*[!0-9]*) echo 0 ;; *) echo $((sectors / 2)) ;; esac
+          }
+
+          disk_kib() {
+                  sectors="$(cat /sys/class/block/mmcblk0/size 2>/dev/null)"
+                  case "$sectors" in ''|*[!0-9]*) echo 0 ;; *) echo $((sectors / 2)) ;; esac
+          }
+
+          overlay_source() {
+                  awk '$2 == "/overlay" {print $1; exit}' /proc/mounts
+          }
+
+          block_type() {
+                  block info "$1" 2>/dev/null | sed -n 's/.*TYPE="\([^"]*\)".*/\1/p' | head -n1
+          }
+
+          block_uuid() {
+                  block info "$1" 2>/dev/null | sed -n 's/.*UUID="\([^"]*\)".*/\1/p' | head -n1
+          }
+
+          status_json() {
+                  dev="$(find_rootfs_data 2>/dev/null)"
+                  src="$(overlay_source)"
+                  disk="$(disk_kib)"
+                  part=0
+                  fstype=""
+                  uuid=""
+                  active=0
+                  mounted=0
+
+                  if [ -n "$dev" ]; then
+                          part="$(dev_kib "$dev")"
+                          fstype="$(block_type "$dev")"
+                          uuid="$(block_uuid "$dev")"
+                          grep -q "^$dev " /proc/mounts 2>/dev/null && mounted=1
+                          [ "$src" = "$dev" ] && active=1
+                          grep -q " $dev " /proc/mounts 2>/dev/null || true
+                  fi
+
+                  set -- $(df -k /overlay 2>/dev/null | awk 'NR==2 {print $2, $3, $4}')
+                  ov_total="${1:-0}"
+                  ov_used="${2:-0}"
+                  ov_free="${3:-0}"
+
+                  cat > "${STATUS}.tmp" <<JSON
+          {
+            "device": "${dev:-}",
+            "physical_kib": ${disk:-0},
+            "partition_kib": ${part:-0},
+            "filesystem": "${fstype:-}",
+            "uuid": "${uuid:-}",
+            "overlay_source": "${src:-}",
+            "overlay_total_kib": ${ov_total:-0},
+            "overlay_used_kib": ${ov_used:-0},
+            "overlay_free_kib": ${ov_free:-0},
+            "active": ${active:-0},
+            "mounted": ${mounted:-0}
+          }
+          JSON
+                  mv "${STATUS}.tmp" "$STATUS"
+                  cat "$STATUS"
+          }
+
+          prepare() {
+                  dev="$(find_rootfs_data)" || {
+                          logger -t sbe1v1k-overlay "rootfs_data partition not found"
+                          return 20
+                  }
+
+                  size_kib="$(dev_kib "$dev")"
+                  # Safety guard: only touch the known large partition (> 5 GiB).
+                  [ "$size_kib" -ge 5242880 ] || {
+                          logger -t sbe1v1k-overlay "refusing $dev: only ${size_kib} KiB"
+                          return 21
+                  }
+
+                  src="$(overlay_source)"
+                  [ "$src" != "$dev" ] || {
+                          logger -t sbe1v1k-overlay "$dev already active as /overlay"
+                          return 0
+                  }
+
+                  grep -q "^$dev " /proc/mounts 2>/dev/null && {
+                          logger -t sbe1v1k-overlay "refusing: $dev is already mounted"
+                          return 22
+                  }
+
+                  fstype="$(block_type "$dev")"
+
+                  if [ -z "$fstype" ]; then
+                          logger -t sbe1v1k-overlay "formatting empty $dev as F2FS (${size_kib} KiB)"
+                          if command -v mkfs.f2fs >/dev/null 2>&1; then
+                                  mkfs.f2fs -f -l SBE1V1K_OVERLAY "$dev" || return 23
+                          elif command -v mkf2fs >/dev/null 2>&1; then
+                                  mkf2fs -f -l SBE1V1K_OVERLAY "$dev" || return 23
+                          else
+                                  logger -t sbe1v1k-overlay "no F2FS formatter found"
+                                  return 24
+                          fi
+                          sleep 1
+                          fstype="$(block_type "$dev")"
+                  elif [ "$fstype" != "f2fs" ]; then
+                          # Never erase an existing unknown filesystem automatically.
+                          logger -t sbe1v1k-overlay "refusing existing filesystem TYPE=$fstype on $dev"
+                          return 25
+                  fi
+
+                  uuid="$(block_uuid "$dev")"
+                  [ -n "$uuid" ] || {
+                          logger -t sbe1v1k-overlay "cannot read UUID from $dev"
+                          return 26
+                  }
+
+                  # Configure standard OpenWrt extroot first so that the fstab
+                  # entry is included when the current overlay is copied.
+                  uci -q delete fstab.extroot
+                  uci set fstab.extroot='mount'
+                  uci set fstab.extroot.uuid="$uuid"
+                  uci set fstab.extroot.target='/overlay'
+                  uci set fstab.extroot.enabled='1'
+                  uci set fstab.extroot.enabled_fsck='1'
+                  uci commit fstab
+
+                  mkdir -p "$MNT"
+                  mount -t f2fs -o noatime,lazytime "$dev" "$MNT" || return 27
+
+                  if [ ! -e "$MNT/.sbe1v1k_overlay_seeded" ]; then
+                          logger -t sbe1v1k-overlay "copying current overlay to $dev"
+                          tar -C /overlay -cf - . | tar -C "$MNT" -xf - || {
+                                  umount "$MNT" || true
+                                  return 28
+                          }
+                          touch "$MNT/.sbe1v1k_overlay_seeded"
+                  fi
+
+                  sync
+                  umount "$MNT" || return 29
+                  logger -t sbe1v1k-overlay "large overlay prepared; reboot required"
+                  return 10
+          }
+
+          case "$1" in
+                  status)
+                          status_json
+                          ;;
+                  prepare|"")
+                          prepare
+                          rc=$?
+                          status_json >/dev/null 2>&1 || true
+                          exit "$rc"
+                          ;;
+                  *)
+                          echo "Usage: $0 {prepare|status}" >&2
+                          exit 1
+                          ;;
+          esac
+          EOF
+          chmod 0755 files/usr/sbin/sbe1v1k-large-overlay
+
+          cat > files/etc/uci-defaults/98-sbe1v1k-large-overlay <<'EOF'
+          #!/bin/sh
+
+          /usr/sbin/sbe1v1k-large-overlay prepare
+          rc=$?
+
+          case "$rc" in
+                  0)
+                          exit 0
+                          ;;
+                  10)
+                          # First boot only: extroot was prepared successfully.
+                          # Reboot once after LuCI/network has had time to come up.
+                          logger -t sbe1v1k-overlay "large overlay ready; scheduling one-time reboot"
+                          ( sleep 20; sync; reboot ) >/dev/null 2>&1 &
+                          exit 0
+                          ;;
+                  *)
+                          logger -t sbe1v1k-overlay "automatic overlay preparation failed rc=$rc; will retry next boot"
+                          # Keep this uci-defaults script for a later retry.
+                          exit 1
+                          ;;
+          esac
+          EOF
+          chmod 0755 files/etc/uci-defaults/98-sbe1v1k-large-overlay
+
+          cat > files/usr/share/luci/menu.d/luci-app-sbe1v1k-storage.json <<'EOF'
+          {
+            "admin/system/sbe1v1k_storage": {
+              "title": "eMMC 存储",
+              "order": 90,
+              "action": {
+                "type": "view",
+                "path": "sbe1v1k/storage"
+              },
+              "depends": {
+                "acl": [ "luci-app-sbe1v1k-storage" ]
+              }
+            }
+          }
+          EOF
+
+          cat > files/usr/share/rpcd/acl.d/luci-app-sbe1v1k-storage.json <<'EOF'
+          {
+            "luci-app-sbe1v1k-storage": {
+              "description": "SBE1V1K internal eMMC overlay status",
+              "read": {
+                "ubus": {
+                  "file": [ "read", "exec" ]
+                }
+              }
+            }
+          }
+          EOF
+
+          cat > files/usr/share/luci/view/sbe1v1k/storage.js <<'EOF'
+          'use strict';
+          'require view';
+          'require fs';
+          'require poll';
+          'require ui';
+
+          function gib(kib) {
+                  var n = Number(kib || 0) / 1024 / 1024;
+                  return n.toFixed(2) + ' GiB';
+          }
+
+          return view.extend({
+                  load: function() {
+                          return fs.exec('/usr/sbin/sbe1v1k-large-overlay', [ 'status' ])
+                                  .then(function(r) { return r.stdout || '{}'; })
+                                  .catch(function() { return '{}'; });
+                  },
+
+                  render: function(raw) {
+                          var st = {};
+                          try { st = JSON.parse(raw || '{}'); } catch (e) {}
+
+                          var body = E('div', { 'class': 'cbi-map' }, [
+                                  E('h2', {}, _('SBE1V1K eMMC 存储')),
+                                  E('div', { 'class': 'cbi-map-descr' },
+                                          _('8GB eMMC 的实际二进制容量约为 7.28 GiB。系统保留 rootfs 分区后，大容量 rootfs_data 可提供约 6.2 GiB 的可写 Overlay。')),
+                                  E('div', { 'class': 'cbi-section' }, [
+                                          E('table', { 'class': 'table' }, [
+                                                  E('tr', { 'class': 'tr' }, [
+                                                          E('td', { 'class': 'td left' }, _('eMMC 物理容量')),
+                                                          E('td', { 'class': 'td left' }, gib(st.physical_kib))
+                                                  ]),
+                                                  E('tr', { 'class': 'tr' }, [
+                                                          E('td', { 'class': 'td left' }, _('大容量分区')),
+                                                          E('td', { 'class': 'td left' }, (st.device || '-') + ' / ' + gib(st.partition_kib))
+                                                  ]),
+                                                  E('tr', { 'class': 'tr' }, [
+                                                          E('td', { 'class': 'td left' }, _('文件系统')),
+                                                          E('td', { 'class': 'td left' }, st.filesystem || _('尚未格式化'))
+                                                  ]),
+                                                  E('tr', { 'class': 'tr' }, [
+                                                          E('td', { 'class': 'td left' }, _('当前 Overlay 来源')),
+                                                          E('td', { 'class': 'td left' }, st.overlay_source || '-')
+                                                  ]),
+                                                  E('tr', { 'class': 'tr' }, [
+                                                          E('td', { 'class': 'td left' }, _('可写空间')),
+                                                          E('td', { 'class': 'td left' },
+                                                                  gib(st.overlay_free_kib) + ' / ' + gib(st.overlay_total_kib))
+                                                  ]),
+                                                  E('tr', { 'class': 'tr' }, [
+                                                          E('td', { 'class': 'td left' }, _('大容量 Overlay')),
+                                                          E('td', { 'class': 'td left' },
+                                                                  st.active ? _('已启用') : _('尚未启用 / 等待重启'))
+                                                  ])
+                                          ])
+                                  ])
+                          ]);
+
+                          poll.add(function() {
+                                  return fs.exec('/usr/sbin/sbe1v1k-large-overlay', [ 'status' ]).catch(function() {});
+                          }, 10);
+
+                          return body;
+                  }
+          });
+          EOF
+
+          {
+            echo "Physical eMMC: ~7.28 GiB"
+            echo "Large partition: PARTNAME=rootfs_data"
+            echo "Expected writable overlay: ~6.1-6.2 GiB after F2FS overhead"
+            echo "Method: safe extroot on existing large p30; GPT/rootfs partition untouched"
+            echo "Automatic first-boot preparation: enabled"
+            echo "One-time reboot after successful migration: enabled"
+            echo "LuCI storage status: /admin/system/sbe1v1k_storage"
+          } | tee ../R10-STORAGE-FEATURES.txt
+
+      - name: Bootstrap complete build environment
+        run: |
+          cd openwrt
+          make -j"$(nproc)" world || make -j1 V=s world
+          test -x staging_dir/host/bin/libdeflate-gzip
+          staging_dir/host/bin/libdeflate-gzip --version || true
+
+      - name: Clean and prepare mac80211
+        run: |
+          set -euo pipefail
+          cd openwrt
+          make package/kernel/mac80211/clean V=s
+          make package/kernel/mac80211/download V=s
+          make package/kernel/mac80211/prepare V=s
+
+      - name: Apply permanent B02 B03 ath12k fixes
+        run: |
+          set -euo pipefail
+          cd openwrt
+          python3 - <<'PY'
+          from pathlib import Path
+
+          wmis = [p for p in Path("build_dir").rglob("wmi.c")
+                  if "/mac80211-regular/backports-" in str(p)
+                  and str(p).endswith("drivers/net/wireless/ath/ath12k/wmi.c")]
+          htcs = [p for p in Path("build_dir").rglob("htc.c")
+                  if "/mac80211-regular/backports-" in str(p)
+                  and str(p).endswith("drivers/net/wireless/ath/ath12k/htc.c")]
+
+          if len(wmis) != 1 or len(htcs) != 1:
+              raise SystemExit(f"Expected one ath12k backports tree, got wmi={len(wmis)} htc={len(htcs)}")
+
+          wmi = wmis[0]
+          htc = htcs[0]
+          if wmi.parent != htc.parent:
+              raise SystemExit(f"WMI/HTC trees differ: {wmi.parent} vs {htc.parent}")
+
+          # B02: QCN9274 hw2.0 firmware exposes one WMI control endpoint
+          # while preferred_hw_mode is still MAX/unknown.
+          s = htc.read_text()
+          old = (
+              "\tdefault:\n"
+              "\t\thtc->wmi_ep_count = ab->hw_params->max_radios;\n"
+              "\t\tbreak;\n"
+              "\t}\n\n"
+              "\t/* setup our pseudo HTC control endpoint connection */"
+          )
+          new = (
+              "\tdefault:\n"
+              "\t\thtc->wmi_ep_count = ab->hw_params->max_radios;\n"
+              "\t\tbreak;\n"
+              "\t}\n\n"
+              "\tif (ab->hw_rev == ATH12K_HW_QCN9274_HW20 &&\n"
+              "\t    ab->wmi_ab.preferred_hw_mode == WMI_HOST_HW_MODE_MAX) {\n"
+              "\t\tath12k_warn(ab, \"B02 QCN9274 hw2 MAX-mode: force wmi_ep_count %u -> 1\\n\",\n"
+              "\t\t\t    htc->wmi_ep_count);\n"
+              "\t\thtc->wmi_ep_count = 1;\n"
+              "\t}\n\n"
+              "\t/* setup our pseudo HTC control endpoint connection */"
+          )
+          if old not in s:
+              raise SystemExit("B02 anchor missing")
+          htc.write_text(s.replace(old, new, 1))
+
+          # B03: skip optional direct-buffer capability IDs not understood
+          # by this backports snapshot instead of aborting SERVICE_READY_EXT.
+          s = wmi.read_text()
+          old = (
+              "\tdir_buff_caps = ab->db_caps;\n"
+              "\tfor (i = 0; i < dma_caps_parse->n_dma_ring_caps; i++) {\n"
+              "\t\tif (le32_to_cpu(dma_caps[i].module_id) >= WMI_DIRECT_BUF_MAX) {\n"
+              "\t\t\tath12k_warn(ab, \"Invalid module id %d\\n\",\n"
+              "\t\t\t\t    le32_to_cpu(dma_caps[i].module_id));\n"
+              "\t\t\tret = -EINVAL;\n"
+              "\t\t\tgoto free_dir_buff;\n"
+              "\t\t}\n\n"
+              "\t\tdir_buff_caps[i].id = le32_to_cpu(dma_caps[i].module_id);\n"
+              "\t\tdir_buff_caps[i].pdev_id =\n"
+              "\t\t\tDP_HW2SW_MACID(le32_to_cpu(dma_caps[i].pdev_id));\n"
+              "\t\tdir_buff_caps[i].min_elem = le32_to_cpu(dma_caps[i].min_elem);\n"
+              "\t\tdir_buff_caps[i].min_buf_sz = le32_to_cpu(dma_caps[i].min_buf_sz);\n"
+              "\t\tdir_buff_caps[i].min_buf_align = le32_to_cpu(dma_caps[i].min_buf_align);\n"
+              "\t}\n\n"
+              "\treturn 0;\n\n"
+              "free_dir_buff:\n"
+              "\tath12k_wmi_free_dbring_caps(ab);\n"
+              "\treturn ret;"
+          )
+          new = (
+              "\tdir_buff_caps = ab->db_caps;\n"
+              "\t{\n"
+              "\t\tu32 valid = 0;\n\n"
+              "\t\tfor (i = 0; i < dma_caps_parse->n_dma_ring_caps; i++) {\n"
+              "\t\t\tu32 module_id = le32_to_cpu(dma_caps[i].module_id);\n\n"
+              "\t\t\tif (module_id >= WMI_DIRECT_BUF_MAX) {\n"
+              "\t\t\t\tath12k_warn(ab,\n"
+              "\t\t\t\t\t    \"B03 skip unsupported dma ring module id %u pdev=%u\\n\",\n"
+              "\t\t\t\t\t    module_id, le32_to_cpu(dma_caps[i].pdev_id));\n"
+              "\t\t\t\tcontinue;\n"
+              "\t\t\t}\n\n"
+              "\t\t\tdir_buff_caps[valid].id = module_id;\n"
+              "\t\t\tdir_buff_caps[valid].pdev_id =\n"
+              "\t\t\t\tDP_HW2SW_MACID(le32_to_cpu(dma_caps[i].pdev_id));\n"
+              "\t\t\tdir_buff_caps[valid].min_elem = le32_to_cpu(dma_caps[i].min_elem);\n"
+              "\t\t\tdir_buff_caps[valid].min_buf_sz = le32_to_cpu(dma_caps[i].min_buf_sz);\n"
+              "\t\t\tdir_buff_caps[valid].min_buf_align = le32_to_cpu(dma_caps[i].min_buf_align);\n"
+              "\t\t\tvalid++;\n"
+              "\t\t}\n\n"
+              "\t\tif (!valid) {\n"
+              "\t\t\tath12k_warn(ab, \"B03 no supported dma ring caps remain\\n\");\n"
+              "\t\t\tath12k_wmi_free_dbring_caps(ab);\n"
+              "\t\t} else {\n"
+              "\t\t\tab->num_db_cap = valid;\n"
+              "\t\t\tath12k_warn(ab, \"B03 accepted %u/%u dma ring caps\\n\",\n"
+              "\t\t\t\t    valid, dma_caps_parse->n_dma_ring_caps);\n"
+              "\t\t}\n"
+              "\t}\n\n"
+              "\treturn 0;"
+          )
+          if old not in s:
+              raise SystemExit("B03 anchor missing")
+          wmi.write_text(s.replace(old, new, 1))
+
+          Path("../ATH12K-ACTUAL-PATH.txt").write_text(str(wmi.parent) + "\n")
+          print("Patched:", wmi.parent)
+          PY
+
+          grep -R -n -E 'B02 |B03 ' "$(cat ../ATH12K-ACTUAL-PATH.txt)" \
+            | tee ../R10-ATH12K-SOURCE-CHECK.txt
+
+      - name: Compile patched mac80211
+        run: |
+          set -euo pipefail
+          cd openwrt
+          make package/kernel/mac80211/compile V=s
+
+      - name: Verify patched ath12k module
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          find build_dir staging_dir -type f -name 'ath12k*.ko' -print \
+            | tee ../R10-ATH12K-KO-LIST.txt
+
+          found=0
+          while IFS= read -r ko; do
+            [ -f "$ko" ] || continue
+            if strings "$ko" | grep -q 'B02 ' && strings "$ko" | grep -q 'B03 '; then
+              echo "PASS B02+B03: $ko" | tee -a ../R10-ATH12K-MODULE-CHECK.txt
+              found=1
+            fi
+          done < ../R10-ATH12K-KO-LIST.txt
+
+          [ "$found" -eq 1 ] || {
+            echo "ERROR: compiled ath12k module does not contain B02+B03"
+            exit 1
+          }
+
+      - name: Build final firmware
+        run: |
+          cd openwrt
+          make -j"$(nproc)" world || make -j1 V=s world
+
+      - name: Validate final firmware features
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          MANIFEST="bin/targets/qualcommbe/ipq95xx/openwrt-qualcommbe-ipq95xx-askey_sbe1v1k.manifest"
+          SYS="bin/targets/qualcommbe/ipq95xx/openwrt-qualcommbe-ipq95xx-askey_sbe1v1k-squashfs-sysupgrade.bin"
+
+          test -s "$SYS"
+          test -s "$MANIFEST"
+
+          : > ../R10-FINAL-PACKAGE-CHECK.txt
+          for p in \
+            luci-theme-material luci-i18n-base-zh-cn \
+            smartdns luci-app-smartdns luci-app-sqm \
+            luci-app-ddns luci-app-upnp luci-app-wol \
+            luci-app-ttyd luci-app-filemanager luci-app-nlbwmon \
+            luci-app-irqbalance luci-app-commands block-mount; do
+              if grep -q "^${p} " "$MANIFEST"; then
+                echo "PASS $p" | tee -a ../R10-FINAL-PACKAGE-CHECK.txt
+              else
+                echo "MISSING $p" | tee -a ../R10-FINAL-PACKAGE-CHECK.txt
+                exit 1
+              fi
+          done
+
+          test -x files/usr/sbin/sbe1v1k-fand
+          test -x files/etc/init.d/sbe1v1k-fan
+          test -x files/etc/uci-defaults/95-sbe1v1k-r10
+          test -x files/usr/sbin/sbe1v1k-hwaccel-status
+          test -x files/usr/sbin/sbe1v1k-hwacceld
+          test -x files/etc/init.d/sbe1v1k-hwaccel
+          test -s files/usr/share/luci/view/sbe1v1k/hwaccel.js
+          test -s files/usr/share/luci/menu.d/luci-app-sbe1v1k-hwaccel.json
+          test -x files/usr/sbin/sbe1v1k-fullcone
+          test -x files/etc/init.d/sbe1v1k-fullcone
+          test -s files/usr/share/luci/view/sbe1v1k/fullcone.js
+          test -s files/usr/share/luci/menu.d/luci-app-sbe1v1k-fullcone.json
+          test -x files/usr/sbin/sbe1v1k-large-overlay
+          test -x files/etc/uci-defaults/98-sbe1v1k-large-overlay
+          test -s files/usr/share/luci/view/sbe1v1k/storage.js
+          test -s files/usr/share/luci/menu.d/luci-app-sbe1v1k-storage.json
+
+          find build_dir staging_dir -type f -name 'ath12k*.ko' -print \
+            | tee ../R10-FINAL-ATH12K-KO-LIST.txt
+
+          found=0
+          while IFS= read -r ko; do
+            [ -f "$ko" ] || continue
+            if strings "$ko" | grep -q 'B02 ' && strings "$ko" | grep -q 'B03 '; then
+              echo "FINAL PASS B02+B03: $ko" | tee -a ../R10-FINAL-ATH12K-MODULE-CHECK.txt
+              found=1
+            fi
+          done < ../R10-FINAL-ATH12K-KO-LIST.txt
+
+          [ "$found" -eq 1 ] || {
+            echo "ERROR: B02+B03 disappeared after final world build"
+            exit 1
+          }
+
+      - name: Collect firmware and validation
+        run: |
+          set -euo pipefail
+
+          OUT=openwrt/bin/targets/qualcommbe/ipq95xx
+          SYS="$OUT/openwrt-qualcommbe-ipq95xx-askey_sbe1v1k-squashfs-sysupgrade.bin"
+
+          mkdir -p artifact/VALIDATION
+
+          cp "$OUT"/openwrt-qualcommbe-ipq95xx-askey_sbe1v1k-* artifact/
+          cp "$OUT"/*.manifest "$OUT"/config.buildinfo "$OUT"/profiles.json \
+             "$OUT"/version.buildinfo artifact/ 2>/dev/null || true
+
+          cp SOURCE_COMMIT.txt \
+             R10-PACKAGE-CHECK.txt R10-FEATURES.txt R10-HWACCEL-FEATURES.txt R10-FULLCONE-FEATURES.txt R10-STORAGE-FEATURES.txt \
+             ATH12K-ACTUAL-PATH.txt R10-ATH12K-SOURCE-CHECK.txt \
+             R10-ATH12K-KO-LIST.txt R10-ATH12K-MODULE-CHECK.txt \
+             R10-FINAL-PACKAGE-CHECK.txt R10-FINAL-ATH12K-KO-LIST.txt \
+             R10-FINAL-ATH12K-MODULE-CHECK.txt \
+             artifact/VALIDATION/
+
+          sha256sum "$SYS" | tee artifact/VALIDATION/SYSUPGRADE-SHA256.txt
+          find artifact -maxdepth 1 -type f -print0 | sort -z \
+            | xargs -0 sha256sum > artifact/VALIDATION/SHA256SUMS.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-V5.8-R10.3-Large-Overlay
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
