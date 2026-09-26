@@ -1,0 +1,94 @@
+name: SBE1V1K V5.7B0.1-R3 Path Fix
+on: {workflow_dispatch: {}}
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib gettext git libncurses-dev libssl-dev python3 rsync unzip zlib1g-dev file wget curl subversion swig time jq zstd binutils
+      - name: Source
+        run: |
+          git clone https://github.com/yintaomu/SBE1V1K-OpenWrt.git openwrt
+          cd openwrt
+          git checkout 6c7c3c6bac78ddbe6c51a88284453d9c724713e1
+      - name: Configure
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          cp configs/sbe1v1k.config .config
+          make defconfig
+          make package/kernel/mac80211/download V=s
+          make package/kernel/mac80211/prepare V=s
+      - name: Discover and patch
+        run: |
+          cd openwrt
+          find build_dir -type f -path '*/drivers/net/wireless/ath/ath12k/wmi.c' -print | tee ../WMI-CANDIDATES.txt
+          find build_dir -type f -path '*/drivers/net/wireless/ath/ath12k/htc.c' -print | tee ../HTC-CANDIDATES.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          w=list(Path("build_dir").rglob("wmi.c"))
+          w=[x for x in w if str(x).endswith("drivers/net/wireless/ath/ath12k/wmi.c")]
+          h=list(Path("build_dir").rglob("htc.c"))
+          h=[x for x in h if str(x).endswith("drivers/net/wireless/ath/ath12k/htc.c")]
+          print("WMI",w); print("HTC",h)
+          if len(w)!=1 or len(h)!=1: raise SystemExit("Need exactly one ath12k WMI/HTC tree")
+          w,h=w[0],h[0]
+          s=w.read_text()
+          a="\tstatus = ath12k_htc_connect_service(&ab->htc, &conn_req, &conn_resp);\n\tif (status) {"
+          b="\tath12k_warn(ab, \"B01 begin pdev=%u svc=0x%x ep_count=%u max_radios=%u hw_mode=%d\\\\n\", pdev_idx, conn_req.service_id, ab->htc.wmi_ep_count, ab->hw_params->max_radios, ab->wmi_ab.preferred_hw_mode);\n\tstatus = ath12k_htc_connect_service(&ab->htc, &conn_req, &conn_resp);\n\tath12k_warn(ab, \"B01 end pdev=%u svc=0x%x ret=%d fw_resp=0x%x eid=%u max_msg=%u\\\\n\", pdev_idx, conn_req.service_id, status, conn_resp.connect_resp_code, conn_resp.eid, conn_resp.max_msg_len);\n\tif (status) {"
+          if a not in s: raise SystemExit("WMI service anchor missing")
+          s=s.replace(a,b,1)
+          a="\tfor (i = 0; i < wmi_ep_count; i++)\n\t\tath12k_connect_pdev_htc_service(ab, i);\n\n\treturn 0;"
+          b="\tath12k_warn(ab, \"B01 wmi_connect ep_count=%u max_radios=%u hw_mode=%d\\\\n\", wmi_ep_count, ab->hw_params->max_radios, ab->wmi_ab.preferred_hw_mode);\n\tfor (i = 0; i < wmi_ep_count; i++) {\n\t\tint b01_ret = ath12k_connect_pdev_htc_service(ab, i);\n\t\tath12k_warn(ab, \"B01 pdev_result pdev=%u ret=%d\\\\n\", i, b01_ret);\n\t}\n\n\treturn 0;"
+          if a not in s: raise SystemExit("WMI loop anchor missing")
+          w.write_text(s.replace(a,b,1))
+          s=h.read_text()
+          a="\tconn_resp->connect_resp_code = le32_get_bits(resp_msg->flags_len,\n\t\t\t\t\t\t     HTC_SVC_RESP_MSG_STATUS);\n\n\t/* check response status */"
+          b="\tconn_resp->connect_resp_code = le32_get_bits(resp_msg->flags_len,\n\t\t\t\t\t\t     HTC_SVC_RESP_MSG_STATUS);\n\tath12k_warn(ab, \"B01 htc_resp req_svc=0x%x resp_svc=0x%x fw=0x%x len=%u\\\\n\", conn_req->service_id, service_id, conn_resp->connect_resp_code, htc->control_resp_len);\n\n\t/* check response status */"
+          if a not in s: raise SystemExit("HTC anchor missing")
+          h.write_text(s.replace(a,b,1))
+          Path("../ATH12K-ACTUAL-PATH.txt").write_text(str(w.parent)+"\n")
+          PY
+          grep -R -n 'B01 ' "$(cat ../ATH12K-ACTUAL-PATH.txt)" | tee ../B01-SOURCE-CHECK.txt
+      - name: Force rebuild mac80211
+        run: |
+          cd openwrt
+          make package/kernel/mac80211/compile V=s -B
+          make package/kernel/mac80211/install V=s -B
+      - name: Verify compiled module
+        run: |
+          cd openwrt
+          find build_dir staging_dir -type f -name 'ath12k*.ko' -print | tee ../ATH12K-KO-LIST.txt
+          found=0
+          while IFS= read -r ko; do
+            [ -f "$ko" ] || continue
+            if strings "$ko" | grep -q 'B01 '; then
+              echo "PASS B01: $ko" | tee -a ../B01-MODULE-CHECK.txt
+              strings "$ko" | grep 'B01 ' | tee -a ../B01-MODULE-CHECK.txt
+              found=1
+            fi
+          done < ../ATH12K-KO-LIST.txt
+          test "$found" -eq 1
+      - name: Build firmware
+        run: |
+          cd openwrt
+          make -j"$(nproc)" world || make -j1 V=s world
+      - name: Collect
+        run: |
+          set -e
+          OUT=openwrt/bin/targets/qualcommbe/ipq95xx
+          SYS="$OUT/openwrt-qualcommbe-ipq95xx-askey_sbe1v1k-squashfs-sysupgrade.bin"
+          test -s "$SYS"
+          mkdir -p artifact/VALIDATION
+          cp "$OUT"/openwrt-qualcommbe-ipq95xx-askey_sbe1v1k-* artifact/
+          cp WMI-CANDIDATES.txt HTC-CANDIDATES.txt ATH12K-ACTUAL-PATH.txt B01-SOURCE-CHECK.txt ATH12K-KO-LIST.txt B01-MODULE-CHECK.txt artifact/VALIDATION/
+          sha256sum "$SYS" | tee artifact/VALIDATION/SYSUPGRADE-SHA256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SBE1V1K-V5.7B0.1-R3-Path-Fix
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
